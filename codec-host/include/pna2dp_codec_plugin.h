@@ -43,7 +43,10 @@ typedef struct PnCodecPlugin {
 
     /* Create an encoder for the negotiated stream. Returns NULL on failure. */
     PnCodecEncoder *(*open)(const PNA2DP_STREAM_PARAMS *params);
-    /* Encode `pcm_frames` interleaved frames in params->PcmFormat. Fill out. Return 0 on success. */
+    /* Encode `pcm_frames` interleaved frames in params->PcmFormat and fill `out` with at most one
+     * media packet. The driver never re-feeds PCM: a plugin whose packetisation does not match the
+     * block size must buffer leftover input and queue extra packets internally (see ldac_plugin.c).
+     * Writing 0 bytes is legal. Return 0 on success. */
     int  (*encode)(PnCodecEncoder *enc, const uint8_t *pcm, uint32_t pcm_bytes, uint32_t pcm_frames, PnCodecOutput *out);
     /* Change quality/bitrate live (ABR). quality_index semantics are codec specific. */
     int  (*reconfigure)(PnCodecEncoder *enc, uint32_t quality_index, uint32_t bitrate_bps);

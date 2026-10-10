@@ -1,15 +1,15 @@
 /*
  * ldac_plugin.c - LDAC encoder plugin using Sony's libldac (Apache-2.0, AOSP).
  *
- * Build: see codec-host/plugins/ldac/build.ps1. Links statically against
- * third_party/ldacBT (libldac + libldacBT_abr). Output DLL: pna2dp-codec-ldac.dll.
+ * Build: codec-host/plugins/ldac/build.ps1 (links libldac + libldacBT_abr statically).
+ * Output DLL: pna2dp-codec-ldac.dll.
  *
  * LDAC specifics:
- *   - encoder consumes 128 (44.1/48 k) or 256 (88.2/96 k) PCM frames per LDAC frame
- *   - EQMID 0/1/2 = 990/660/330 kbps class; may be changed between frames (in band)
- *   - the A2DP packet carries RTP header + 1-byte frame count + N LDAC frames; the
- *     library packs as many frames as fit the MTU for us (ldacBT_encode)
- *   - ABR: libldacBT_abr adjusts EQMID from the transport queue depth we report
+ *   - the encoder consumes 128 (44.1/48 k) or 256 (88.2/96 k) PCM frames per LDAC frame
+ *   - EQMID 0/1/2 = 990/660/330 kbps class; it may change between frames (in band)
+ *   - libldac packs as many frames as fit the L2CAP MTU and emits whole packets; the
+ *     driver sends one packet per result, so packets are queued here when the library
+ *     emits more than one for a block, and partial frames are carried over
  *
  * SPDX-License-Identifier: MIT (plugin); libldac is Apache-2.0
  */
@@ -18,6 +18,16 @@
 #include "ldacBT_abr.h"
 #include <stdlib.h>
 #include <string.h>
+
+#define LDAC_MAX_PACKET      2048
+#define LDAC_MAX_PENDING     4
+#define LDAC_MAX_LEFTOVER    (256 * 2 * 4)   /* one LDAC frame of 32-bit stereo */
+
+typedef struct ldac_packet {
+    uint8_t  data[LDAC_MAX_PACKET];
+    uint32_t len;
+    uint32_t frames;
+} ldac_packet;
 
 struct PnCodecEncoder {
     HANDLE_LDAC_BT     h;
@@ -28,8 +38,15 @@ struct PnCodecEncoder {
     uint32_t           rate;
     uint32_t           channels;
     uint32_t           pcm_per_frame;
-    uint32_t           mtu;
     uint32_t           bytes_per_sample;
+    uint32_t           frame_bytes;         /* PCM bytes per LDAC frame */
+    uint32_t           mtu;
+    /* queued output packets (FIFO) */
+    ldac_packet        pending[LDAC_MAX_PENDING];
+    uint32_t           pending_head, pending_count;
+    /* partial frame carried over between calls */
+    uint8_t            leftover[LDAC_MAX_LEFTOVER];
+    uint32_t           leftover_bytes;
 };
 
 static int LdacChannelMode(uint32_t mode)
@@ -55,48 +72,82 @@ static PnCodecEncoder *LdacOpen(const PNA2DP_STREAM_PARAMS *p)
     default:             e->fmt = LDACBT_SMPL_FMT_S32; e->bytes_per_sample = 4; break;
     }
     e->rate = p->SampleRate;
-    e->channels = p->Channels;
+    e->channels = p->Channels ? p->Channels : 2;
     e->mtu = p->MediaMtu;
     e->eqmid = (p->QualityIndex <= 2) ? (int)p->QualityIndex : LDACBT_EQMID_SQ;
     e->abr_enabled = (p->QualityIndex == PNA2DP_LDAC_EQMID_ABR);
     if (e->abr_enabled) e->eqmid = LDACBT_EQMID_SQ;
-    /* mtu is the payload room: libldac wants the full L2CAP MTU (it subtracts RTP + header itself) */
+    /* libldac wants the full L2CAP MTU and subtracts the RTP + payload headers itself */
     int r = ldacBT_init_handle_encode(e->h, (int)(p->MediaMtu + 13), e->eqmid, LdacChannelMode(p->ChannelMode), e->fmt, (int)p->SampleRate);
     if (r != 0) { ldacBT_free_handle(e->h); free(e); return NULL; }
-    e->pcm_per_frame = (uint32_t)ldacBT_get_sampling_freq(e->h) >= 88200 ? 256 : 128;
+    e->pcm_per_frame = (p->SampleRate >= 88200) ? 256 : 128;
+    e->frame_bytes = e->pcm_per_frame * e->channels * e->bytes_per_sample;
     if (e->abr_enabled) {
         e->abr = ldac_ABR_get_handle();
-        if (e->abr) {
-            /* interval = number of encode calls between adjustments; 1 Tx = one packet */
-            ldac_ABR_Init(e->abr, 1000 /* us per packet is ~ interval hint */);
-            ldac_ABR_set_thresholds(e->abr, 6, 4, 2);
-        }
+        if (e->abr) { ldac_ABR_Init(e->abr, 1000); ldac_ABR_set_thresholds(e->abr, 6, 4, 2); }
     }
     return e;
 }
 
+static void QueuePacket(PnCodecEncoder *e, const uint8_t *data, uint32_t len, uint32_t frames)
+{
+    if (e->pending_count >= LDAC_MAX_PENDING || len > LDAC_MAX_PACKET) return;   /* drop: should never happen */
+    ldac_packet *q = &e->pending[(e->pending_head + e->pending_count) % LDAC_MAX_PENDING];
+    memcpy(q->data, data, len);
+    q->len = len;
+    q->frames = frames;
+    e->pending_count++;
+}
+
+static int PopPacket(PnCodecEncoder *e, PnCodecOutput *out)
+{
+    if (!e->pending_count) return 0;
+    ldac_packet *q = &e->pending[e->pending_head];
+    if (q->len > out->capacity) return 0;
+    memcpy(out->buffer, q->data, q->len);
+    out->written = q->len;
+    out->frame_count = q->frames;
+    out->pcm_frames_consumed = q->frames * e->pcm_per_frame;   /* RTP timestamp advance */
+    out->payload_header_byte = q->frames & 0x0F;
+    e->pending_head = (e->pending_head + 1) % LDAC_MAX_PENDING;
+    e->pending_count--;
+    return 1;
+}
+
+static void EncodeFrame(PnCodecEncoder *e, const uint8_t *frame)
+{
+    uint8_t packet[LDAC_MAX_PACKET];
+    int pcm_used = 0, stream_wrote = 0, frame_num = 0;
+    if (ldacBT_encode(e->h, (void *)frame, &pcm_used, packet, &stream_wrote, &frame_num) != 0) return;
+    if (stream_wrote > 0) QueuePacket(e, packet, (uint32_t)stream_wrote, (uint32_t)frame_num);
+}
+
 static int LdacEncode(PnCodecEncoder *e, const uint8_t *pcm, uint32_t pcm_bytes, uint32_t pcm_frames, PnCodecOutput *out)
 {
-    (void)pcm_bytes;
-    uint32_t frame_bytes = e->pcm_per_frame * e->channels * e->bytes_per_sample;
-    uint32_t written = 0, frames_out = 0, consumed = 0;
-    for (uint32_t f = 0; f + e->pcm_per_frame <= pcm_frames; f++) {
-        int pcm_used = 0, stream_wrote = 0, frame_num = 0;
-        if (written + e->mtu > out->capacity) break;
-        int r = ldacBT_encode(e->h, (void *)(pcm + (size_t)f * frame_bytes), &pcm_used, out->buffer + written, &stream_wrote, &frame_num);
-        if (r != 0) return -1;
-        consumed += e->pcm_per_frame;
-        if (stream_wrote > 0) {
-            written += (uint32_t)stream_wrote;
-            frames_out += (uint32_t)frame_num;
-            /* libldac emits a whole packet's worth at once; stop so the driver sends it */
-            break;
-        }
+    (void)pcm_frames;
+    uint32_t pos = 0;
+    out->written = 0;
+    out->frame_count = 0;
+    out->pcm_frames_consumed = 0;
+
+    /* complete a carried-over partial frame first */
+    if (e->leftover_bytes) {
+        uint32_t need = e->frame_bytes - e->leftover_bytes;
+        uint32_t take = need < pcm_bytes ? need : pcm_bytes;
+        memcpy(e->leftover + e->leftover_bytes, pcm, take);
+        e->leftover_bytes += take;
+        pos += take;
+        if (e->leftover_bytes == e->frame_bytes) { EncodeFrame(e, e->leftover); e->leftover_bytes = 0; }
     }
-    out->written = written;
-    out->frame_count = frames_out;
-    out->pcm_frames_consumed = consumed ? consumed : pcm_frames;
-    out->payload_header_byte = frames_out & 0x0F;
+    while (pos + e->frame_bytes <= pcm_bytes) {
+        EncodeFrame(e, pcm + pos);
+        pos += e->frame_bytes;
+    }
+    if (pos < pcm_bytes) {
+        uint32_t rest = pcm_bytes - pos;
+        if (rest <= sizeof(e->leftover)) { memcpy(e->leftover, pcm + pos, rest); e->leftover_bytes = rest; }
+    }
+    PopPacket(e, out);   /* zero-length output is legal: the driver sends nothing */
     out->actual_bitrate_bps = (uint32_t)ldacBT_get_bitrate(e->h) * 1000u;
     return 0;
 }
@@ -113,7 +164,12 @@ static int LdacReconfigure(PnCodecEncoder *e, uint32_t quality, uint32_t bitrate
     return 0;
 }
 
-static void LdacFlush(PnCodecEncoder *e) { (void)e; }
+static void LdacFlush(PnCodecEncoder *e)
+{
+    e->leftover_bytes = 0;
+    e->pending_count = 0;
+    e->pending_head = 0;
+}
 
 static void LdacClose(PnCodecEncoder *e)
 {

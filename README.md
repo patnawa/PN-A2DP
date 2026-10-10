@@ -56,8 +56,9 @@ pna2dpctl watch
 
 ## Status
 
-The driver, the SBC codec, the codec host and the control tool compile from this tree.
-The SBC codec is verified by a round-trip self test. The kernel driver has **not** yet
+The driver, the SBC codec, the codec host, the control tool and the LDAC, aptX and AAC
+plugins compile from this tree. The SBC codec is verified by a round-trip self test and
+the three plugins by an encoder ABI test (`out\Release\plugin_test.exe`). The kernel driver has **not** yet
 been loaded against real hardware from this environment (no kernel debugger or test
 signing on the analysis PC); `docs/06-testing-plan.md` lists the bring-up steps.
 

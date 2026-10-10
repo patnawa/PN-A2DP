@@ -631,7 +631,7 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
         break;
     case PNA2DP_CODEC_LDAC:
         P->PcmFramesPerCodecFrame = (Cfg->SampleRate >= 88200) ? 256 : 128;
-        P->CodecFramesPerPacket = (Cfg->SampleRate >= 88200) ? 2 : 4;   /* ~11.6 ms per packet; host may return fewer */
+        P->CodecFramesPerPacket = 2;   /* blocks of 2 LDAC frames: the plugin packs per MTU and never queues more than one packet per call */
         P->EncoderPcmFormat = Cfg->PcmFormat ? Cfg->PcmFormat : PNA2DP_FMT_S32;
         P->Abr.MaxLevel = 2;
         break;
