@@ -1,0 +1,18 @@
+# build outputs
+/out/
+/build/obj/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.sys
+*.exe
+*.dll
+*.cat
+*.log
+*.tmh
+# toolchain / local
+/.toolchain/
+/third_party/*/build/
+.vs/

@@ -1,0 +1,24 @@
+#include <windows.h>
+#include <ntverp.h>
+
+#define VER_FILETYPE                VFT_DRV
+#define VER_FILESUBTYPE             VFT2_DRV_SOUND
+#define VER_FILEDESCRIPTION_STR     "PN-A2DP Bluetooth A2DP Source Driver"
+#define VER_INTERNALNAME_STR        "pna2dp.sys"
+#define VER_ORIGINALFILENAME_STR    "pna2dp.sys"
+#undef  VER_PRODUCTNAME_STR
+#define VER_PRODUCTNAME_STR         "PN-A2DP"
+#undef  VER_COMPANYNAME_STR
+#define VER_COMPANYNAME_STR         "PN-A2DP Project"
+#undef  VER_LEGALCOPYRIGHT_STR
+#define VER_LEGALCOPYRIGHT_STR      "MIT License"
+#undef  VER_PRODUCTVERSION
+#define VER_PRODUCTVERSION          0,1,0,0
+#undef  VER_PRODUCTVERSION_STR
+#define VER_PRODUCTVERSION_STR      "0.1.0.0"
+#undef  VER_FILEVERSION
+#define VER_FILEVERSION             0,1,0,0
+#undef  VER_FILEVERSION_STR
+#define VER_FILEVERSION_STR         "0.1.0.0"
+
+#include "common.ver"

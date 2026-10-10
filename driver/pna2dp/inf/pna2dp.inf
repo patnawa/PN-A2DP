@@ -1,0 +1,175 @@
+;
+; pna2dp.inf - PN-A2DP open Bluetooth A2DP source driver
+;
+; Binds to the BthEnum PDO that represents the remote AudioSink service (UUID 0x110B),
+; replacing the inbox Microsoft Bluetooth A2dp Source driver for that device only.
+;
+; SPDX-License-Identifier: MIT
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = MEDIA
+ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 10/10/2026,0.1.0.0
+CatalogFile = pna2dp.cat
+PnpLockDown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+pna2dp.sys = 1,,
+
+[DestinationDirs]
+PnA2dp_CopyFiles = 13     ; run from the driver store
+
+[Manufacturer]
+%ProviderName% = PnA2dp, NTamd64.10.0...19041, NTamd64.10.0...22000, NTarm64.10.0...22000
+
+[PnA2dp.NTamd64.10.0...19041]
+%PnA2dp.DeviceDesc% = PnA2dp_Win10, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}
+
+[PnA2dp.NTamd64.10.0...22000]
+%PnA2dp.DeviceDesc% = PnA2dp_Win11, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}
+
+[PnA2dp.NTarm64.10.0...22000]
+%PnA2dp.DeviceDesc% = PnA2dp_Win11, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}
+
+;---------------------------------------------------------------------------
+; Install sections
+;---------------------------------------------------------------------------
+
+[PnA2dp_Win10]
+Include   = ks.inf, wdmaudio.inf
+Needs     = KS.Registration, WDMAUDIO.Registration, mssysfx.CopyFilesAndRegister
+CopyFiles = PnA2dp_CopyFiles
+AddReg    = PnA2dp_AddReg
+
+[PnA2dp_Win11]
+Include   = ks.inf, wdmaudio.inf
+Needs     = KS.Registration, WDMAUDIO.Registration, mssysfx.CopyFilesAndRegisterCapX
+CopyFiles = PnA2dp_CopyFiles
+AddReg    = PnA2dp_AddReg
+
+[PnA2dp_CopyFiles]
+pna2dp.sys,,,0x100
+
+[PnA2dp_AddReg]
+HKR,,Driver,,pna2dp.sys
+
+[PnA2dp_Win10.Services]
+AddService = pna2dp, 0x00000002, PnA2dp_ServiceInstall
+
+[PnA2dp_Win11.Services]
+AddService = pna2dp, 0x00000002, PnA2dp_ServiceInstall
+
+[PnA2dp_ServiceInstall]
+DisplayName    = %PnA2dp.ServiceDesc%
+ServiceType    = 1       ; SERVICE_KERNEL_DRIVER
+StartType      = 3       ; SERVICE_DEMAND_START
+ErrorControl   = 1       ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\pna2dp.sys
+AddReg         = PnA2dp_ServiceInstall_AddReg
+
+[PnA2dp_ServiceInstall_AddReg]
+HKR, Parameters, DebugLevel, %REG_DWORD%, 3
+
+;---------------------------------------------------------------------------
+; KS interfaces (audio endpoint)
+;---------------------------------------------------------------------------
+
+[PnA2dp_Win10.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Topology%, PnA2dp_Topology_Win10
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_Topology%, PnA2dp_Topology_Win10
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Wave%,     PnA2dp_Wave
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_Wave%,     PnA2dp_Wave
+
+[PnA2dp_Win11.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Topology%, PnA2dp_Topology_Win11
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_Topology%, PnA2dp_Topology_Win11
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Wave%,     PnA2dp_Wave
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_Wave%,     PnA2dp_Wave
+
+[PnA2dp_Topology_Win10]
+AddReg = PnA2dp_Topology_AddReg, PnA2dp_SysFx_Win10_AddReg
+
+[PnA2dp_Topology_Win11]
+AddReg = PnA2dp_Topology_AddReg, PnA2dp_SysFx_Win11_AddReg
+
+[PnA2dp_Topology_AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%PnA2dp.TopologyName%
+HKR,"EP\\0",%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,"EP\\0",%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,%REG_DWORD%,0x1
+
+; Microsoft "Audio Home Theater Effects" (bass boost, virtual surround, loudness) stay available
+[PnA2dp_SysFx_Win10_AddReg]
+HKR,"FX\\0",%PKEY_ItemNameDisplay%,,%FX_FriendlyName%
+HKR,"FX\\0",%PKEY_FX_StreamEffectClsid%,,%FX10_STREAM_CLSID%
+HKR,"FX\\0",%PKEY_FX_ModeEffectClsid%,,%FX10_MODE_CLSID%
+HKR,"FX\\0",%PKEY_FX_UiClsid%,,%FX_UI_CLSID%
+HKR,"FX\\0",%PKEY_FX_Association%,,%KSNODETYPE_ANY%
+HKR,"FX\\0",%PKEY_SFX_ProcessingModes_Supported_For_Streaming%,%REG_MULTI_SZ%,%AUDIO_SIGNALPROCESSINGMODE_DEFAULT%
+HKR,"FX\\0",%PKEY_MFX_ProcessingModes_Supported_For_Streaming%,%REG_MULTI_SZ%,%AUDIO_SIGNALPROCESSINGMODE_DEFAULT%
+
+[PnA2dp_SysFx_Win11_AddReg]
+HKR,"FX\\0",%PKEY_ItemNameDisplay%,,%FX_FriendlyName%
+HKR,"FX\\0",%PKEY_FX_StreamEffectClsid%,,%FX11_STREAM_CLSID%
+HKR,"FX\\0",%PKEY_FX_ModeEffectClsid%,,%FX11_MODE_CLSID%
+HKR,"FX\\0",%PKEY_FX_UiClsid%,,%FX_UI_CLSID%
+HKR,"FX\\0\\%WMALFXGFXAPO_Context%",%PKEY_FX_Association%,,%KSNODETYPE_ANY%
+HKR,"FX\\0\\%WMALFXGFXAPO_Context%\\User",,,
+HKR,"FX\\0",%PKEY_SFX_ProcessingModes_Supported_For_Streaming%,%REG_MULTI_SZ%,%AUDIO_SIGNALPROCESSINGMODE_DEFAULT%
+HKR,"FX\\0",%PKEY_MFX_ProcessingModes_Supported_For_Streaming%,%REG_MULTI_SZ%,%AUDIO_SIGNALPROCESSINGMODE_DEFAULT%
+
+[PnA2dp_Wave]
+AddReg = PnA2dp_Wave_AddReg
+
+[PnA2dp_Wave_AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%PnA2dp.WaveName%
+
+;---------------------------------------------------------------------------
+; Strings
+;---------------------------------------------------------------------------
+
+[Strings]
+ProviderName            = "PN-A2DP Project"
+DiskName                = "PN-A2DP Installation Disk"
+PnA2dp.DeviceDesc       = "PN-A2DP Bluetooth Stereo (A2DP) Device"
+PnA2dp.ServiceDesc      = "PN-A2DP Bluetooth A2DP Source Service"
+PnA2dp.TopologyName     = "PN-A2DP Topology"
+PnA2dp.WaveName         = "PN-A2DP Wave"
+FX_FriendlyName         = "Microsoft Audio Home Theater Effects"
+
+KSNAME_Wave             = "Wave"
+KSNAME_Topology         = "Topology"
+
+KSNODETYPE_ANY          = "{00000000-0000-0000-0000-000000000000}"
+KSCATEGORY_AUDIO        = "{6994ad04-93ef-11d0-a3cc-00a0c9223196}"
+KSCATEGORY_RENDER       = "{65e8773e-8f56-11d0-a3b9-00a0c9223196}"
+KSCATEGORY_TOPOLOGY     = "{dda54a40-1e4c-11d1-a050-405705c10000}"
+
+PKEY_AudioEndpoint_Association               = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},7"
+PKEY_ItemNameDisplay                         = "{b725f130-47ef-101a-a5f1-02608c9eebac},10"
+PKEY_FX_Association                          = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},0"
+PKEY_FX_UiClsid                              = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},3"
+PKEY_FX_StreamEffectClsid                    = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},5"
+PKEY_FX_ModeEffectClsid                      = "{d04e05a6-594b-4fb6-a80d-01af5eed7d1d},6"
+PKEY_SFX_ProcessingModes_Supported_For_Streaming = "{d3993a3f-99c2-4402-b5ec-a92a0367664b},5"
+PKEY_MFX_ProcessingModes_Supported_For_Streaming = "{d3993a3f-99c2-4402-b5ec-a92a0367664b},6"
+
+Proxy.CLSID             = "{17cca71b-ecd7-11d0-b908-00a0c9223196}"
+FX_UI_CLSID             = "{5860e1c5-f95c-4a7a-8ec8-8aef24f379a1}"
+FX10_STREAM_CLSID       = "{62dc1a93-ae24-464c-a43e-452f824c4250}"
+FX10_MODE_CLSID         = "{637c490d-eee3-4c0a-973f-371958802da2}"
+FX11_STREAM_CLSID       = "{c9453e73-8c5c-4463-9984-af8bab2f5447}"
+FX11_MODE_CLSID         = "{13ab3ebd-137e-4903-9d89-60be8277fd17}"
+WMALFXGFXAPO_Context    = "{b13412ee-07af-4c57-b08b-e327f8db085b}"
+AUDIO_SIGNALPROCESSINGMODE_DEFAULT = "{c18e2f7e-933d-4965-b7d1-1eef228d2af3}"
+
+REG_DWORD               = 0x00010001
+REG_MULTI_SZ            = 0x00010000

@@ -1,0 +1,9 @@
+[submodule "third_party/ldacBT"]
+	path = third_party/ldacBT
+	url = https://github.com/EHfive/ldacBT.git
+[submodule "third_party/libfreeaptx"]
+	path = third_party/libfreeaptx
+	url = https://github.com/iamthehorker/libfreeaptx.git
+[submodule "third_party/fdk-aac"]
+	path = third_party/fdk-aac
+	url = https://github.com/mstorsjo/fdk-aac.git

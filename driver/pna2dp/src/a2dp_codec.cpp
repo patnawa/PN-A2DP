@@ -1,0 +1,610 @@
+/*
+ * a2dp_codec.cpp - codec capability parsing, selection and configuration building.
+ * SPDX-License-Identifier: MIT
+ */
+#include "pna2dp.h"
+
+static const struct { ULONG Mask; ULONG Hz; } g_RateTable[] = {
+    { PNA2DP_RATE_8000, 8000 }, { PNA2DP_RATE_11025, 11025 }, { PNA2DP_RATE_12000, 12000 }, { PNA2DP_RATE_16000, 16000 },
+    { PNA2DP_RATE_22050, 22050 }, { PNA2DP_RATE_24000, 24000 }, { PNA2DP_RATE_32000, 32000 }, { PNA2DP_RATE_44100, 44100 },
+    { PNA2DP_RATE_48000, 48000 }, { PNA2DP_RATE_64000, 64000 }, { PNA2DP_RATE_88200, 88200 }, { PNA2DP_RATE_96000, 96000 },
+};
+
+ULONG A2dpRateMaskToHz(_In_ ULONG SingleBit)
+{
+    for (ULONG i = 0; i < PN_ARRAYSIZE(g_RateTable); i++) if (g_RateTable[i].Mask == SingleBit) return g_RateTable[i].Hz;
+    return 0;
+}
+
+ULONG A2dpHzToRateMask(_In_ ULONG Hz)
+{
+    for (ULONG i = 0; i < PN_ARRAYSIZE(g_RateTable); i++) if (g_RateTable[i].Hz == Hz) return g_RateTable[i].Mask;
+    return 0;
+}
+
+const char *A2dpCodecName(_In_ ULONG Codec)
+{
+    switch (Codec) {
+    case PNA2DP_CODEC_SBC: return "SBC";
+    case PNA2DP_CODEC_AAC: return "AAC";
+    case PNA2DP_CODEC_APTX: return "aptX";
+    case PNA2DP_CODEC_APTX_HD: return "aptX HD";
+    case PNA2DP_CODEC_APTX_LL: return "aptX LL";
+    case PNA2DP_CODEC_LDAC: return "LDAC";
+    case PNA2DP_CODEC_FASTSTREAM: return "FastStream";
+    case PNA2DP_CODEC_OPUS: return "Opus";
+    case PNA2DP_CODEC_LC3PLUS: return "LC3plus";
+    default: return "none";
+    }
+}
+
+static ULONG ReadLe32(const UCHAR *p) { return (ULONG)p[0] | ((ULONG)p[1] << 8) | ((ULONG)p[2] << 16) | ((ULONG)p[3] << 24); }
+static USHORT ReadLe16(const UCHAR *p) { return (USHORT)(p[0] | (p[1] << 8)); }
+static VOID WriteLe32(UCHAR *p, ULONG v) { p[0] = (UCHAR)v; p[1] = (UCHAR)(v >> 8); p[2] = (UCHAR)(v >> 16); p[3] = (UCHAR)(v >> 24); }
+static VOID WriteLe16(UCHAR *p, USHORT v) { p[0] = (UCHAR)v; p[1] = (UCHAR)(v >> 8); }
+
+/* ---- SBC ---------------------------------------------------------------- */
+
+static ULONG SbcRateBitsToMask(UCHAR b)
+{
+    ULONG m = 0;
+    if (b & PNA2DP_SBC_FREQ_16000) m |= PNA2DP_RATE_16000;
+    if (b & PNA2DP_SBC_FREQ_32000) m |= PNA2DP_RATE_32000;
+    if (b & PNA2DP_SBC_FREQ_44100) m |= PNA2DP_RATE_44100;
+    if (b & PNA2DP_SBC_FREQ_48000) m |= PNA2DP_RATE_48000;
+    return m;
+}
+static UCHAR SbcRateMaskToBits(ULONG m)
+{
+    UCHAR b = 0;
+    if (m & PNA2DP_RATE_16000) b |= PNA2DP_SBC_FREQ_16000;
+    if (m & PNA2DP_RATE_32000) b |= PNA2DP_SBC_FREQ_32000;
+    if (m & PNA2DP_RATE_44100) b |= PNA2DP_SBC_FREQ_44100;
+    if (m & PNA2DP_RATE_48000) b |= PNA2DP_SBC_FREQ_48000;
+    return b;
+}
+static ULONG SbcChBitsToMask(UCHAR b)
+{
+    ULONG m = 0;
+    if (b & PNA2DP_SBC_CH_MONO) m |= PNA2DP_CHMODE_MONO;
+    if (b & PNA2DP_SBC_CH_DUAL) m |= PNA2DP_CHMODE_DUAL;
+    if (b & PNA2DP_SBC_CH_STEREO) m |= PNA2DP_CHMODE_STEREO;
+    if (b & PNA2DP_SBC_CH_JOINT) m |= PNA2DP_CHMODE_JOINT;
+    return m;
+}
+static UCHAR SbcChMaskToBits(ULONG m)
+{
+    UCHAR b = 0;
+    if (m & PNA2DP_CHMODE_MONO) b |= PNA2DP_SBC_CH_MONO;
+    if (m & PNA2DP_CHMODE_DUAL) b |= PNA2DP_SBC_CH_DUAL;
+    if (m & PNA2DP_CHMODE_STEREO) b |= PNA2DP_SBC_CH_STEREO;
+    if (m & PNA2DP_CHMODE_JOINT) b |= PNA2DP_SBC_CH_JOINT;
+    return b;
+}
+
+/* ---- aptX family -------------------------------------------------------- */
+
+static ULONG AptxRateBitsToMask(UCHAR b)
+{
+    ULONG m = 0;
+    if (b & APTX_FREQ_16000) m |= PNA2DP_RATE_16000;
+    if (b & APTX_FREQ_32000) m |= PNA2DP_RATE_32000;
+    if (b & APTX_FREQ_44100) m |= PNA2DP_RATE_44100;
+    if (b & APTX_FREQ_48000) m |= PNA2DP_RATE_48000;
+    return m;
+}
+static UCHAR AptxRateMaskToBits(ULONG m)
+{
+    UCHAR b = 0;
+    if (m & PNA2DP_RATE_16000) b |= APTX_FREQ_16000;
+    if (m & PNA2DP_RATE_32000) b |= APTX_FREQ_32000;
+    if (m & PNA2DP_RATE_44100) b |= APTX_FREQ_44100;
+    if (m & PNA2DP_RATE_48000) b |= APTX_FREQ_48000;
+    return b;
+}
+
+/* ---- AAC ---------------------------------------------------------------- */
+
+static ULONG AacRateBitsToMask(UCHAR b1, UCHAR b2)
+{
+    ULONG m = 0;
+    if (b1 & 0x80) m |= PNA2DP_RATE_8000;
+    if (b1 & 0x40) m |= PNA2DP_RATE_11025;
+    if (b1 & 0x20) m |= PNA2DP_RATE_12000;
+    if (b1 & 0x10) m |= PNA2DP_RATE_16000;
+    if (b1 & 0x08) m |= PNA2DP_RATE_22050;
+    if (b1 & 0x04) m |= PNA2DP_RATE_24000;
+    if (b1 & 0x02) m |= PNA2DP_RATE_32000;
+    if (b1 & 0x01) m |= PNA2DP_RATE_44100;
+    if (b2 & 0x80) m |= PNA2DP_RATE_48000;
+    if (b2 & 0x40) m |= PNA2DP_RATE_64000;
+    if (b2 & 0x20) m |= PNA2DP_RATE_88200;
+    if (b2 & 0x10) m |= PNA2DP_RATE_96000;
+    return m;
+}
+static VOID AacRateMaskToBits(ULONG m, UCHAR *b1, UCHAR *b2)
+{
+    UCHAR x = 0, y = 0;
+    if (m & PNA2DP_RATE_8000) x |= 0x80;
+    if (m & PNA2DP_RATE_11025) x |= 0x40;
+    if (m & PNA2DP_RATE_12000) x |= 0x20;
+    if (m & PNA2DP_RATE_16000) x |= 0x10;
+    if (m & PNA2DP_RATE_22050) x |= 0x08;
+    if (m & PNA2DP_RATE_24000) x |= 0x04;
+    if (m & PNA2DP_RATE_32000) x |= 0x02;
+    if (m & PNA2DP_RATE_44100) x |= 0x01;
+    if (m & PNA2DP_RATE_48000) y |= 0x80;
+    if (m & PNA2DP_RATE_64000) y |= 0x40;
+    if (m & PNA2DP_RATE_88200) y |= 0x20;
+    if (m & PNA2DP_RATE_96000) y |= 0x10;
+    *b1 = x; *b2 = y;
+}
+
+/* ---- LDAC --------------------------------------------------------------- */
+
+static ULONG LdacRateBitsToMask(UCHAR b)
+{
+    ULONG m = 0;
+    if (b & LDAC_FREQ_44100) m |= PNA2DP_RATE_44100;
+    if (b & LDAC_FREQ_48000) m |= PNA2DP_RATE_48000;
+    if (b & LDAC_FREQ_88200) m |= PNA2DP_RATE_88200;
+    if (b & LDAC_FREQ_96000) m |= PNA2DP_RATE_96000;
+    return m;
+}
+static UCHAR LdacRateMaskToBits(ULONG m)
+{
+    UCHAR b = 0;
+    if (m & PNA2DP_RATE_44100) b |= LDAC_FREQ_44100;
+    if (m & PNA2DP_RATE_48000) b |= LDAC_FREQ_48000;
+    if (m & PNA2DP_RATE_88200) b |= LDAC_FREQ_88200;
+    if (m & PNA2DP_RATE_96000) b |= LDAC_FREQ_96000;
+    return b;
+}
+
+/* ------------------------------------------------------------------------- */
+
+BOOLEAN A2dpParseCaps(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const UCHAR *Ies, _In_ ULONG Len,
+                      _Out_ PA2DP_CODEC_CAPS Caps, _Out_opt_ PULONG VendorId, _Out_opt_ PUSHORT VendorCodecId)
+{
+    RtlZeroMemory(Caps, sizeof(*Caps));
+    if (VendorId) *VendorId = 0;
+    if (VendorCodecId) *VendorCodecId = 0;
+
+    switch (MediaCodecType) {
+    case A2DP_CODEC_SBC:
+        if (Len < 4) return FALSE;
+        Caps->Codec = PNA2DP_CODEC_SBC;
+        Caps->RateMask = SbcRateBitsToMask(Ies[0] & 0xF0);
+        Caps->ChannelModeMask = SbcChBitsToMask(Ies[0] & 0x0F);
+        Caps->SbcBlockMask = Ies[1] & 0xF0;
+        Caps->SbcSubbandMask = Ies[1] & 0x0C;
+        Caps->SbcAllocMask = Ies[1] & 0x03;
+        Caps->SbcMinBitpool = Ies[2];
+        Caps->SbcMaxBitpool = Ies[3];
+        Caps->FormatMask = PNA2DP_FMT_S16;
+        return TRUE;
+
+    case A2DP_CODEC_MPEG24_AAC:
+        if (Len < 6) return FALSE;
+        Caps->Codec = PNA2DP_CODEC_AAC;
+        Caps->AacObjectMask = Ies[0];
+        Caps->RateMask = AacRateBitsToMask(Ies[1], Ies[2]);
+        Caps->ChannelModeMask = ((Ies[2] & AAC_CH_MONO) ? PNA2DP_CHMODE_MONO : 0) | ((Ies[2] & AAC_CH_STEREO) ? PNA2DP_CHMODE_STEREO : 0);
+        Caps->AacVbr = (Ies[3] & 0x80) != 0;
+        Caps->AacMaxBitrate = ((ULONG)(Ies[3] & 0x7F) << 16) | ((ULONG)Ies[4] << 8) | Ies[5];
+        Caps->FormatMask = PNA2DP_FMT_S16 | PNA2DP_FMT_S24 | PNA2DP_FMT_S32;
+        return TRUE;
+
+    case A2DP_CODEC_VENDOR: {
+        if (Len < 6) return FALSE;
+        ULONG vid = ReadLe32(Ies);
+        USHORT cid = ReadLe16(Ies + 4);
+        const UCHAR *v = Ies + 6;
+        ULONG vlen = Len - 6;
+        if (VendorId) *VendorId = vid;
+        if (VendorCodecId) *VendorCodecId = cid;
+        if (vid == A2DP_VENDOR_APTX && cid == A2DP_CODECID_APTX) {
+            if (vlen < 1) return FALSE;
+            Caps->Codec = PNA2DP_CODEC_APTX;
+            Caps->RateMask = AptxRateBitsToMask(v[0] & 0xF0);
+            Caps->ChannelModeMask = ((v[0] & APTX_CH_STEREO) ? PNA2DP_CHMODE_STEREO : 0) | ((v[0] & APTX_CH_MONO) ? PNA2DP_CHMODE_MONO : 0);
+            Caps->FormatMask = PNA2DP_FMT_S24;
+            return TRUE;
+        }
+        if (vid == A2DP_VENDOR_APTX_HD && cid == A2DP_CODECID_APTX_HD) {
+            if (vlen < 1) return FALSE;
+            Caps->Codec = PNA2DP_CODEC_APTX_HD;
+            Caps->RateMask = AptxRateBitsToMask(v[0] & 0xF0);
+            Caps->ChannelModeMask = ((v[0] & APTX_CH_STEREO) ? PNA2DP_CHMODE_STEREO : 0) | ((v[0] & APTX_CH_MONO) ? PNA2DP_CHMODE_MONO : 0);
+            Caps->FormatMask = PNA2DP_FMT_S24;
+            return TRUE;
+        }
+        if (vid == A2DP_VENDOR_CSR && cid == A2DP_CODECID_APTX_LL) {
+            if (vlen < 2) return FALSE;
+            Caps->Codec = PNA2DP_CODEC_APTX_LL;
+            Caps->RateMask = AptxRateBitsToMask(v[0] & 0xF0);
+            Caps->ChannelModeMask = ((v[0] & APTX_CH_STEREO) ? PNA2DP_CHMODE_STEREO : 0) | ((v[0] & APTX_CH_MONO) ? PNA2DP_CHMODE_MONO : 0);
+            Caps->AptxLlBidirectional = (v[1] & 0x01) != 0;
+            Caps->FormatMask = PNA2DP_FMT_S24;
+            return TRUE;
+        }
+        if (vid == A2DP_VENDOR_SONY && cid == A2DP_CODECID_LDAC) {
+            if (vlen < 2) return FALSE;
+            Caps->Codec = PNA2DP_CODEC_LDAC;
+            Caps->RateMask = LdacRateBitsToMask(v[0]);
+            Caps->ChannelModeMask = ((v[1] & LDAC_CH_MONO) ? PNA2DP_CHMODE_MONO : 0) | ((v[1] & LDAC_CH_DUAL) ? PNA2DP_CHMODE_DUAL : 0) |
+                                    ((v[1] & LDAC_CH_STEREO) ? PNA2DP_CHMODE_STEREO : 0);
+            Caps->FormatMask = PNA2DP_FMT_S16 | PNA2DP_FMT_S24 | PNA2DP_FMT_S32 | PNA2DP_FMT_F32;
+            return TRUE;
+        }
+        if (vid == A2DP_VENDOR_CSR && cid == A2DP_CODECID_FASTSTREAM) {
+            if (vlen < 2) return FALSE;
+            Caps->Codec = PNA2DP_CODEC_FASTSTREAM;
+            Caps->FsDirections = v[0];
+            Caps->RateMask = ((v[1] & FASTSTREAM_SINK_FREQ_48000) ? PNA2DP_RATE_48000 : 0) | ((v[1] & FASTSTREAM_SINK_FREQ_44100) ? PNA2DP_RATE_44100 : 0);
+            Caps->ChannelModeMask = PNA2DP_CHMODE_JOINT;
+            Caps->FormatMask = PNA2DP_FMT_S16;
+            return TRUE;
+        }
+        if (vid == A2DP_VENDOR_LINUXFOUND && cid == A2DP_CODECID_OPUS) {
+            /* PipeWire OPUS-A2DP 0.5: octet0 = channel mask (bit0 mono, bit1 stereo...), later bytes frame durations/bitrate */
+            if (vlen < 1) return FALSE;
+            Caps->Codec = PNA2DP_CODEC_OPUS;
+            Caps->RateMask = PNA2DP_RATE_48000;
+            Caps->ChannelModeMask = ((v[0] & 0x01) ? PNA2DP_CHMODE_MONO : 0) | ((v[0] & 0x02) ? PNA2DP_CHMODE_STEREO : 0);
+            Caps->FormatMask = PNA2DP_FMT_S16 | PNA2DP_FMT_F32;
+            return TRUE;
+        }
+        return FALSE;
+    }
+    default:
+        return FALSE;
+    }
+}
+
+BOOLEAN A2dpParseConfig(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const UCHAR *Ies, _In_ ULONG Len, _Out_ PA2DP_CODEC_CONFIG Cfg)
+{
+    A2DP_CODEC_CAPS caps;
+    ULONG vid; USHORT cid;
+    RtlZeroMemory(Cfg, sizeof(*Cfg));
+    if (!A2dpParseCaps(MediaCodecType, Ies, Len, &caps, &vid, &cid)) return FALSE;
+    Cfg->Codec = caps.Codec;
+    Cfg->MediaCodecType = MediaCodecType;
+    /* a configuration has exactly one bit per field; pick the lowest set bit if several */
+    Cfg->SampleRate = A2dpRateMaskToHz(caps.RateMask & (0 - caps.RateMask));
+    if (caps.RateMask & PNA2DP_RATE_96000) Cfg->SampleRate = 96000;   /* prefer highest if sloppy sink */
+    Cfg->ChannelMode = caps.ChannelModeMask & (0 - caps.ChannelModeMask);
+    Cfg->Channels = (Cfg->ChannelMode == PNA2DP_CHMODE_MONO) ? 1 : 2;
+    switch (caps.Codec) {
+    case PNA2DP_CODEC_SBC:
+        Cfg->SbcBlocks = (caps.SbcBlockMask & PNA2DP_SBC_BLOCKS_16) ? 16 : (caps.SbcBlockMask & PNA2DP_SBC_BLOCKS_12) ? 12 :
+                         (caps.SbcBlockMask & PNA2DP_SBC_BLOCKS_8) ? 8 : 4;
+        Cfg->SbcSubbands = (caps.SbcSubbandMask & PNA2DP_SBC_SUBBANDS_8) ? 8 : 4;
+        Cfg->SbcAlloc = (caps.SbcAllocMask & PNA2DP_SBC_ALLOC_LOUDNESS) ? 0 : 1;
+        Cfg->SbcMinBitpool = caps.SbcMinBitpool;
+        Cfg->SbcMaxBitpool = caps.SbcMaxBitpool;
+        Cfg->SbcBitpool = caps.SbcMaxBitpool;
+        Cfg->PcmFormat = PNA2DP_FMT_S16;
+        break;
+    case PNA2DP_CODEC_AAC:
+        Cfg->AacObjectType = (caps.AacObjectMask & AAC_OBJ_MPEG2_LC) ? 2 : (caps.AacObjectMask & AAC_OBJ_MPEG4_LC) ? 2 :
+                             (caps.AacObjectMask & AAC_OBJ_HE_V1) ? 5 : 29;
+        Cfg->AacVbr = caps.AacVbr;
+        Cfg->BitrateBps = caps.AacMaxBitrate;
+        Cfg->PcmFormat = PNA2DP_FMT_S16;
+        break;
+    case PNA2DP_CODEC_LDAC:
+        Cfg->PcmFormat = PNA2DP_FMT_S32;
+        Cfg->LdacEqmid = PNA2DP_LDAC_EQMID_SQ;
+        break;
+    case PNA2DP_CODEC_APTX_HD:
+    case PNA2DP_CODEC_APTX:
+    case PNA2DP_CODEC_APTX_LL:
+        Cfg->PcmFormat = PNA2DP_FMT_S24;
+        break;
+    default:
+        Cfg->PcmFormat = PNA2DP_FMT_S16;
+        break;
+    }
+    Cfg->IesLength = (UCHAR)PN_MIN(Len, sizeof(Cfg->Ies));
+    RtlCopyMemory(Cfg->Ies, Ies, Cfg->IesLength);
+    Cfg->MaxBitrateBps = Cfg->BitrateBps = A2dpNominalBitrate(Cfg);
+    return TRUE;
+}
+
+ULONG A2dpBuildLocalCaps(_In_ ULONG Codec, _Out_writes_bytes_(Cap) PUCHAR Out, _In_ ULONG Cap, _Out_ PUCHAR MediaCodecType)
+{
+    if (Cap < 16) return 0;
+    RtlZeroMemory(Out, Cap);
+    switch (Codec) {
+    case PNA2DP_CODEC_SBC:
+        *MediaCodecType = A2DP_CODEC_SBC;
+        Out[0] = PNA2DP_SBC_FREQ_16000 | PNA2DP_SBC_FREQ_32000 | PNA2DP_SBC_FREQ_44100 | PNA2DP_SBC_FREQ_48000 |
+                 PNA2DP_SBC_CH_MONO | PNA2DP_SBC_CH_DUAL | PNA2DP_SBC_CH_STEREO | PNA2DP_SBC_CH_JOINT;
+        Out[1] = PNA2DP_SBC_BLOCKS_4 | PNA2DP_SBC_BLOCKS_8 | PNA2DP_SBC_BLOCKS_12 | PNA2DP_SBC_BLOCKS_16 |
+                 PNA2DP_SBC_SUBBANDS_4 | PNA2DP_SBC_SUBBANDS_8 | PNA2DP_SBC_ALLOC_SNR | PNA2DP_SBC_ALLOC_LOUDNESS;
+        Out[2] = 2;
+        Out[3] = 250;
+        return 4;
+    case PNA2DP_CODEC_AAC: {
+        UCHAR b1, b2;
+        *MediaCodecType = A2DP_CODEC_MPEG24_AAC;
+        Out[0] = AAC_OBJ_MPEG2_LC | AAC_OBJ_MPEG4_LC;
+        AacRateMaskToBits(PNA2DP_RATE_44100 | PNA2DP_RATE_48000 | PNA2DP_RATE_88200 | PNA2DP_RATE_96000, &b1, &b2);
+        Out[1] = b1;
+        Out[2] = (UCHAR)(b2 | AAC_CH_MONO | AAC_CH_STEREO);
+        Out[3] = 0x80 | 0x05;   /* VBR + bitrate 0x05 xxxx = 320000 */
+        Out[4] = 0xE2;
+        Out[5] = 0x00;          /* 0x04E200 = 320000 */
+        return 6;
+    }
+    case PNA2DP_CODEC_APTX:
+        *MediaCodecType = A2DP_CODEC_VENDOR;
+        WriteLe32(Out, A2DP_VENDOR_APTX); WriteLe16(Out + 4, A2DP_CODECID_APTX);
+        Out[6] = APTX_FREQ_44100 | APTX_FREQ_48000 | APTX_CH_STEREO;
+        return 7;
+    case PNA2DP_CODEC_APTX_HD:
+        *MediaCodecType = A2DP_CODEC_VENDOR;
+        WriteLe32(Out, A2DP_VENDOR_APTX_HD); WriteLe16(Out + 4, A2DP_CODECID_APTX_HD);
+        Out[6] = APTX_FREQ_44100 | APTX_FREQ_48000 | APTX_CH_STEREO;
+        return 11;   /* 4 reserved bytes */
+    case PNA2DP_CODEC_APTX_LL:
+        *MediaCodecType = A2DP_CODEC_VENDOR;
+        WriteLe32(Out, A2DP_VENDOR_CSR); WriteLe16(Out + 4, A2DP_CODECID_APTX_LL);
+        Out[6] = APTX_FREQ_44100 | APTX_FREQ_48000 | APTX_CH_STEREO;
+        Out[7] = 0x00;  /* no bidirectional link */
+        return 8;
+    case PNA2DP_CODEC_LDAC:
+        *MediaCodecType = A2DP_CODEC_VENDOR;
+        WriteLe32(Out, A2DP_VENDOR_SONY); WriteLe16(Out + 4, A2DP_CODECID_LDAC);
+        Out[6] = LDAC_FREQ_44100 | LDAC_FREQ_48000 | LDAC_FREQ_88200 | LDAC_FREQ_96000;
+        Out[7] = LDAC_CH_MONO | LDAC_CH_DUAL | LDAC_CH_STEREO;
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+static ULONG PickRate(ULONG Allowed, ULONG Preferred)
+{
+    if (Allowed == 0) return 0;
+    ULONG pm = A2dpHzToRateMask(Preferred);
+    if (pm & Allowed) return Preferred;
+    /* nearest higher first, then highest available */
+    for (ULONG i = 0; i < PN_ARRAYSIZE(g_RateTable); i++) {
+        if ((g_RateTable[i].Mask & Allowed) && g_RateTable[i].Hz >= Preferred) return g_RateTable[i].Hz;
+    }
+    for (LONG i = (LONG)PN_ARRAYSIZE(g_RateTable) - 1; i >= 0; i--) {
+        if (g_RateTable[i].Mask & Allowed) return g_RateTable[i].Hz;
+    }
+    return 0;
+}
+
+static ULONG PickHighestRate(ULONG Allowed)
+{
+    for (LONG i = (LONG)PN_ARRAYSIZE(g_RateTable) - 1; i >= 0; i--) if (g_RateTable[i].Mask & Allowed) return g_RateTable[i].Hz;
+    return 0;
+}
+
+static ULONG PickChannelMode(ULONG Allowed, ULONG PreferDual)
+{
+    if (PreferDual && (Allowed & PNA2DP_CHMODE_DUAL)) return PNA2DP_CHMODE_DUAL;
+    if (Allowed & PNA2DP_CHMODE_JOINT) return PNA2DP_CHMODE_JOINT;
+    if (Allowed & PNA2DP_CHMODE_STEREO) return PNA2DP_CHMODE_STEREO;
+    if (Allowed & PNA2DP_CHMODE_DUAL) return PNA2DP_CHMODE_DUAL;
+    if (Allowed & PNA2DP_CHMODE_MONO) return PNA2DP_CHMODE_MONO;
+    return 0;
+}
+
+BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CONFIG *Pref, _In_ ULONG PreferredRate,
+                         _In_ ULONG PreferredBits, _Out_ PA2DP_CODEC_CONFIG Cfg)
+{
+    RtlZeroMemory(Cfg, sizeof(*Cfg));
+    Cfg->Codec = Caps->Codec;
+    ULONG rates = Caps->RateMask;
+    ULONG chmodes = Caps->ChannelModeMask;
+    BOOLEAN preferDual = (Pref->Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) != 0;
+
+    switch (Caps->Codec) {
+    case PNA2DP_CODEC_SBC: {
+        if (Pref->Sbc.RateMask) rates &= SbcRateBitsToMask(Pref->Sbc.RateMask);
+        if (Pref->Sbc.ChannelModeMask) chmodes &= SbcChBitsToMask(Pref->Sbc.ChannelModeMask);
+        if (!rates) rates = Caps->RateMask;
+        if (!chmodes) chmodes = Caps->ChannelModeMask;
+        Cfg->MediaCodecType = A2DP_CODEC_SBC;
+        Cfg->SampleRate = PickRate(rates, PreferredRate);
+        Cfg->ChannelMode = PickChannelMode(chmodes, preferDual);
+        UCHAR blocks = Caps->SbcBlockMask, subs = Caps->SbcSubbandMask, alloc = Caps->SbcAllocMask;
+        if (Pref->Sbc.BlockMask && (blocks & Pref->Sbc.BlockMask)) blocks &= Pref->Sbc.BlockMask;
+        if (Pref->Sbc.SubbandMask && (subs & Pref->Sbc.SubbandMask)) subs &= Pref->Sbc.SubbandMask;
+        if (Pref->Sbc.AllocMask && (alloc & Pref->Sbc.AllocMask)) alloc &= Pref->Sbc.AllocMask;
+        Cfg->SbcBlocks = (blocks & PNA2DP_SBC_BLOCKS_16) ? 16 : (blocks & PNA2DP_SBC_BLOCKS_12) ? 12 : (blocks & PNA2DP_SBC_BLOCKS_8) ? 8 : 4;
+        Cfg->SbcSubbands = (subs & PNA2DP_SBC_SUBBANDS_8) ? 8 : 4;
+        Cfg->SbcAlloc = (alloc & PNA2DP_SBC_ALLOC_LOUDNESS) ? 0 : 1;
+        UCHAR minbp = PN_MAX(Caps->SbcMinBitpool, (UCHAR)2);
+        UCHAR maxbp = Caps->SbcMaxBitpool;
+        if (Pref->Sbc.MaxBitpool) {
+            if (Pref->Sbc.MaxBitpool <= maxbp || Pref->Sbc.AllowBitpoolOverride) maxbp = Pref->Sbc.MaxBitpool;
+        }
+        if (Pref->Sbc.MinBitpool && Pref->Sbc.MinBitpool > minbp) minbp = Pref->Sbc.MinBitpool;
+        if (maxbp < minbp) maxbp = minbp;
+        /* Keep every frame inside a single L2CAP MTU for latency: frame <= ~ (mtu-13) */
+        Cfg->SbcMinBitpool = minbp;
+        Cfg->SbcMaxBitpool = maxbp;
+        Cfg->SbcBitpool = maxbp;
+        Cfg->PcmFormat = PNA2DP_FMT_S16;
+        break;
+    }
+    case PNA2DP_CODEC_AAC:
+        if (Pref->Aac.RateMask) rates &= Pref->Aac.RateMask;
+        if (!rates) rates = Caps->RateMask;
+        if (Pref->Aac.ChannelModeMask) chmodes &= Pref->Aac.ChannelModeMask;
+        if (!chmodes) chmodes = Caps->ChannelModeMask;
+        Cfg->MediaCodecType = A2DP_CODEC_MPEG24_AAC;
+        Cfg->SampleRate = PickRate(rates, PreferredRate);
+        Cfg->ChannelMode = (chmodes & PNA2DP_CHMODE_STEREO) ? PNA2DP_CHMODE_STEREO : PNA2DP_CHMODE_MONO;
+        Cfg->AacObjectType = 2;
+        if (Pref->Aac.ObjectType == 5 && (Caps->AacObjectMask & AAC_OBJ_HE_V1)) Cfg->AacObjectType = 5;
+        Cfg->AacVbr = Caps->AacVbr && Pref->Aac.Vbr;
+        Cfg->BitrateBps = Caps->AacMaxBitrate ? Caps->AacMaxBitrate : 256000;
+        if (Pref->Aac.BitrateBps && Pref->Aac.BitrateBps < Cfg->BitrateBps) Cfg->BitrateBps = Pref->Aac.BitrateBps;
+        if (Cfg->BitrateBps > 320000) Cfg->BitrateBps = 320000;
+        Cfg->PcmFormat = PNA2DP_FMT_S16;
+        break;
+    case PNA2DP_CODEC_APTX:
+    case PNA2DP_CODEC_APTX_HD:
+    case PNA2DP_CODEC_APTX_LL: {
+        const PNA2DP_APTX_PARAMS *ap = Caps->Codec == PNA2DP_CODEC_APTX ? &Pref->Aptx : Caps->Codec == PNA2DP_CODEC_APTX_HD ? &Pref->AptxHd : &Pref->AptxLl;
+        if (ap->RateMask) rates &= ap->RateMask;
+        if (!rates) rates = Caps->RateMask;
+        Cfg->MediaCodecType = A2DP_CODEC_VENDOR;
+        Cfg->SampleRate = PickRate(rates, PreferredRate);
+        Cfg->ChannelMode = (chmodes & PNA2DP_CHMODE_STEREO) ? PNA2DP_CHMODE_STEREO : PNA2DP_CHMODE_MONO;
+        Cfg->PcmFormat = PNA2DP_FMT_S24;
+        Cfg->AptxLlTargetLevel = ap->LlTargetLevel;
+        break;
+    }
+    case PNA2DP_CODEC_LDAC:
+        if (Pref->Ldac.RateMask) rates &= Pref->Ldac.RateMask;
+        if (!rates) rates = Caps->RateMask;
+        if (Pref->Ldac.ChannelModeMask) chmodes &= Pref->Ldac.ChannelModeMask;
+        if (!chmodes) chmodes = Caps->ChannelModeMask;
+        Cfg->MediaCodecType = A2DP_CODEC_VENDOR;
+        /* LDAC: prefer the engine rate when the sink has it, otherwise the highest */
+        Cfg->SampleRate = PickRate(rates, PreferredRate);
+        if (PreferredBits >= 24 && (rates & (PNA2DP_RATE_96000 | PNA2DP_RATE_88200)) && Cfg->SampleRate < 88200 &&
+            (Pref->Flags & PNA2DP_CFG_EXPOSE_ALL_RATES)) {
+            Cfg->SampleRate = PickHighestRate(rates);
+        }
+        Cfg->ChannelMode = (chmodes & PNA2DP_CHMODE_STEREO) ? PNA2DP_CHMODE_STEREO : (chmodes & PNA2DP_CHMODE_DUAL) ? PNA2DP_CHMODE_DUAL : PNA2DP_CHMODE_MONO;
+        if (preferDual && (chmodes & PNA2DP_CHMODE_DUAL)) Cfg->ChannelMode = PNA2DP_CHMODE_DUAL;
+        Cfg->LdacEqmid = (Pref->Ldac.Eqmid <= PNA2DP_LDAC_EQMID_MQ) ? Pref->Ldac.Eqmid : PNA2DP_LDAC_EQMID_SQ;
+        Cfg->PcmFormat = (Pref->Ldac.FormatMask & PNA2DP_FMT_S32) ? PNA2DP_FMT_S32 : (Pref->Ldac.FormatMask & PNA2DP_FMT_S24) ? PNA2DP_FMT_S24 :
+                         (Pref->Ldac.FormatMask & PNA2DP_FMT_F32) ? PNA2DP_FMT_F32 : (PreferredBits > 16 ? PNA2DP_FMT_S32 : PNA2DP_FMT_S16);
+        break;
+    case PNA2DP_CODEC_FASTSTREAM:
+        Cfg->MediaCodecType = A2DP_CODEC_VENDOR;
+        Cfg->SampleRate = (rates & PNA2DP_RATE_48000) ? 48000 : 44100;
+        Cfg->ChannelMode = PNA2DP_CHMODE_JOINT;
+        Cfg->PcmFormat = PNA2DP_FMT_S16;
+        break;
+    case PNA2DP_CODEC_OPUS:
+        Cfg->MediaCodecType = A2DP_CODEC_VENDOR;
+        Cfg->SampleRate = 48000;
+        Cfg->ChannelMode = (chmodes & PNA2DP_CHMODE_STEREO) ? PNA2DP_CHMODE_STEREO : PNA2DP_CHMODE_MONO;
+        Cfg->PcmFormat = PNA2DP_FMT_S16;
+        break;
+    default:
+        return FALSE;
+    }
+    if (!Cfg->SampleRate || !Cfg->ChannelMode) return FALSE;
+    Cfg->Channels = (Cfg->ChannelMode == PNA2DP_CHMODE_MONO) ? 1 : 2;
+    A2dpSerializeConfig(Cfg);
+    Cfg->BitrateBps = A2dpNominalBitrate(Cfg);
+    Cfg->MaxBitrateBps = Cfg->BitrateBps;
+    return TRUE;
+}
+
+VOID A2dpSerializeConfig(_Inout_ PA2DP_CODEC_CONFIG Cfg)
+{
+    PUCHAR o = Cfg->Ies;
+    RtlZeroMemory(Cfg->Ies, sizeof(Cfg->Ies));
+    ULONG rateMask = A2dpHzToRateMask(Cfg->SampleRate);
+    switch (Cfg->Codec) {
+    case PNA2DP_CODEC_SBC:
+        o[0] = (UCHAR)(SbcRateMaskToBits(rateMask) | SbcChMaskToBits(Cfg->ChannelMode));
+        o[1] = (UCHAR)((Cfg->SbcBlocks == 16 ? PNA2DP_SBC_BLOCKS_16 : Cfg->SbcBlocks == 12 ? PNA2DP_SBC_BLOCKS_12 : Cfg->SbcBlocks == 8 ? PNA2DP_SBC_BLOCKS_8 : PNA2DP_SBC_BLOCKS_4) |
+                       (Cfg->SbcSubbands == 8 ? PNA2DP_SBC_SUBBANDS_8 : PNA2DP_SBC_SUBBANDS_4) |
+                       (Cfg->SbcAlloc == 0 ? PNA2DP_SBC_ALLOC_LOUDNESS : PNA2DP_SBC_ALLOC_SNR));
+        o[2] = Cfg->SbcMinBitpool;
+        o[3] = Cfg->SbcMaxBitpool;
+        Cfg->IesLength = 4;
+        break;
+    case PNA2DP_CODEC_AAC: {
+        UCHAR b1, b2;
+        o[0] = (UCHAR)(Cfg->AacObjectType == 5 ? AAC_OBJ_HE_V1 : Cfg->AacObjectType == 29 ? AAC_OBJ_HE_V2 : AAC_OBJ_MPEG2_LC);
+        AacRateMaskToBits(rateMask, &b1, &b2);
+        o[1] = b1;
+        o[2] = (UCHAR)(b2 | (Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? AAC_CH_MONO : AAC_CH_STEREO));
+        o[3] = (UCHAR)((Cfg->AacVbr ? 0x80 : 0) | ((Cfg->BitrateBps >> 16) & 0x7F));
+        o[4] = (UCHAR)(Cfg->BitrateBps >> 8);
+        o[5] = (UCHAR)(Cfg->BitrateBps);
+        Cfg->IesLength = 6;
+        break;
+    }
+    case PNA2DP_CODEC_APTX:
+        WriteLe32(o, A2DP_VENDOR_APTX); WriteLe16(o + 4, A2DP_CODECID_APTX);
+        o[6] = (UCHAR)(AptxRateMaskToBits(rateMask) | (Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? APTX_CH_MONO : APTX_CH_STEREO));
+        Cfg->IesLength = 7;
+        break;
+    case PNA2DP_CODEC_APTX_HD:
+        WriteLe32(o, A2DP_VENDOR_APTX_HD); WriteLe16(o + 4, A2DP_CODECID_APTX_HD);
+        o[6] = (UCHAR)(AptxRateMaskToBits(rateMask) | (Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? APTX_CH_MONO : APTX_CH_STEREO));
+        Cfg->IesLength = 11;
+        break;
+    case PNA2DP_CODEC_APTX_LL:
+        WriteLe32(o, A2DP_VENDOR_CSR); WriteLe16(o + 4, A2DP_CODECID_APTX_LL);
+        o[6] = (UCHAR)(AptxRateMaskToBits(rateMask) | (Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? APTX_CH_MONO : APTX_CH_STEREO));
+        o[7] = 0;
+        Cfg->IesLength = 8;
+        break;
+    case PNA2DP_CODEC_LDAC:
+        WriteLe32(o, A2DP_VENDOR_SONY); WriteLe16(o + 4, A2DP_CODECID_LDAC);
+        o[6] = LdacRateMaskToBits(rateMask);
+        o[7] = (UCHAR)(Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? LDAC_CH_MONO : Cfg->ChannelMode == PNA2DP_CHMODE_DUAL ? LDAC_CH_DUAL : LDAC_CH_STEREO);
+        Cfg->IesLength = 8;
+        break;
+    case PNA2DP_CODEC_FASTSTREAM:
+        WriteLe32(o, A2DP_VENDOR_CSR); WriteLe16(o + 4, A2DP_CODECID_FASTSTREAM);
+        o[6] = FASTSTREAM_DIR_SINK;
+        o[7] = (UCHAR)(Cfg->SampleRate == 48000 ? FASTSTREAM_SINK_FREQ_48000 : FASTSTREAM_SINK_FREQ_44100);
+        Cfg->IesLength = 8;
+        break;
+    case PNA2DP_CODEC_OPUS:
+        WriteLe32(o, A2DP_VENDOR_LINUXFOUND); WriteLe16(o + 4, A2DP_CODECID_OPUS);
+        o[6] = (UCHAR)(Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? 0x01 : 0x02);
+        Cfg->IesLength = 7;
+        break;
+    default:
+        Cfg->IesLength = 0;
+        break;
+    }
+}
+
+ULONG A2dpNominalBitrate(_In_ const A2DP_CODEC_CONFIG *Cfg)
+{
+    switch (Cfg->Codec) {
+    case PNA2DP_CODEC_SBC: {
+        sbc_params p;
+        p.sample_rate = Cfg->SampleRate;
+        p.channel_mode = (sbc_u8)(Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? SBC_MODE_MONO : Cfg->ChannelMode == PNA2DP_CHMODE_DUAL ? SBC_MODE_DUAL :
+                                  Cfg->ChannelMode == PNA2DP_CHMODE_STEREO ? SBC_MODE_STEREO : SBC_MODE_JOINT);
+        p.allocation = Cfg->SbcAlloc;
+        p.subbands = Cfg->SbcSubbands;
+        p.blocks = Cfg->SbcBlocks;
+        p.bitpool = Cfg->SbcBitpool ? Cfg->SbcBitpool : Cfg->SbcMaxBitpool;
+        return sbc_bitrate(&p);
+    }
+    case PNA2DP_CODEC_AAC:
+        return Cfg->BitrateBps;
+    case PNA2DP_CODEC_APTX:
+    case PNA2DP_CODEC_APTX_LL:
+        return Cfg->SampleRate * 4 * Cfg->Channels;             /* 4:1 of 16-bit: 352.8 kbps at 44.1 stereo */
+    case PNA2DP_CODEC_APTX_HD:
+        return Cfg->SampleRate * 6 * Cfg->Channels;             /* 24-bit 4:1: 576 kbps at 48 stereo */
+    case PNA2DP_CODEC_LDAC: {
+        BOOLEAN x = (Cfg->SampleRate == 44100 || Cfg->SampleRate == 88200);
+        switch (Cfg->LdacEqmid) {
+        case PNA2DP_LDAC_EQMID_HQ: return x ? 909000 : 990000;
+        case PNA2DP_LDAC_EQMID_SQ: return x ? 606000 : 660000;
+        default: return x ? 303000 : 330000;
+        }
+    }
+    case PNA2DP_CODEC_FASTSTREAM:
+        return 212000;
+    case PNA2DP_CODEC_OPUS:
+        return Cfg->BitrateBps ? Cfg->BitrateBps : 160000;
+    default:
+        return 0;
+    }
+}
