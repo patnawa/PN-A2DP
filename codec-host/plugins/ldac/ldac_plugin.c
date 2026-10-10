@@ -21,7 +21,7 @@
 
 #define LDAC_MAX_PACKET      2048
 #define LDAC_MAX_PENDING     4
-#define LDAC_MAX_LEFTOVER    (256 * 2 * 4)   /* one LDAC frame of 32-bit stereo */
+#define LDAC_MAX_LEFTOVER    (128 * 2 * 4)   /* one LSU of 32-bit stereo */
 
 typedef struct ldac_packet {
     uint8_t  data[LDAC_MAX_PACKET];
@@ -39,7 +39,7 @@ struct PnCodecEncoder {
     uint32_t           channels;
     uint32_t           pcm_per_frame;
     uint32_t           bytes_per_sample;
-    uint32_t           frame_bytes;         /* PCM bytes per LDAC frame */
+    uint32_t           frame_bytes;         /* PCM bytes per encode call (one LSU) */
     uint32_t           mtu;
     /* queued output packets (FIFO) */
     ldac_packet        pending[LDAC_MAX_PENDING];
@@ -81,7 +81,8 @@ static PnCodecEncoder *LdacOpen(const PNA2DP_STREAM_PARAMS *p)
     int r = ldacBT_init_handle_encode(e->h, (int)(p->MediaMtu + 13), e->eqmid, LdacChannelMode(p->ChannelMode), e->fmt, (int)p->SampleRate);
     if (r != 0) { ldacBT_free_handle(e->h); free(e); return NULL; }
     e->pcm_per_frame = (p->SampleRate >= 88200) ? 256 : 128;
-    e->frame_bytes = e->pcm_per_frame * e->channels * e->bytes_per_sample;
+    /* ldacBT_encode always consumes one LSU of 128 PCM frames per call, at every sampling rate */
+    e->frame_bytes = 128 * e->channels * e->bytes_per_sample;
     if (e->abr_enabled) {
         e->abr = ldac_ABR_get_handle();
         if (e->abr) { ldac_ABR_Init(e->abr, 1000); ldac_ABR_set_thresholds(e->abr, 6, 4, 2); }
