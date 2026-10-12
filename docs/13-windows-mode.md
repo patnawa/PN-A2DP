@@ -17,7 +17,9 @@ If Windows requires a restart, save your work and restart manually. The panel
 reports a pending change; the selected driver in Device Manager can already say
 Microsoft while the old driver still serves an open audio stream.
 
-Devices on the Microsoft driver automatically show **Audio** and **Driver** tabs.
+Devices on the Microsoft driver show **Quality**, **Audio** and **Driver** tabs
+in panel 0.1.0.27. Quality offers read-only audio checks and diagnostic export;
+Bluetooth codec/packet telemetry remains unavailable in this mode.
 Devices on PN-A2DP retain the existing codec and transport tabs.
 Other third-party drivers are explicitly labelled as such; they can use the
 standard Windows audio controls without being labelled as Microsoft drivers.

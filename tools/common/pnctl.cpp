@@ -849,7 +849,12 @@ DWORD ReadConfigFile(const std::wstring &path, PNA2DP_CONFIG &c)
 
 DWORD WriteConfigFile(const std::wstring &path, const PNA2DP_CONFIG &c)
 {
-    std::wstring text = ConfigToText(c);
+    return WriteUtf8FileAtomic(path, ConfigToText(c));
+}
+
+DWORD WriteUtf8FileAtomic(const std::wstring &path, const std::wstring &text)
+{
+    if (text.empty() || text.size() > 1024 * 1024) return ERROR_INVALID_DATA;
     int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), (int)text.size(), nullptr, 0, nullptr, nullptr);
     if (!length) return GetLastError();
     std::string bytes(length, '\0');

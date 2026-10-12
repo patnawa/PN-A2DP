@@ -8,6 +8,7 @@
   .\build\build.ps1 -Target tests    # SBC self test
   .\build\build.ps1 -Target service-tests # focused Windows service failure tests
   .\build\build.ps1 -Target process-tests # helper-process responsiveness tests
+  .\build\build.ps1 -Target health-tests # audio diagnostics and quality-history tests
   .\build\build.ps1 -Target windows  # application-only Windows mode installer + portable
   .\build\build.ps1 -Target gui      # control panel (pna2dp-panel.exe)
   .\build\build.ps1 -Target setup    # installer (pna2dp-setup.exe) embedding everything found in out\<Config>
@@ -20,7 +21,7 @@
   WDK NuGet layout (see get-wdk.ps1 and toolchain.ps1).
 #>
 param(
-    [ValidateSet('all','driver','host','cli','tests','service-tests','process-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
+    [ValidateSet('all','driver','host','cli','tests','service-tests','process-tests','health-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
     [ValidateSet('Release','Debug')][string]$Config = 'Release',
     [switch]$Sign,
     [switch]$Sanitize,
@@ -157,7 +158,12 @@ function Build-ProcessTests {
     Build-UserExe 'process_wait_test' @((Join-Path $Root 'tools\common\test\process_wait_test.cpp')) @("/I$(Join-Path $Root 'tools\common')", "/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib') @()
 }
 
+function Build-HealthTests {
+    Build-UserExe 'health_test' @((Join-Path $Root 'tools\common\test\health_test.cpp'), (Join-Path $Root 'tools\common\pnhealth.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) @("/I$(Join-Path $Root 'tools\common')", "/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib','uuid.lib') @()
+}
+
 function Build-Tests {
+    Build-HealthTests
     Build-ServiceTests
     Build-ProcessTests
     Build-UserExe 'boot_mode_test' @((Join-Path $Root 'tools\common\test\boot_mode_test.cpp'), (Join-Path $Root 'tools\common\pnboot.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib','uuid.lib') @()
@@ -216,7 +222,7 @@ function Build-WinExe([string]$name, [string[]]$sources, [string]$rcFile, [strin
 }
 
 function Build-Gui {
-    $srcs = @((Join-Path $Root 'tools\pna2dp-panel\panel.cpp'), (Join-Path $Root 'tools\pna2dp-panel\bootdlg.cpp'), (Join-Path $Root 'tools\common\pnboot.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp')) + $CommonSrcs
+    $srcs = @((Join-Path $Root 'tools\pna2dp-panel\panel.cpp'), (Join-Path $Root 'tools\pna2dp-panel\bootdlg.cpp'), (Join-Path $Root 'tools\common\pnhealth.cpp'), (Join-Path $Root 'tools\common\pnboot.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp')) + $CommonSrcs
     Build-WinExe 'pna2dp-panel' $srcs (Join-Path $Root 'tools\pna2dp-panel\panel.rc') @() @() @()
 }
 
@@ -257,6 +263,7 @@ function Build-Setup {
         @{ file = (Join-Path $Root 'LICENSE');              sub = '';        comp = 'core';     required = $true  },
         @{ file = (Join-Path $Root 'THIRD-PARTY-NOTICES.md'); sub = '';      comp = 'core';     required = $true  },
         @{ file = (Join-Path $Root 'docs\13-windows-mode.md'); sub = ''; comp = 'core'; required = $true },
+        @{ file = (Join-Path $Root 'docs\14-audio-diagnostics.md'); sub = ''; comp = 'core'; required = $true },
         @{ file = (Join-Path $Root 'README.md');            sub = '';        comp = 'core';     required = $false }
     )
     if ($WindowsMode) { $items = @($items | Where-Object { $_.comp -in @('panel','cli','core') }) }
@@ -326,6 +333,7 @@ function Build-Dist {
     if (!$WindowsMode) { Get-ChildItem $Out -Filter 'pna2dp-codec-*.dll' | Copy-Item -Destination (Join-Path $dist 'portable') -Force }
     foreach ($f in @('LICENSE','THIRD-PARTY-NOTICES.md','README.md')) { $p = Join-Path $Root $f; if (Test-Path $p) { Copy-Item $p (Join-Path $dist 'portable') -Force } }
     Copy-Item -LiteralPath (Join-Path $Root 'docs\13-windows-mode.md') -Destination (Join-Path $dist 'portable') -Force
+    Copy-Item -LiteralPath (Join-Path $Root 'docs\14-audio-diagnostics.md') -Destination (Join-Path $dist 'portable') -Force
     if (!$WindowsMode) { Copy-Item (Join-Path $Root 'build\install.ps1'), (Join-Path $Root 'build\update-device-driver.ps1'), (Join-Path $Root 'build\switch-device.ps1') (Join-Path $dist 'portable') -Force }
     $zip = Join-Path $dist 'pna2dp-portable.zip'
     # Entries are written one by one with '/' separators: Windows PowerShell's Compress-Archive and
@@ -349,6 +357,7 @@ switch ($Target) {
     'tests'   { Build-Tests }
     'service-tests' { Build-ServiceTests }
     'process-tests' { Build-ProcessTests }
+    'health-tests' { Build-HealthTests }
     'cli'     { Build-Cli }
     'host'    { Build-Host }
     'gui'     { Build-Gui }

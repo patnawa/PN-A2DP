@@ -24,6 +24,7 @@ headset and is saved per headset by the driver (`Services\pna2dp\Parameters\Devi
 
 | Tab | What it shows / changes |
 |---|---|
+| Quality | Background audio checks with suggested settings, a live bitrate chart and recent transport counters, and a local diagnostic export that omits device identifiers. Also available in Windows mode with explicit telemetry limits. See [audio diagnostics](14-audio-diagnostics.md). |
 | Status | Live connection state, codec, format, encoder owner, bitrate and ceiling, estimated latency, sink delay report, MTU, AVDTP version, flags, last NTSTATUS; transport statistics (packets, bytes, drops, queue depth, write completion time, ABR level, codec host round trip); driver version, codec host service state, encoders available. Refreshes on every driver event (pended `WAIT_EVENT` IOCTL on a worker thread) and once a second. |
 | Codecs | Live codec/rate/bitrate, receiver support, live state, and saved or edited settings. Activate selected puts a supported codec first and applies it with SBC fallback. Auto quality + codecs restores automatic selection. The preset picker is a loader, not an indicator of saved settings. SBC cannot be disabled. |
 | SBC | Max bitpool (slider, or the headset's maximum), min bitpool, bitpool override (XQ), dual channel preference, rate / channel mode / block / subband / allocation masks, live bitrate estimate at 44.1 and 48 kHz. |

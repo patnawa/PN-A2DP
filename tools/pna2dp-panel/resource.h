@@ -18,6 +18,17 @@
 #define IDD_PAGE_ADAPTER        112
 #define IDD_PAGE_WINDOWS        113
 #define IDD_BOOT_MODE           114
+#define IDD_PAGE_QUALITY        115
+#define IDC_QUALITY_TITLE       2501
+#define IDC_QUALITY_REASON      2502
+#define IDC_QUALITY_BITRATE     2503
+#define IDC_QUALITY_RECENT      2504
+#define IDC_QUALITY_GRAPH       2505
+#define IDC_HEALTH_RESULTS      2506
+#define IDC_HEALTH_CHECK        2507
+#define IDC_HEALTH_EXPORT       2508
+#define IDC_HEALTH_FIX          2509
+#define IDC_HEALTH_TIMESTAMP    2510
 #define IDC_BOOT_STATE          2401
 #define IDC_BOOT_PLATFORM       2402
 #define IDC_BOOT_DEVICES        2403

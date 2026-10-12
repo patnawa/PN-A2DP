@@ -24,7 +24,7 @@ Check 'application-only preflight' {
 $extract = Join-Path $report 'payload'
 Check 'payload excludes kernel drivers and codec host' {
     SetupRun @('--extract',('"' + $extract + '"'))
-    $allowed = @('pna2dp-panel.exe','pna2dpctl.exe','LICENSE','THIRD-PARTY-NOTICES.md','README.md','13-windows-mode.md')
+    $allowed = @('pna2dp-panel.exe','pna2dpctl.exe','LICENSE','THIRD-PARTY-NOTICES.md','README.md','13-windows-mode.md','14-audio-diagnostics.md')
     $files = @(Get-ChildItem -LiteralPath $extract -Recurse -File)
     if ($files.Count -ne $allowed.Count) { throw 'Unexpected payload file count.' }
     foreach ($file in $files) { if ($file.Name -notin $allowed) { throw "Unexpected file $($file.Name)" } }

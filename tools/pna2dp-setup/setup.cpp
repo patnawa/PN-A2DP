@@ -647,7 +647,7 @@ static DWORD DoUninstall(Log &log, bool &reboot)
 
     /* files: everything we know about; the uninstaller itself is deleted after exit */
     const wchar_t *names[] = { L"pna2dp-codechost.exe", L"pna2dp-panel.exe", L"pna2dpctl.exe", L"freeaptx.dll", L"LICENSE", L"THIRD-PARTY-NOTICES.md", L"README.md",
-                               L"13-windows-mode.md", L"pna2dp-setup.log", L"driver\\pna2dp.inf", L"driver\\pna2dp.sys", L"driver\\pna2dp.cat", L"driver\\pna2dp-test.cer" };
+                               L"13-windows-mode.md", L"14-audio-diagnostics.md", L"pna2dp-setup.log", L"driver\\pna2dp.inf", L"driver\\pna2dp.sys", L"driver\\pna2dp.cat", L"driver\\pna2dp-test.cer" };
     for (auto n : names) { std::wstring p = pn::JoinPath(dir, n); if (pn::FileExists(p) && !DeleteFileW(p.c_str())) MoveFileExW(p.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT); }
     /* the uninstaller copy, unless it is the running module (then ScheduleSelfDelete removes it) */
     std::wstring uninstCopy = pn::JoinPath(dir, L"uninstall.exe");

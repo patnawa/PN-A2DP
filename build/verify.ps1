@@ -52,6 +52,7 @@ try {
     Invoke-Check 'controls-and-machine' { & (Join-Path $outputDir 'pnctl_test.exe') }
     Invoke-Check 'service-failure-handling' { & (Join-Path $outputDir 'service_failure_test.exe') }
     Invoke-Check 'process-wait' { & (Join-Path $outputDir 'process_wait_test.exe') }
+    Invoke-Check 'audio-health' { & (Join-Path $outputDir 'health_test.exe') }
     Invoke-Check 'audio-endpoints' { & (Join-Path $outputDir 'audio_test.exe') --list }
     Invoke-Check 'windows-audio' { & (Join-Path $outputDir 'windows_audio_test.exe') }
     Invoke-Check 'spatial-discovery' { & (Join-Path $outputDir 'spatial_test.exe') }
@@ -71,6 +72,7 @@ try {
             Invoke-Check 'asan-controls' { & (Join-Path $asanDir 'pnctl_test.exe') }
             Invoke-Check 'asan-services' { & (Join-Path $asanDir 'service_failure_test.exe') }
             Invoke-Check 'asan-process-wait' { & (Join-Path $asanDir 'process_wait_test.exe') }
+            Invoke-Check 'asan-audio-health' { & (Join-Path $asanDir 'health_test.exe') }
         } finally { $env:PATH = $savedPath }
     }
     Invoke-Check 'installer-payload' {

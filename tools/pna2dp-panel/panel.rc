@@ -35,6 +35,23 @@ BEGIN
 END
 
 // ------------------------------------------------------------------------------------
+IDD_PAGE_QUALITY DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Waiting for observations", IDC_QUALITY_TITLE, 4, 3, 212, 13, SS_NOPREFIX
+    LTEXT           "", IDC_QUALITY_BITRATE, 218, 3, 178, 13, SS_NOPREFIX | SS_RIGHT
+    LTEXT           "", IDC_QUALITY_REASON, 4, 20, 392, 28, SS_NOPREFIX
+    LTEXT           "", IDC_QUALITY_RECENT, 4, 50, 392, 14, SS_NOPREFIX
+    CONTROL         "Bitrate history; up to 60 seconds. Text measurements are above.", IDC_QUALITY_GRAPH, "Static", SS_OWNERDRAW, 4, 67, 392, 45
+    LTEXT           "Check this device without changing settings or playing a tone.", IDC_HEALTH_TIMESTAMP, 4, 118, 392, 14, SS_NOPREFIX
+    EDITTEXT        IDC_HEALTH_RESULTS, 4, 136, 392, 96, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Check my audio", IDC_HEALTH_CHECK, 4, 240, 96, 18
+    PUSHBUTTON      "Export diagnostics...", IDC_HEALTH_EXPORT, 106, 240, 115, 18
+    PUSHBUTTON      "Open suggested settings", IDC_HEALTH_FIX, 227, 240, 169, 18
+END
+
+// ------------------------------------------------------------------------------------
 IDD_PAGE_WINDOWS DIALOGEX 0, 0, 400, 262
 STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
 FONT 9, "Segoe UI", 400, 0, 0x1

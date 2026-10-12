@@ -98,6 +98,13 @@ an already prepared test machine and the explicit `--allow-test-driver` option
 
 ## Status
 
+Control panel **0.1.0.27** adds a **Quality** page in both driver modes.
+**Check my audio** checks the selected device, output, volume and available codec
+information in the background. PN mode also shows a rolling bitrate chart and
+recent transport errors. **Export diagnostics** saves a local UTF-8 report with
+device identifiers omitted and no audio recording. See
+[audio diagnostics](docs/14-audio-diagnostics.md) for coverage and limitations.
+
 Development status: the x64 driver, codec host, tools, installer and three external
 codec plugins build locally. The test suite covers production codec negotiation,
 AVDTP parsing/reassembly, PCM conversion and RTP, with 50,000 malformed packet inputs

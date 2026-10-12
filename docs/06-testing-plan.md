@@ -1,5 +1,43 @@
 # Testing and verification
 
+## Audio diagnostics, control panel 0.1.0.27 (2026-10-12)
+
+The new `health_test.exe` exercises the production audio-check model, bounded
+quality history and UTF-8 report writer. Its 43 checks cover unavailable and
+problem devices, pending restart, endpoint/volume query failure, mute/zero volume,
+non-default outputs, receiver support, encoder and codec-host availability,
+Windows-mode telemetry limits, stale samples, missing packet progress, counter
+resets, observation gaps, congestion/recovery, bounded history and report privacy.
+The suite also runs under AddressSanitizer as part of `verify.ps1`.
+
+A resume regression reproduced a false stalled-stream warning twice. Targeted
+checks confirmed fresh timestamps and correct zero packet deltas; the history
+had retained idle time because the connection state could remain Streaming while
+the audio-active flag changed. Resetting the window on that flag transition fixes
+the failure. Evidence: `out/health-resume-red*.log`, `health-resume-probes.log` and
+`health-resume-green.log`.
+
+Read-only integration on the Sony confirmed endpoint matching, current volume and
+mute, default selection, SBC receiver support, encoder registration and service
+state. A nonexistent device instance returns an explicit problem and a nonzero
+integration-test exit. Live UI checks covered the Sony's rolling transport window,
+successful report export, simulated Windows-mode behavior and history/result
+clearing on device selection. The GUI report contains capabilities, preferences
+and a numeric timeline, without the Sony name/address or endpoint/instance IDs.
+
+Final verification passed 23 software groups, six Windows-mode groups and nine
+signing checks. Logs are under `out/verification/20261012-170743/`,
+`windows-mode-20261012-170743/` and `setup-signing-20261012-170743-b4ebc8a4/`.
+The installed panel, CLI, uninstaller and diagnostics guide match the package
+hashes. The installed GUI repeated the audio check and export successfully;
+ongoing Sony playback remained SBC 48 kHz / 357 kbps with zero observed dropped
+packets, write failures and latency trims. Audio configuration, kernel/host hashes
+and the codec-host PID stayed unchanged through the application-only update.
+
+This release changes application diagnostics only. No new kernel/audio-processing
+code is installed, and receiver support remains subject to the hardware coverage
+documented below. See [audio diagnostics](14-audio-diagnostics.md).
+
 ## Diagnosing-bugs pass, control panel 0.1.0.26 (2026-10-12)
 
 Two repeatable failures were isolated using production helpers before applying

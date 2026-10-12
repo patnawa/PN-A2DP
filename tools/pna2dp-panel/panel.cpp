@@ -34,6 +34,8 @@
 #include "pnboot.h"
 #include "pnaudio.h"
 #include "pnretry.h"
+#include "pnhealth.h"
+#include <memory>
 #include "bootdlg.h"
 #include <uxtheme.h>
 #include <algorithm>
@@ -51,6 +53,7 @@
 #define WM_APP_DEFERRED       (WM_APP + 4)
 #define TIMER_STATS           1
 #define TIMER_DEMO            2
+#define TIMER_HEALTH          3
 
 static HINSTANCE g_inst;
 
@@ -75,6 +78,7 @@ struct Session {
     PNA2DP_CONFIG config = {};     /* edited copy */
     PNA2DP_CONFIG applied = {};    /* what the driver has */
     PNA2DP_STATS stats = {};
+    bool telemetryValid = false;
     ULONGLONG demoTicks = 0;
 
     void Reset()
@@ -84,10 +88,11 @@ struct Session {
         ver = PNA2DP_VERSION{}; status = PNA2DP_STATUS{}; caps = PNA2DP_CAPABILITIES{};
         config = PNA2DP_CONFIG{}; applied = PNA2DP_CONFIG{}; stats = PNA2DP_STATS{};
         demoTicks = 0;
+        telemetryValid = false;
     }
     void DemoFill()
     {
-        demo = true; open = true;
+        demo = true; open = true; telemetryValid = true;
         ver.AbiVersion = PNA2DP_ABI_VERSION; ver.DriverVersion = 0x00010000; ver.Role = 1;
         ver.KernelCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);
         ver.HostCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_LDAC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_AAC) |
@@ -123,7 +128,8 @@ struct Session {
         if (demo) return true;
         if (!open) return false;
         bool ok = dev.GetStatus(status);
-        dev.GetStats(stats);
+        bool statsOk = dev.GetStats(stats);
+        telemetryValid = ok && statsOk && status.Size == sizeof(status) && stats.Size == sizeof(stats);
         if (withCaps) dev.GetCapabilities(caps);
         return ok;
     }
@@ -339,10 +345,10 @@ static std::wstring Quote(const std::wstring &s) { return L"\"" + s + L"\""; }
 /* Panel                                                                        */
 /* ------------------------------------------------------------------------- */
 
-enum Page { PG_STATUS = 0, PG_CODECS, PG_SBC, PG_AAC, PG_APTX, PG_LDAC, PG_TRANSPORT, PG_SINK, PG_DRIVER, PG_ADAPTER, PG_WINDOWS, PG_COUNT };
+enum Page { PG_STATUS = 0, PG_CODECS, PG_SBC, PG_AAC, PG_APTX, PG_LDAC, PG_TRANSPORT, PG_SINK, PG_DRIVER, PG_ADAPTER, PG_WINDOWS, PG_QUALITY, PG_COUNT };
 static const struct { int dlg; const wchar_t *title; } kPages[PG_COUNT] = {
     { IDD_PAGE_STATUS, L"Status" }, { IDD_PAGE_CODECS, L"Codecs" }, { IDD_PAGE_SBC, L"SBC" }, { IDD_PAGE_AAC, L"AAC" }, { IDD_PAGE_APTX, L"aptX" },
-    { IDD_PAGE_LDAC, L"LDAC" }, { IDD_PAGE_TRANSPORT, L"Transport" }, { IDD_PAGE_SINK, L"Headset" }, { IDD_PAGE_DRIVER, L"Driver" }, { IDD_PAGE_ADAPTER, L"Adapter" }, { IDD_PAGE_WINDOWS, L"Audio" } };
+    { IDD_PAGE_LDAC, L"LDAC" }, { IDD_PAGE_TRANSPORT, L"Transport" }, { IDD_PAGE_SINK, L"Headset" }, { IDD_PAGE_DRIVER, L"Driver" }, { IDD_PAGE_ADAPTER, L"Adapter" }, { IDD_PAGE_WINDOWS, L"Audio" }, { IDD_PAGE_QUALITY, L"Quality" } };
 
 static const ULONG kCodecOrder[] = { PNA2DP_CODEC_LDAC, PNA2DP_CODEC_APTX_HD, PNA2DP_CODEC_AAC, PNA2DP_CODEC_APTX, PNA2DP_CODEC_APTX_LL, PNA2DP_CODEC_SBC };
 
@@ -365,6 +371,17 @@ private:
     std::vector<DeviceEntry> m_devices;
     int m_sel = -1;
     Session m_s;
+    pn::QualityHistory m_history;
+    pn::HealthSnapshot m_health;
+    bool m_healthValid = false;
+    pn::HealthAction m_healthAction = pn::HealthAction::None;
+    struct HealthJob {
+        unsigned generation = 0;
+        pn::HealthSnapshot result;
+        std::atomic<bool> done{false};
+        bool failed = false;
+    };
+    std::shared_ptr<HealthJob> m_healthJob;
     pn::WindowsAudioInfo m_audio;
     std::vector<int> m_tabs;
     bool m_adjustingVolume = false;
@@ -468,6 +485,11 @@ private:
     void LoadDriver();
     void LoadReadiness();
     void LoadAdapter();
+    void LoadQuality(bool observe = false);
+    void CheckAudio();
+    void FinishAudioCheck();
+    void ExportDiagnostics();
+    void OpenHealthAction();
     bool CollectConfig(PNA2DP_CONFIG &c);
 
     /* page events */
@@ -542,6 +564,8 @@ void Panel::InitAppearance()
         }
     }
     m_styleDpi = dpi;
+    SendDlgItemMessageW(m_page[PG_QUALITY], IDC_QUALITY_TITLE, WM_SETFONT, (WPARAM)m_boldFont, TRUE);
+    SendDlgItemMessageW(m_page[PG_QUALITY], IDC_QUALITY_BITRATE, WM_SETFONT, (WPARAM)m_boldFont, TRUE);
     InvalidateRect(m_hwnd, NULL, TRUE);
 }
 
@@ -635,7 +659,54 @@ void Panel::DrawControl(const DRAWITEMSTRUCT &d)
     const UINT dpi = GetDpiForWindow(m_hwnd);
     RECT r = d.rcItem;
     bool selected = (d.itemState & ODS_SELECTED) != 0, disabled = (d.itemState & ODS_DISABLED) != 0;
-    if (d.CtlType == ODT_STATIC && d.CtlID >= IDC_DRV_TEST_LIGHT && d.CtlID <= IDC_DRV_HVCI_LIGHT) {
+    if (d.CtlType == ODT_STATIC && d.CtlID == IDC_QUALITY_GRAPH) {
+        FillRect(d.hDC, &r, m_surface);
+        const auto &samples = m_history.Samples();
+        SetBkMode(d.hDC, TRANSPARENT); SetTextColor(d.hDC, m_mutedColor);
+        HGDIOBJ font = SelectObject(d.hDC, m_bodyFont);
+        RECT label = r; label.bottom = label.top + MulDiv(18, dpi, 96);
+        DrawTextW(d.hDC, WindowsMode() ? L"Bluetooth telemetry" : L"Bitrate history - up to 60 seconds (kbps); orange marks reductions or errors", -1, &label, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        RECT plot = r; plot.top = label.bottom + 3; plot.bottom -= MulDiv(17, dpi, 96);
+        plot.left += MulDiv(38, dpi, 96);
+        if (samples.size() < 2 || GetTickCount64() - samples.back().tick > 2500) {
+            DrawTextW(d.hDC, WindowsMode() ? L"This driver does not expose bitrate history" : L"Waiting for fresh measurements", -1, &plot, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            ULONG ceiling = 1;
+            for (const auto &s : samples) ceiling = (std::max)(ceiling, (std::max)(s.status.BitrateBps, s.status.MaxBitrateBps));
+            RECT axis = r; axis.top = plot.top; axis.right = plot.left - 4;
+            std::wstring high = std::to_wstring(ceiling / 1000);
+            DrawTextW(d.hDC, high.c_str(), -1, &axis, DT_RIGHT | DT_TOP | DT_SINGLELINE);
+            axis.top = plot.bottom - MulDiv(16, dpi, 96); DrawTextW(d.hDC, L"0", -1, &axis, DT_RIGHT | DT_TOP | DT_SINGLELINE);
+            axis = plot; axis.top = plot.bottom + 2; axis.bottom = r.bottom;
+            DrawTextW(d.hDC, L"60 s ago", -1, &axis, DT_LEFT | DT_SINGLELINE);
+            DrawTextW(d.hDC, L"Now", -1, &axis, DT_RIGHT | DT_SINGLELINE);
+            HPEN grid = CreatePen(PS_DOT, 1, m_highContrast ? m_textColor : RGB(201, 210, 224));
+            HGDIOBJ oldGrid = SelectObject(d.hDC, grid);
+            for (int y : {plot.top, (plot.top + plot.bottom) / 2, plot.bottom}) { MoveToEx(d.hDC, plot.left, y, nullptr); LineTo(d.hDC, plot.right, y); }
+            SelectObject(d.hDC, oldGrid); DeleteObject(grid);
+            HPEN line = CreatePen(PS_SOLID, MulDiv(2, dpi, 96), m_highContrast ? m_textColor : m_accentColor);
+            HGDIOBJ old = SelectObject(d.hDC, line);
+            ULONGLONG latest = samples.back().tick;
+            POINT previous{};
+            for (size_t i = 0; i < samples.size(); ++i) {
+                const auto &s = samples[i];
+                int x = plot.right - 4 - (int)((latest - s.tick) * (plot.right - plot.left - 8) / 60000);
+                int y = plot.bottom - 2 - (int)((ULONGLONG)s.status.BitrateBps * (plot.bottom - plot.top - 4) / ceiling);
+                if (!i) MoveToEx(d.hDC, x, y, nullptr);
+                else {
+                    LineTo(d.hDC, x, previous.y); LineTo(d.hDC, x, y);
+                    const auto &before = samples[i - 1];
+                    if (s.status.BitrateBps < before.status.BitrateBps || s.stats.PacketsDropped > before.stats.PacketsDropped || s.stats.WriteFailures > before.stats.WriteFailures || s.stats.Underruns > before.stats.Underruns) {
+                        HPEN marker = CreatePen(PS_SOLID, MulDiv(2, dpi, 96), m_highContrast ? m_textColor : RGB(190, 95, 10));
+                        SelectObject(d.hDC, marker); MoveToEx(d.hDC, x, plot.top, nullptr); LineTo(d.hDC, x, plot.bottom); SelectObject(d.hDC, line); DeleteObject(marker); MoveToEx(d.hDC, x, y, nullptr);
+                    }
+                }
+                previous = {x, y};
+            }
+            SelectObject(d.hDC, old); DeleteObject(line);
+        }
+        SelectObject(d.hDC, font);
+    } else if (d.CtlType == ODT_STATIC && d.CtlID >= IDC_DRV_TEST_LIGHT && d.CtlID <= IDC_DRV_HVCI_LIGHT) {
         bool known = d.CtlID == IDC_DRV_SECURE_LIGHT ? m_signing.secureBootKnown : m_signing.queried;
         bool pass = d.CtlID == IDC_DRV_TEST_LIGHT ? m_signing.testSigning :
             d.CtlID == IDC_DRV_SECURE_LIGHT ? !m_signing.secureBoot : !m_signing.hvci;
@@ -845,6 +916,7 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     case WM_TIMER:
         if (p->m_inPrompt) return TRUE;
+        if (wp == TIMER_HEALTH) { p->FinishAudioCheck(); return TRUE; }
         if (wp == TIMER_STATS && !p->m_inPrompt && p->m_sel >= 0 && p->m_sel < (int)p->m_devices.size()) {
             if (p->m_adjustingVolume && GetCapture() != GetDlgItem(p->m_page[PG_WINDOWS], IDC_WIN_VOLUME)) p->m_adjustingVolume = false;
             if (!p->m_demo && GetTickCount64() - p->m_driverRefreshTick >= 5000) {
@@ -860,7 +932,7 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (wp == TIMER_STATS && p->m_cur == PG_ADAPTER && !p->m_inPrompt) p->LoadAdapter();
         if (wp == TIMER_STATS && p->m_cur == PG_DRIVER && !p->m_inPrompt) p->LoadReadiness();
-        if (wp == TIMER_STATS) { if (p->m_s.open) { if (p->m_s.demo) p->m_s.DemoTick(); p->m_s.Refresh(false); p->UpdateOutputSummary(); if (p->m_cur == PG_STATUS) p->LoadStatus(); if (p->m_cur == PG_CODECS) p->UpdateCodecLive(); if (p->m_cur >= PG_SBC && p->m_cur <= PG_LDAC) p->UpdateCodecDetails(); } return TRUE; }
+        if (wp == TIMER_STATS) { if (p->m_s.open) { if (p->m_s.demo) p->m_s.DemoTick(); p->m_s.Refresh(false); p->UpdateOutputSummary(); if (p->m_cur == PG_STATUS) p->LoadStatus(); if (p->m_cur == PG_CODECS) p->UpdateCodecLive(); if (p->m_cur >= PG_SBC && p->m_cur <= PG_LDAC) p->UpdateCodecDetails(); } p->LoadQuality(true); return TRUE; }
         break;
     case WM_SIZE: if (wp != SIZE_MINIMIZED) p->LayoutShell(); return TRUE;
     case WM_GETMINMAXINFO: {
@@ -996,6 +1068,7 @@ void Panel::OnInit()
     RefreshDevices(false);
     SetDirty(false);
     SetTimer(m_hwnd, TIMER_STATS, 1000, NULL);
+    SetTimer(m_hwnd, TIMER_HEALTH, 150, NULL);
     InitAppearance();
     UINT dpi = GetDpiForWindow(m_hwnd);
     MONITORINFO monitor = {sizeof(monitor)};
@@ -1016,6 +1089,7 @@ void Panel::OnClose()
         if (r == IDYES && !Apply()) return;
     }
     KillTimer(m_hwnd, TIMER_STATS);
+    KillTimer(m_hwnd, TIMER_HEALTH);
     CloseSession();
     DestroyWindow(m_hwnd);
 }
@@ -1056,7 +1130,8 @@ bool Panel::WindowsMode() const
 void Panel::ConfigureTabs()
 {
     m_tabs.clear();
-    if (WindowsMode()) m_tabs = {PG_WINDOWS, PG_DRIVER};
+    m_tabs.push_back(PG_QUALITY);
+    if (WindowsMode()) { m_tabs.push_back(PG_WINDOWS); m_tabs.push_back(PG_DRIVER); }
     else for (int i = 0; i < PG_WINDOWS; ++i) m_tabs.push_back(i);
     TabCtrl_DeleteAllItems(m_tab);
     for (size_t i = 0; i < m_tabs.size(); ++i) {
@@ -1066,7 +1141,7 @@ void Panel::ConfigureTabs()
     for (int id : {IDC_APPLY, IDC_REVERT, IDC_DEFAULTS, IDC_IMPORT, IDC_EXPORT})
         ShowWindow(GetDlgItem(m_hwnd, id), WindowsMode() ? SW_HIDE : SW_SHOW);
     // Start each selected device in its actual mode, rather than leave a hidden codec page selected.
-    SelectPage(WindowsMode() ? PG_WINDOWS : PG_STATUS);
+    SelectPage(PG_QUALITY);
     LayoutPages();
 }
 
@@ -1125,6 +1200,7 @@ void Panel::SelectPage(int p)
     if (p >= PG_SBC && p <= PG_LDAC) UpdateCodecDetails();
     if (p == PG_DRIVER) LoadDriver();
     if (p == PG_ADAPTER) LoadAdapter();
+    if (p == PG_QUALITY) LoadQuality();
     InvalidateRect(m_tab, NULL, FALSE);
 }
 
@@ -1231,6 +1307,11 @@ void Panel::RefreshDevices(bool keepSelection)
 void Panel::CloseSession()
 {
     StopEventThread();
+    m_history.Reset();
+    m_healthValid = false;
+    m_healthAction = pn::HealthAction::None;
+    SetText(m_page[PG_QUALITY], IDC_HEALTH_RESULTS, L"Press Check my audio for a fresh device, output, volume and codec check.");
+    SetText(m_page[PG_QUALITY], IDC_HEALTH_TIMESTAMP, L"Read-only check; no settings changed and no audio recorded.");
     m_pendingEvents = 0;
     m_pendingGone = ERROR_SUCCESS;
     m_refreshPending = false;
@@ -1482,6 +1563,107 @@ void Panel::LoadAll()
     EnableItem(m_page[PG_CODECS], IDC_PRESET_APPLY, false);
     SetText(m_page[PG_CODECS], IDC_PRESET_DESC, L"Choose a preset to preview it. Load preset changes the editable settings; Apply saves them.");
     m_loading = false;
+    LoadQuality();
+}
+
+void Panel::LoadQuality(bool observe)
+{
+    HWND d = m_page[PG_QUALITY];
+    bool selected = m_sel >= 0 && m_sel < (int)m_devices.size();
+    if (observe) {
+        PNA2DP_QUALITY q{};
+        bool qv = m_s.open && !m_demo && m_s.dev.GetQuality(q);
+        m_history.Observe(GetTickCount64(), m_s.open && m_s.telemetryValid, m_s.status, m_s.stats, qv, q);
+    }
+    auto summary = m_history.Summary(GetTickCount64());
+    if (!selected) { summary.title = L"Select a Bluetooth device"; summary.reason = L"Pair and connect a stereo receiver, then press Refresh."; }
+    else if (WindowsMode()) { summary.title = m_devices[m_sel].node.usesWindowsA2dp() ? L"Windows manages Bluetooth quality" : L"System driver manages Bluetooth quality"; summary.reason = L"Codec, bitrate and packet health are unavailable in this mode. Check my audio can inspect the output, volume and device state."; summary.recent = L"Bluetooth measurements unavailable"; }
+    if (m_demo) summary.title = L"Demo: " + summary.title;
+    SetText(d, IDC_QUALITY_TITLE, summary.title);
+    SetText(d, IDC_QUALITY_REASON, summary.reason);
+    SetText(d, IDC_QUALITY_RECENT, summary.recent);
+    if (m_s.open && m_s.telemetryValid && m_s.status.Codec) SetTextF(d, IDC_QUALITY_BITRATE, L"%s: %u kbps | ceiling %u", pn::CodecName(m_s.status.Codec), m_s.status.BitrateBps / 1000, m_s.status.MaxBitrateBps / 1000);
+    else SetText(d, IDC_QUALITY_BITRATE, L"Bitrate unavailable");
+    EnableItem(d, IDC_HEALTH_CHECK, selected && !m_healthJob);
+    EnableItem(d, IDC_HEALTH_EXPORT, m_healthValid && !m_healthJob);
+    EnableItem(d, IDC_HEALTH_FIX, m_healthValid && m_healthAction != pn::HealthAction::None && !m_demo);
+    InvalidateRect(GetDlgItem(d, IDC_QUALITY_GRAPH), nullptr, FALSE);
+}
+
+void Panel::CheckAudio()
+{
+    if (m_healthJob || m_sel < 0 || m_sel >= (int)m_devices.size()) return;
+    m_healthValid = false; m_healthAction = pn::HealthAction::None;
+    auto job = std::make_shared<HealthJob>(); job->generation = m_sessionGen;
+    m_healthJob = job;
+    SetText(m_page[PG_QUALITY], IDC_HEALTH_TIMESTAMP, L"Checking this device in the background...");
+    SetText(m_page[PG_QUALITY], IDC_HEALTH_RESULTS, L"Reading device, output, volume, service and codec information. You can keep using the panel.");
+    if (m_demo) {
+        auto &h = job->result; h.demo = h.nodeKnown = h.found = true; h.node = m_devices[m_sel].node;
+        h.status = m_s.status; h.stats = m_s.stats; h.version = m_s.ver; h.caps = m_s.caps; h.config = m_s.applied;
+        h.statusValid = h.statsValid = h.versionValid = h.capsValid = h.configValid = m_s.open;
+        GetSystemTime(&h.capturedUtc); job->done = true;
+    } else {
+        auto id = m_devices[m_sel].node.instanceId;
+        try {
+            // The worker owns all memory and handles. Closing/changing the panel
+            // cannot invalidate them; only the UI consumes a completed result.
+            std::thread([job, id] {
+                try { job->result = pn::CollectHealth(id); } catch (...) { job->failed = true; }
+                job->done.store(true, std::memory_order_release);
+            }).detach();
+        } catch (...) { job->failed = true; job->done = true; }
+    }
+    LoadQuality();
+}
+
+void Panel::FinishAudioCheck()
+{
+    if (!m_healthJob || !m_healthJob->done.load(std::memory_order_acquire)) return;
+    auto job = m_healthJob; m_healthJob.reset();
+    if (job->generation != m_sessionGen) { LoadQuality(); return; }
+    HWND d = m_page[PG_QUALITY];
+    if (job->failed) { SetText(d, IDC_HEALTH_RESULTS, L"The diagnostic check could not finish. Retry the check."); SetText(d, IDC_HEALTH_TIMESTAMP, L"Check failed; no settings changed."); LoadQuality(); return; }
+    m_health = std::move(job->result); m_healthValid = true;
+    auto checks = pn::EvaluateHealth(m_health, m_history.Summary(GetTickCount64()));
+    SetText(d, IDC_HEALTH_RESULTS, pn::HealthCheckText(checks));
+    m_healthAction = pn::HealthAction::Sound;
+    for (const auto &check : checks) if ((check.level == pn::HealthLevel::Error || check.level == pn::HealthLevel::Warning || check.level == pn::HealthLevel::Unknown) && check.action != pn::HealthAction::None) { m_healthAction = check.action; break; }
+    const auto &t = m_health.capturedUtc;
+    SetTextF(d, IDC_HEALTH_TIMESTAMP, L"%sChecked at %02u:%02u:%02u UTC. Recheck after changing settings.", m_demo ? L"Demo - " : L"", t.wHour, t.wMinute, t.wSecond);
+    const wchar_t *action = m_healthAction == pn::HealthAction::Driver ? L"Open Driver requirements" : m_healthAction == pn::HealthAction::Adapter ? L"Open Adapter details" : m_healthAction == pn::HealthAction::Codecs ? L"Open codec settings" : m_healthAction == pn::HealthAction::Bluetooth ? L"Open Bluetooth settings" : L"Open Sound settings";
+    SetText(d, IDC_HEALTH_FIX, action);
+    LoadQuality();
+}
+
+void Panel::ExportDiagnostics()
+{
+    if (!m_healthValid || m_healthJob) return;
+    ModalScope modal(*this);
+    // Freeze the completed check and history before entering a common dialog.
+    std::wstring report = pn::DiagnosticReport(m_health, m_history, GetTickCount64(), L"" PN_PANEL_VERSION_TEXT);
+    wchar_t file[MAX_PATH] = L"PN-A2DP-diagnostics.txt";
+    OPENFILENAMEW dialog{sizeof(dialog)}; dialog.hwndOwner = m_hwnd;
+    dialog.lpstrFile = file; dialog.nMaxFile = _countof(file);
+    dialog.lpstrFilter = L"Diagnostic text (*.txt)\0*.txt\0\0"; dialog.lpstrDefExt = L"txt";
+    dialog.lpstrTitle = L"Export diagnostics - identifiers omitted, no audio recorded";
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&dialog)) return;
+    DWORD error = pn::WriteUtf8FileAtomic(file, report);
+    if (error) Error(L"Cannot export diagnostics. Any existing file has been kept.", error);
+    else SetStatusText(L"Diagnostic report exported. Device identifiers and audio recordings are excluded.");
+}
+
+void Panel::OpenHealthAction()
+{
+    if (!m_healthValid || m_demo) return;
+    if (m_healthAction == pn::HealthAction::Driver) SelectPage(PG_DRIVER);
+    else if (m_healthAction == pn::HealthAction::Adapter) SelectPage(PG_ADAPTER);
+    else if (m_healthAction == pn::HealthAction::Codecs) SelectPage(PG_CODECS);
+    else if (m_healthAction != pn::HealthAction::None) {
+        if ((INT_PTR)ShellExecuteW(m_hwnd, L"open", m_healthAction == pn::HealthAction::Bluetooth ? L"ms-settings:bluetooth" : L"ms-settings:sound", nullptr, nullptr, SW_SHOWNORMAL) <= 32)
+            Prompt(L"Windows Settings could not be opened. Open Settings from the Start menu.");
+    }
 }
 
 void Panel::LoadAdapter()
@@ -2063,6 +2245,12 @@ INT_PTR CALLBACK Panel::PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
 {
     if (m_inPrompt) return TRUE;
+    if (page == m_page[PG_QUALITY]) {
+        if (id == IDC_HEALTH_CHECK) { CheckAudio(); return TRUE; }
+        if (id == IDC_HEALTH_EXPORT) { ExportDiagnostics(); return TRUE; }
+        if (id == IDC_HEALTH_FIX) { OpenHealthAction(); return TRUE; }
+        return TRUE; // diagnostics never create editable codec preferences
+    }
     /* Windows controls apply immediately and never mark codec settings dirty. */
     if (page == m_page[PG_WINDOWS]) {
         if (id == IDC_WIN_REFRESH) { LoadWindowsAudio(); return TRUE; }

@@ -101,5 +101,6 @@ bool         ConfigFromText(const std::wstring &text, PNA2DP_CONFIG &c);
 // UTF-8, maximum 1 MiB. Failed reads preserve c; failed writes preserve the old file.
 DWORD        ReadConfigFile(const std::wstring &path, PNA2DP_CONFIG &c);
 DWORD        WriteConfigFile(const std::wstring &path, const PNA2DP_CONFIG &c);
+DWORD        WriteUtf8FileAtomic(const std::wstring &path, const std::wstring &text);
 
 } // namespace pn
