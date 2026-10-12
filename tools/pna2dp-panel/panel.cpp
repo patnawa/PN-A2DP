@@ -33,6 +33,7 @@
 #include "pndrv.h"
 #include "pnboot.h"
 #include "pnaudio.h"
+#include "pnretry.h"
 #include "bootdlg.h"
 #include <uxtheme.h>
 #include <algorithm>
@@ -47,6 +48,7 @@
 #define WM_APP_DRIVER_EVENT   (WM_APP + 1)   /* wParam = event mask */
 #define WM_APP_DEVICE_GONE    (WM_APP + 2)
 #define WM_APP_LAYOUT         (WM_APP + 3)
+#define WM_APP_DEFERRED       (WM_APP + 4)
 #define TIMER_STATS           1
 #define TIMER_DEMO            2
 
@@ -321,14 +323,10 @@ static DWORD RunOperation(int argc, wchar_t **argv)
     return err;
 }
 
-/* Runs an operation elevated (or in-process when already elevated). Returns the Win32 result. */
-static DWORD Elevated(HWND owner, const std::wstring &args, std::vector<std::wstring> argvIfElevated)
+/* Keep operations in a helper even for an administrator-launched panel, so
+ * SetupAPI and service waits never run on the panel's message thread. */
+static DWORD Elevated(HWND owner, const std::wstring &args)
 {
-    if (pn::IsElevated()) {
-        std::vector<wchar_t *> av;
-        for (auto &s : argvIfElevated) av.push_back(&s[0]);
-        return RunOperation((int)av.size(), av.data());
-    }
     DWORD code = 0;
     DWORD err = pn::RunElevated(pn::ModulePath(), L"--op " + args, code, owner);
     if (err != ERROR_SUCCESS) return err;
@@ -377,10 +375,31 @@ private:
     bool m_dirty = false;
     std::thread m_evThread;
     std::atomic<bool> m_evStop{ false };
-    DWORD m_lastGoneTick = 0;
+    pn::EventRetryLimiter m_eventRetry;
     unsigned m_sessionGen = 1;      /* bumped whenever a session closes; tags event-thread messages */
     bool m_inPrompt = false;        /* a modal prompt is up: defer refreshes until it is answered */
     bool m_refreshPending = false;
+    ULONG m_pendingEvents = 0;
+    DWORD m_pendingGone = ERROR_SUCCESS;
+    // Common dialogs and COM can dispatch device messages before they return.
+    struct ModalScope {
+        Panel &panel;
+        bool previous;
+        explicit ModalScope(Panel &p) : panel(p), previous(p.m_inPrompt) { panel.m_inPrompt = true; }
+        ~ModalScope() {
+            panel.m_inPrompt = previous;
+            if (!previous && (panel.m_refreshPending || panel.m_pendingEvents || panel.m_pendingGone))
+                PostMessageW(panel.m_hwnd, WM_APP_DEFERRED, 0, panel.m_sessionGen);
+        }
+    };
+    int Prompt(std::wstring text, UINT flags = MB_ICONINFORMATION) {
+        ModalScope modal(*this);
+        return Msg(m_hwnd, text, flags);
+    }
+    void Error(std::wstring text, DWORD error) {
+        ModalScope modal(*this);
+        ShowError(m_hwnd, text, error);
+    }
     LONG m_volumeLoaded = 0;        /* VolumeDb16 shown on the Transport page; written back only when edited */
     bool m_volumeEdited = false;
     pn::PackageTrust m_driverTrust;
@@ -456,7 +475,7 @@ private:
     INT_PTR OnPageNotify(HWND page, NMHDR *nm);
     INT_PTR OnPageScroll(HWND page, HWND ctl);
     void CodecMove(int delta);
-    void DriverOp(const std::wstring &what, const std::wstring &args, std::vector<std::wstring> argv, bool rescanAfter);
+    void DriverOp(const std::wstring &what, const std::wstring &args, bool rescanAfter);
     friend INT_PTR CALLBACK PageProcThunk(HWND, UINT, WPARAM, LPARAM);
 };
 
@@ -762,15 +781,16 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         p->OnInit();
         return TRUE;
     case WM_COMMAND:
+        if (p->m_inPrompt) return TRUE;
         switch (LOWORD(wp)) {
         case IDOK: if (p->m_dirty && p->m_s.open) p->Apply(); return TRUE;
-        case IDC_REFRESH: p->RefreshDevices(); return TRUE;
+        case IDC_REFRESH: p->m_eventRetry.Reset(); p->RefreshDevices(); return TRUE;
         case IDC_APPLY: p->Apply(); return TRUE;
         case IDC_REVERT: p->Revert(); return TRUE;
         case IDC_DEFAULTS: p->Defaults(); return TRUE;
         case IDC_IMPORT: p->ImportConfig(); return TRUE;
         case IDC_EXPORT: p->ExportConfig(); return TRUE;
-        case IDC_ABOUT: DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_ABOUT), hwnd, AboutProc, 0); return TRUE;
+        case IDC_ABOUT: { ModalScope modal(*p); DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_ABOUT), hwnd, AboutProc, 0); return TRUE; }
         case IDCANCEL: p->OnClose(); return TRUE;
         }
         break;
@@ -797,20 +817,34 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     }
     case WM_APP_DRIVER_EVENT:
-        if ((unsigned)lp == p->m_sessionGen && !p->m_inPrompt) p->OnDriverEvent((ULONG)wp);
+        if ((unsigned)lp == p->m_sessionGen) {
+            if (p->m_inPrompt) p->m_pendingEvents |= (ULONG)wp;
+            else p->OnDriverEvent((ULONG)wp);
+        }
         return TRUE;
     case WM_APP_DEVICE_GONE: {
         if ((unsigned)lp != p->m_sessionGen) return TRUE;       /* stale message from a session that is already closed */
-        if (p->m_inPrompt) { p->m_refreshPending = true; return TRUE; }
+        if (p->m_inPrompt) { p->m_pendingGone = (DWORD)wp; return TRUE; }
         /* refresh once; if the instance keeps failing right after reopening, stop retrying */
-        DWORD now = GetTickCount();
-        bool storm = p->m_lastGoneTick && (now - p->m_lastGoneTick) < 10000;
-        p->m_lastGoneTick = now;
+        std::wstring instance = p->m_sel >= 0 && p->m_sel < (int)p->m_devices.size() ? p->m_devices[p->m_sel].node.instanceId : L"";
+        bool storm = p->m_eventRetry.ShouldPause(instance, GetTickCount64());
         if (storm) { p->StopEventThread(); p->SetStatusText(L"The driver stopped answering event requests: " + pn::Win32ErrorText((DWORD)wp) + L". Status updates are paused; press Refresh to retry."); }
         else { p->SetStatusText(L"The headset's driver instance went away; refreshing the device list."); p->RefreshDevices(); }
         return TRUE;
     }
+    case WM_APP_DEFERRED:
+        if ((unsigned)lp != p->m_sessionGen || p->m_inPrompt) return TRUE;
+        if (p->m_refreshPending) { p->m_refreshPending = false; p->RefreshDevices(); }
+        else if (p->m_pendingGone) {
+            DWORD error = p->m_pendingGone; p->m_pendingGone = ERROR_SUCCESS;
+            PostMessageW(hwnd, WM_APP_DEVICE_GONE, error, p->m_sessionGen);
+        } else {
+            ULONG events = p->m_pendingEvents; p->m_pendingEvents = 0;
+            if (events) p->OnDriverEvent(events);
+        }
+        return TRUE;
     case WM_TIMER:
+        if (p->m_inPrompt) return TRUE;
         if (wp == TIMER_STATS && !p->m_inPrompt && p->m_sel >= 0 && p->m_sel < (int)p->m_devices.size()) {
             if (p->m_adjustingVolume && GetCapture() != GetDlgItem(p->m_page[PG_WINDOWS], IDC_WIN_VOLUME)) p->m_adjustingVolume = false;
             if (!p->m_demo && GetTickCount64() - p->m_driverRefreshTick >= 5000) {
@@ -977,9 +1011,7 @@ void Panel::OnClose()
 {
     if (m_inPrompt) return;
     if (m_dirty && m_s.open) {
-        m_inPrompt = true;
-        int r = Msg(m_hwnd, L"Apply the changed settings before closing?", MB_ICONQUESTION | MB_YESNOCANCEL);
-        m_inPrompt = false;
+        int r = Prompt(L"Apply the changed settings before closing?", MB_ICONQUESTION | MB_YESNOCANCEL);
         if (r == IDCANCEL) return;
         if (r == IDYES && !Apply()) return;
     }
@@ -1132,11 +1164,9 @@ void Panel::RefreshDevices(bool keepSelection)
     if (keepSelection && m_sel >= 0 && m_sel < (int)m_devices.size()) keep = m_devices[m_sel].node.instanceId;
     if (m_inPrompt) { m_refreshPending = true; return; }
     if (m_dirty && m_s.open) {
-        m_inPrompt = true;
-        int r = Msg(m_hwnd, L"Apply the changed settings before refreshing?", MB_ICONQUESTION | MB_YESNO);
-        m_inPrompt = false;
+        int r = Prompt(L"Apply the changed settings before refreshing?", MB_ICONQUESTION | MB_YESNOCANCEL);
         m_refreshPending = false;
-        if (r == IDYES && !Apply()) return;
+        if (r == IDCANCEL || (r == IDYES && !Apply())) return;
     }
     CloseSession();
     m_devices.clear();
@@ -1201,6 +1231,9 @@ void Panel::RefreshDevices(bool keepSelection)
 void Panel::CloseSession()
 {
     StopEventThread();
+    m_pendingEvents = 0;
+    m_pendingGone = ERROR_SUCCESS;
+    m_refreshPending = false;
     m_s.dev.Close();
     m_s.open = false;
     m_s.demo = false;
@@ -1215,10 +1248,8 @@ void Panel::SelectDevice(int index)
     if (index < 0 || index >= (int)m_devices.size()) return;
     if (m_dirty && m_s.open && index != m_sel) {
         std::wstring target = m_devices[index].node.instanceId;
-        m_inPrompt = true;
-        int r = Msg(m_hwnd, L"Apply the changed settings to the previous headset first?", MB_ICONQUESTION | MB_YESNO);
-        m_inPrompt = false;
-        if (r == IDYES && !Apply()) {
+        int r = Prompt(L"Apply the changed settings to the previous headset first?", MB_ICONQUESTION | MB_YESNOCANCEL);
+        if (r == IDCANCEL || (r == IDYES && !Apply())) {
             /* Keep the previous session and its unsaved edits after a rejected save. */
             m_inPrompt = true;
             ListView_SetItemState(m_devList, index, 0, LVIS_SELECTED | LVIS_FOCUSED);
@@ -1226,7 +1257,6 @@ void Panel::SelectDevice(int index)
             m_inPrompt = false;
             return;
         }
-        if (m_refreshPending) { m_refreshPending = false; RefreshDevices(false); }
         /* the device list may have been rebuilt while the prompt was up: find the target again */
         index = -1;
         for (size_t i = 0; i < m_devices.size(); i++) if (_wcsicmp(m_devices[i].node.instanceId.c_str(), target.c_str()) == 0) index = (int)i;
@@ -1234,7 +1264,8 @@ void Panel::SelectDevice(int index)
     }
     CloseSession();
     m_sel = index;
-    DeviceEntry &d = m_devices[index];
+    const DeviceEntry d = m_devices[index];
+    const unsigned generation = m_sessionGen;
     m_s.Reset();
     if (d.demo && d.node.usesPnA2dp()) {
         m_s.DemoFill();
@@ -1252,6 +1283,7 @@ void Panel::SelectDevice(int index)
     ConfigureTabs();
     EnableConfigPages(m_s.open);
     LoadAll();
+    if (generation != m_sessionGen) return;
     SetDirty(false);
     if (m_s.open) SetStatusText(L"Connected to the PN-A2DP driver instance for " + (d.node.name.empty() ? pn::BtAddressText(d.node.address) : d.node.name) + L".");
     else if (!m_s.open) {
@@ -1265,7 +1297,6 @@ void Panel::StartEventThread()
 {
     if (m_s.demo || !m_s.open) return;
     m_evStop = false;
-    m_lastGoneTick = 0;
     HWND hwnd = m_hwnd;
     pn::Device *dev = &m_s.dev;
     std::atomic<bool> *stop = &m_evStop;
@@ -1364,9 +1395,7 @@ bool Panel::Apply()
         if (!m_s.demo && m_s.dev.GetConfig(live)) c.VolumeDb16 = live.VolumeDb16; else c.VolumeDb16 = m_s.applied.VolumeDb16;
     }
     if (!m_s.StoreConfig(c)) {
-        m_inPrompt = true;
-        ShowError(m_hwnd, L"The driver rejected the configuration. Your changes have been kept; correct the problem and try Apply again.", m_s.dev.LastError());
-        m_inPrompt = false;
+        Error(L"The driver rejected the configuration. Your changes have been kept; correct the problem and try Apply again.", m_s.dev.LastError());
         return false;
     }
     LoadAll();
@@ -1412,35 +1441,24 @@ static bool PickFile(HWND owner, bool save, std::wstring &path)
 void Panel::ExportConfig()
 {
     if (!m_s.open) return;
+    ModalScope modal(*this);
     PNA2DP_CONFIG c; CollectConfig(c);
     std::wstring path;
     if (!PickFile(m_hwnd, true, path)) return;
-    std::wstring text = pn::ConfigToText(c);
-    int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), NULL, 0, NULL, NULL);
-    std::string u8(n, 0);
-    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), &u8[0], n, NULL, NULL);
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) { ShowError(m_hwnd, L"Cannot write the file.", GetLastError()); return; }
-    DWORD w = 0; WriteFile(f, u8.data(), (DWORD)u8.size(), &w, NULL); CloseHandle(f);
+    DWORD error = pn::WriteConfigFile(path, c);
+    if (error) { Error(L"Cannot export settings. The existing file has been kept.", error); return; }
     SetStatusText(L"Settings exported to " + path);
 }
 
 void Panel::ImportConfig()
 {
     if (!m_s.open) return;
+    ModalScope modal(*this);
     std::wstring path;
     if (!PickFile(m_hwnd, false, path)) return;
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) { ShowError(m_hwnd, L"Cannot read the file.", GetLastError()); return; }
-    DWORD size = GetFileSize(f, NULL), got = 0;
-    std::string u8(size, 0);
-    if (size) ReadFile(f, &u8[0], size, &got, NULL);
-    CloseHandle(f);
-    int n = MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), (int)got, NULL, 0);
-    std::wstring text(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), (int)got, &text[0], n);
     PNA2DP_CONFIG c;
-    if (!pn::ConfigFromText(text, c)) { Msg(m_hwnd, L"The file does not contain PN-A2DP settings.", MB_ICONWARNING); return; }
+    DWORD error = pn::ReadConfigFile(path, c);
+    if (error) { Error(L"Cannot import settings. Choose a valid UTF-8 PN-A2DP settings file (up to 1 MiB). Your settings have been kept.", error); return; }
     c.VolumeDb16 = m_s.config.VolumeDb16;
     m_s.config = c;
     LoadAll();
@@ -2044,18 +2062,20 @@ INT_PTR CALLBACK Panel::PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
 {
+    if (m_inPrompt) return TRUE;
     /* Windows controls apply immediately and never mark codec settings dirty. */
     if (page == m_page[PG_WINDOWS]) {
         if (id == IDC_WIN_REFRESH) { LoadWindowsAudio(); return TRUE; }
-        if (id == IDC_WIN_DETAILS) { Msg(m_hwnd, pn::WindowsAudioReport(m_audio)); return TRUE; }
+        if (id == IDC_WIN_DETAILS) { Prompt(pn::WindowsAudioReport(m_audio)); return TRUE; }
         if ((id == IDC_WIN_SOUND || id == IDC_WIN_BLUETOOTH) && !m_demo) {
             HINSTANCE result = ShellExecuteW(m_hwnd, L"open", id == IDC_WIN_SOUND ? L"ms-settings:sound" : L"ms-settings:bluetooth", nullptr, nullptr, SW_SHOWNORMAL);
-            if ((INT_PTR)result <= 32) Msg(m_hwnd, L"Cannot open Windows settings.", MB_ICONERROR);
+            if ((INT_PTR)result <= 32) Prompt(L"Cannot open Windows settings.", MB_ICONERROR);
             return TRUE;
         }
         if (id == IDC_WIN_MUTE && code == BN_CLICKED && WindowsMode() && !m_demo) {
-            ++m_audioRevision;
+            const unsigned generation = m_sessionGen, revision = ++m_audioRevision;
             HRESULT hr = pn::SetWindowsMute(m_devices[m_sel].node.instanceId, m_audio.endpointId, Checked(page, id));
+            if (generation != m_sessionGen || revision != m_audioRevision) return TRUE;
             LoadWindowsAudio();
             if (SUCCEEDED(hr)) SetStatusText(L"Output mute updated.");
             if (FAILED(hr)) SetStatusText(L"Mute was not changed. The output may have disconnected or changed; refresh and retry.");
@@ -2073,7 +2093,7 @@ INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
     }
     if (page == m_page[PG_STATUS]) {
         if (id == IDC_ST_RESETSTATS) { if (!m_s.demo) m_s.dev.ResetStats(); else m_s.stats = PNA2DP_STATS{}; m_s.Refresh(false); LoadStatus(); return TRUE; }
-        if (id == IDC_ST_RECONNECT) { if (!m_s.demo && !m_s.dev.Reconnect()) ShowError(m_hwnd, L"Reconnect failed.", m_s.dev.LastError()); else SetStatusText(L"Reconnecting..."); return TRUE; }
+        if (id == IDC_ST_RECONNECT) { if (!m_s.demo && !m_s.dev.Reconnect()) Error(L"Reconnect failed.", m_s.dev.LastError()); else SetStatusText(L"Reconnecting..."); return TRUE; }
         return FALSE;
     }
     if (page == m_page[PG_CODECS]) {
@@ -2117,20 +2137,21 @@ INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
         return FALSE;
     }
     if (page == m_page[PG_DRIVER]) {
-        const DeviceEntry *e = (m_sel >= 0 && m_sel < (int)m_devices.size()) ? &m_devices[m_sel] : nullptr;
+        const bool selected = m_sel >= 0 && m_sel < (int)m_devices.size();
+        const DeviceEntry device = selected ? m_devices[m_sel] : DeviceEntry{};
+        const DeviceEntry *e = selected ? &device : nullptr;
         switch (id) {
         case IDC_DRV_REQUIREMENTS: {
             LoadDriver();
-            m_inPrompt = true;
-            Msg(m_hwnd, m_readiness.detail + L"\n\nThese checks do not change Windows security settings. A green light means a PN development-driver requirement is met, not that Windows security is stronger.");
-            m_inPrompt = false; return TRUE;
+            Prompt(m_readiness.detail + L"\n\nThese checks do not change Windows security settings. A green light means a PN development-driver requirement is met, not that Windows security is stronger.");
+            return TRUE;
         }
         case IDC_DRV_SECURITY:
             if ((INT_PTR)ShellExecuteW(m_hwnd, L"open", L"windowsdefender://coreisolation", nullptr, nullptr, SW_SHOWNORMAL) <= 32)
-                Msg(m_hwnd, L"Open Windows Security > Device security > Core isolation to inspect Memory Integrity.");
+                Prompt(L"Open Windows Security > Device security > Core isolation to inspect Memory Integrity.");
             return TRUE;
         case IDC_DRV_BOOT_MODE: {
-            if (m_demo || pn::IsElevated()) { ShowBootModeDialog(g_inst, m_hwnd, m_demo); LoadDriver(); return TRUE; }
+            if (m_demo || pn::IsElevated()) { ModalScope modal(*this); ShowBootModeDialog(g_inst, m_hwnd, m_demo); LoadDriver(); return TRUE; }
             // Boot settings may stay open for minutes. Do not block the audio panel
             // in RunElevated's synchronous wait while the separate dialog is open.
             if (HWND existing = FindWindowW(L"#32770", L"PN-A2DP - Windows boot mode")) {
@@ -2143,28 +2164,28 @@ INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
             launch.lpParameters = L"--op boot-settings"; launch.nShow = SW_SHOWNORMAL;
             if (!ShellExecuteExW(&launch)) {
                 DWORD error = GetLastError();
-                if (error != ERROR_CANCELLED) ShowError(m_hwnd, L"Cannot open Windows boot settings.", error);
+                if (error != ERROR_CANCELLED) Error(L"Cannot open Windows boot settings.", error);
                 SetStatusText(error == ERROR_CANCELLED ? L"Boot settings cancelled; no changes made." : L"Cannot open Windows boot settings.");
             } else SetStatusText(L"Windows boot settings opened in a separate administrator window.");
             return TRUE;
         }
         case IDC_DRV_USE_PNA2DP:
             if (!e) return TRUE;
-            if (e->demo) { Msg(m_hwnd, L"Demo mode: this would stage pna2dp.inf (if needed) and force it onto the selected device node through SetupAPI (DiInstallDevice with DIIRFLAG_FORCE_INF)."); return TRUE; }
+            if (e->demo) { Prompt(L"Demo mode: this would stage pna2dp.inf (if needed) and force it onto the selected device node through SetupAPI (DiInstallDevice with DIIRFLAG_FORCE_INF)."); return TRUE; }
             LoadReadiness();
-            if (!m_readiness.ready()) { Msg(m_hwnd, m_readiness.detail, MB_ICONWARNING); return TRUE; }
-            if (Msg(m_hwnd, L"Use the newest available PN-A2DP driver for \"" + e->node.name + L"\"?\n\nThe audio endpoint is recreated; a stream that is playing stops for a moment. Windows may require a restart to finish the change.", MB_ICONQUESTION | MB_YESNO) != IDYES) return TRUE;
-            DriverOp(L"Switching to the PN-A2DP driver", L"use-pna2dp " + Quote(e->node.instanceId), { L"use-pna2dp", e->node.instanceId }, true);
+            if (!m_readiness.ready()) { Prompt(m_readiness.detail, MB_ICONWARNING); return TRUE; }
+            if (Prompt(L"Use the newest available PN-A2DP driver for \"" + e->node.name + L"\"?\n\nThe audio endpoint is recreated; a stream that is playing stops for a moment. Windows may require a restart to finish the change.", MB_ICONQUESTION | MB_YESNO) != IDYES) return TRUE;
+            DriverOp(L"Switching to the PN-A2DP driver", L"use-pna2dp " + Quote(e->node.instanceId), true);
             return TRUE;
         case IDC_DRV_USE_INBOX:
             if (!e) return TRUE;
-            if (BootSettingsWindow()) { Msg(m_hwnd, L"Close Windows / Test Mode before switching drivers."); return TRUE; }
-            if (e->demo) { Msg(m_hwnd, L"Demo mode: this would select microsoft_bluetooth_a2dp_src.inf from the compatible driver list for the device node and install it."); return TRUE; }
-            if (Msg(m_hwnd, L"Switch \"" + e->node.name + L"\" back to the Microsoft inbox driver?\n\nThe PN-A2DP settings for this headset stay in the registry and are used again when you switch back.", MB_ICONQUESTION | MB_YESNO) != IDYES) return TRUE;
-            DriverOp(L"Restoring the Microsoft driver", L"use-inbox " + Quote(e->node.instanceId), { L"use-inbox", e->node.instanceId }, true);
+            if (BootSettingsWindow()) { Prompt(L"Close Windows / Test Mode before switching drivers."); return TRUE; }
+            if (e->demo) { Prompt(L"Demo mode: this would select microsoft_bluetooth_a2dp_src.inf from the compatible driver list for the device node and install it."); return TRUE; }
+            if (Prompt(L"Switch \"" + e->node.name + L"\" back to the Microsoft inbox driver?\n\nThe PN-A2DP settings for this headset stay in the registry and are used again when you switch back.", MB_ICONQUESTION | MB_YESNO) != IDYES) return TRUE;
+            DriverOp(L"Restoring the Microsoft driver", L"use-inbox " + Quote(e->node.instanceId), true);
             return TRUE;
         case IDC_DRV_RESCAN:
-            DriverOp(L"Rescanning devices", L"rescan", { L"rescan" }, true);
+            DriverOp(L"Rescanning devices", L"rescan", true);
             return TRUE;
         case IDC_DRV_STAGE: {
             wchar_t buf[MAX_PATH] = L"pna2dp.inf";
@@ -2173,27 +2194,27 @@ INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST; ofn.lpstrTitle = L"Select the PN-A2DP driver package (pna2dp.inf with pna2dp.sys and pna2dp.cat beside it)";
             std::wstring def = FindPackageInf();
             if (!def.empty()) wcscpy_s(buf, def.c_str());
-            if (!GetOpenFileNameW(&ofn)) return TRUE;
-            DriverOp(L"Staging the driver package", L"stage " + Quote(buf), { L"stage", buf }, false);
+            { ModalScope modal(*this); if (!GetOpenFileNameW(&ofn)) return TRUE; }
+            DriverOp(L"Staging the driver package", L"stage " + Quote(buf), false);
             return TRUE;
         }
         case IDC_DRV_UNSTAGE: {
             auto staged = pn::FindStagedPackages();
             if (staged.empty()) return TRUE;
-            if (Msg(m_hwnd, L"Remove " + staged.back().publishedName + L" from the driver store?\n\nHeadsets that use PN-A2DP fall back to the Microsoft driver on their next connection.", MB_ICONQUESTION | MB_YESNO) != IDYES) return TRUE;
-            DriverOp(L"Removing the driver package", L"unstage " + staged.back().publishedName, { L"unstage", staged.back().publishedName }, true);
+            if (Prompt(L"Remove " + staged.back().publishedName + L" from the driver store?\n\nHeadsets that use PN-A2DP fall back to the Microsoft driver on their next connection.", MB_ICONQUESTION | MB_YESNO) != IDYES) return TRUE;
+            DriverOp(L"Removing the driver package", L"unstage " + staged.back().publishedName, true);
             return TRUE;
         }
-        case IDC_DRV_SVC_START: DriverOp(L"Starting the codec host service", L"svc-start", { L"svc-start" }, false); return TRUE;
-        case IDC_DRV_SVC_STOP: DriverOp(L"Stopping the codec host service", L"svc-stop", { L"svc-stop" }, false); return TRUE;
+        case IDC_DRV_SVC_START: DriverOp(L"Starting the codec host service", L"svc-start", false); return TRUE;
+        case IDC_DRV_SVC_STOP: DriverOp(L"Stopping the codec host service", L"svc-stop", false); return TRUE;
         case IDC_DRV_SVC_INSTALL: {
             std::wstring exe = pn::JoinPath(GetText(page, IDC_DRV_INSTALLDIR), L"pna2dp-codechost.exe");
-            DriverOp(L"Installing the codec host service", L"svc-install " + Quote(exe), { L"svc-install", exe }, false);
+            DriverOp(L"Installing the codec host service", L"svc-install " + Quote(exe), false);
             return TRUE;
         }
         case IDC_DRV_SVC_REMOVE:
-            if (Msg(m_hwnd, L"Remove the codec host service? Only SBC remains available until it is installed again.", MB_ICONQUESTION | MB_YESNO) != IDYES) return TRUE;
-            DriverOp(L"Removing the codec host service", L"svc-remove", { L"svc-remove" }, false);
+            if (Prompt(L"Remove the codec host service? Only SBC remains available until it is installed again.", MB_ICONQUESTION | MB_YESNO) != IDYES) return TRUE;
+            DriverOp(L"Removing the codec host service", L"svc-remove", false);
             return TRUE;
         case IDC_DRV_OPENDIR: ShellExecuteW(m_hwnd, L"open", GetText(page, IDC_DRV_INSTALLDIR).c_str(), NULL, NULL, SW_SHOWNORMAL); return TRUE;
         }
@@ -2256,6 +2277,7 @@ INT_PTR Panel::OnPageNotify(HWND page, NMHDR *nm)
 
 INT_PTR Panel::OnPageScroll(HWND page, HWND ctl)
 {
+    if (m_inPrompt) return TRUE;
     if (!ctl || (m_loading && page != m_page[PG_WINDOWS])) return FALSE;
     int id = GetDlgCtrlID(ctl);
     int pos = (int)SendMessageW(ctl, TBM_GETPOS, 0, 0);
@@ -2264,8 +2286,9 @@ INT_PTR Panel::OnPageScroll(HWND page, HWND ctl)
         m_loading = guard;
         if (!WindowsMode() || m_demo) return TRUE;
         m_adjustingVolume = GetCapture() == ctl;
-        ++m_audioRevision;
+        const unsigned generation = m_sessionGen, revision = ++m_audioRevision;
         HRESULT hr = pn::SetWindowsVolume(m_devices[m_sel].node.instanceId, m_audio.endpointId, (float)pos / 100.0f);
+        if (generation != m_sessionGen || revision != m_audioRevision) return TRUE;
         SetTextF(page, IDC_WIN_LEVEL, L"%d%%", pos);
         if (FAILED(hr)) { m_adjustingVolume = false; LoadWindowsAudio(); SetStatusText(L"Volume was not changed. Refresh the selected output and retry."); }
         return TRUE;
@@ -2279,22 +2302,34 @@ INT_PTR Panel::OnPageScroll(HWND page, HWND ctl)
     return TRUE;
 }
 
-void Panel::DriverOp(const std::wstring &what, const std::wstring &args, std::vector<std::wstring> argv, bool rescanAfter)
+void Panel::DriverOp(const std::wstring &what, const std::wstring &args, bool rescanAfter)
 {
+    if (rescanAfter && m_dirty && m_s.open) {
+        int answer = Prompt(L"Apply your changed settings before this driver operation?\n\nYes saves them, No discards them, and Cancel keeps editing.", MB_ICONQUESTION | MB_YESNOCANCEL);
+        if (answer == IDCANCEL || (answer == IDYES && !Apply())) return;
+    }
+    if (m_demo) {
+        Prompt(L"Demo mode: " + what + L" is simulated. No device, driver package or Windows service was changed.");
+        return;
+    }
     SetStatusText(what + L"...");
     SetCursor(LoadCursorW(NULL, IDC_WAIT));
     if (rescanAfter) CloseSession();
-    DWORD err = Elevated(m_hwnd, args, argv);
+    DWORD err;
+    {
+        ModalScope modal(*this);
+        err = Elevated(m_hwnd, args);
+    }
     SetCursor(LoadCursorW(NULL, IDC_ARROW));
     if (err == ERROR_CANCELLED) { if (rescanAfter) RefreshDevices(true); SetStatusText(what + L": cancelled at the elevation prompt."); return; }
     if (err == ERROR_REQUEST_ABORTED) { if (rescanAfter) RefreshDevices(true); LoadDriver(); SetStatusText(L"Activation blocked by the requirements check; device driver unchanged."); return; }
-    if (err == ERROR_SUCCESS_REBOOT_REQUIRED) { Msg(m_hwnd, what + L" succeeded; Windows asks for a restart to finish the driver change.", MB_ICONINFORMATION); err = ERROR_SUCCESS; }
+    if (err == ERROR_SUCCESS_REBOOT_REQUIRED) { Prompt(what + L" succeeded; Windows asks for a restart to finish the driver change.", MB_ICONINFORMATION); err = ERROR_SUCCESS; }
     if (err != ERROR_SUCCESS) {
         std::wstring hint;
         if (err == ERROR_BUSY) hint = L"\n\nClose Windows / Test Mode and wait for any other driver operation to finish, then retry.";
         if (err == ERROR_FILE_NOT_FOUND) hint = L"\n\nNo pna2dp.inf was found. Use \"Stage package...\" to point at the driver package, or run the installer.";
         if (err == 0xE0000247 || err == 0xE000022F || err == ERROR_DRIVER_BLOCKED || err == 0x800B0109) hint = L"\n\nThe package signature is not trusted. A test-signed build needs test signing enabled (bcdedit /set testsigning on) and the test certificate in the Root and TrustedPublisher stores; see docs/04-build-sign-install.md.";
-        ShowError(m_hwnd, what + L" failed." + hint, err);
+        Error(what + L" failed." + hint, err);
         SetStatusText(what + L": failed.");
     } else {
         SetStatusText(what + L": done.");

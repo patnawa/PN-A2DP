@@ -678,16 +678,29 @@ DWORD StartServiceByName(const wchar_t *name, DWORD waitMs)
     return err;
 }
 
+static DWORD StopServiceHandle(SC_HANDLE service, DWORD waitMs)
+{
+    SERVICE_STATUS status{};
+    if (!QueryServiceStatus(service, &status)) return GetLastError();
+    if (status.dwCurrentState == SERVICE_STOPPED) return ERROR_SUCCESS;
+    if (status.dwCurrentState != SERVICE_STOP_PENDING && !ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+        DWORD error = GetLastError();
+        if (error != ERROR_SERVICE_NOT_ACTIVE && error != ERROR_SERVICE_CANNOT_ACCEPT_CTRL) return error;
+        // Another caller can begin shutdown between our query and STOP request.
+        // Only a confirmed stopped/stopping state makes the refusal harmless.
+        if (!QueryServiceStatus(service, &status)) return GetLastError();
+        if (status.dwCurrentState != SERVICE_STOPPED && status.dwCurrentState != SERVICE_STOP_PENDING) return error;
+    }
+    return WaitServiceState(service, SERVICE_STOPPED, waitMs);
+}
+
 DWORD StopServiceByName(const wchar_t *name, DWORD waitMs)
 {
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
     if (!scm) return GetLastError();
     SC_HANDLE s = OpenServiceW(scm, name, SERVICE_STOP | SERVICE_QUERY_STATUS);
     if (!s) { DWORD e = GetLastError(); CloseServiceHandle(scm); return e; }
-    SERVICE_STATUS st = {};
-    DWORD err = ERROR_SUCCESS;
-    if (!ControlService(s, SERVICE_CONTROL_STOP, &st)) { err = GetLastError(); if (err == ERROR_SERVICE_NOT_ACTIVE) err = ERROR_SUCCESS; }
-    if (err == ERROR_SUCCESS) err = WaitServiceState(s, SERVICE_STOPPED, waitMs);
+    DWORD err = StopServiceHandle(s, waitMs);
     CloseServiceHandle(s);
     CloseServiceHandle(scm);
     return err;
@@ -701,17 +714,22 @@ DWORD StopServiceAndWaitForExit(const wchar_t *name, DWORD waitMs)
     if (!s) { DWORD e = GetLastError(); CloseServiceHandle(scm); return e == ERROR_SERVICE_DOES_NOT_EXIST ? ERROR_SUCCESS : e; }
     SERVICE_STATUS_PROCESS ssp = {};
     DWORD need = 0, pid = 0;
-    if (QueryServiceStatusEx(s, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &need)) pid = ssp.dwProcessId;
-    HANDLE proc = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
-    SERVICE_STATUS st = {};
     DWORD err = ERROR_SUCCESS;
-    if (ssp.dwCurrentState != SERVICE_STOPPED) {
-        if (!ControlService(s, SERVICE_CONTROL_STOP, &st)) { err = GetLastError(); if (err == ERROR_SERVICE_NOT_ACTIVE) err = ERROR_SUCCESS; }
-        if (err == ERROR_SUCCESS) err = WaitServiceState(s, SERVICE_STOPPED, waitMs);
-    }
+    if (!QueryServiceStatusEx(s, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &need)) err = GetLastError();
+    // Windows does not guarantee the PID in START_PENDING/STOP_PENDING, and it
+    // is never valid in STOPPED. Do not open a stale or unrelated process.
+    else if (ssp.dwCurrentState == SERVICE_RUNNING || ssp.dwCurrentState == SERVICE_PAUSED ||
+             ssp.dwCurrentState == SERVICE_PAUSE_PENDING || ssp.dwCurrentState == SERVICE_CONTINUE_PENDING) pid = ssp.dwProcessId;
+    HANDLE proc = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+    // An already-exited process has no handle; other failures must not be
+    // mistaken for evidence that its executable can safely be replaced.
+    if (pid && !proc) { DWORD openError = GetLastError(); if (openError != ERROR_INVALID_PARAMETER) err = openError; }
+    if (err == ERROR_SUCCESS) err = StopServiceHandle(s, waitMs);
     if (err == ERROR_SUCCESS && proc) {
         /* SERVICE_STOPPED is reported before the process has released its image; wait for the exit */
-        if (WaitForSingleObject(proc, waitMs) == WAIT_TIMEOUT) err = ERROR_SERVICE_REQUEST_TIMEOUT;
+        DWORD result = WaitForSingleObject(proc, waitMs);
+        if (result == WAIT_TIMEOUT) err = ERROR_SERVICE_REQUEST_TIMEOUT;
+        else if (result != WAIT_OBJECT_0) err = GetLastError();
     }
     if (proc) CloseHandle(proc);
     CloseServiceHandle(s);
@@ -754,11 +772,11 @@ DWORD DeleteServiceByName(const wchar_t *name)
     if (!scm) return GetLastError();
     SC_HANDLE s = OpenServiceW(scm, name, DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
     if (!s) { DWORD e = GetLastError(); CloseServiceHandle(scm); return e == ERROR_SERVICE_DOES_NOT_EXIST ? ERROR_SUCCESS : e; }
-    SERVICE_STATUS st = {};
-    ControlService(s, SERVICE_CONTROL_STOP, &st);
-    WaitServiceState(s, SERVICE_STOPPED, 10000);
-    DWORD err = DeleteService(s) ? ERROR_SUCCESS : GetLastError();
-    if (err == ERROR_SERVICE_MARKED_FOR_DELETE) err = ERROR_SUCCESS;
+    DWORD err = StopServiceHandle(s, 10000);
+    if (err == ERROR_SUCCESS && !DeleteService(s)) {
+        err = GetLastError();
+        if (err == ERROR_SERVICE_MARKED_FOR_DELETE) err = ERROR_SUCCESS;
+    }
     CloseServiceHandle(s);
     CloseServiceHandle(scm);
     return err;
@@ -840,6 +858,12 @@ bool IsElevated()
 DWORD RunElevated(const std::wstring &exe, const std::wstring &params, DWORD &exitCode, HWND owner)
 {
     exitCode = 0;
+    struct RestoreInput {
+        HWND window;
+        bool enabled;
+        ~RestoreInput() { if (enabled && IsWindow(window)) EnableWindow(window, TRUE); }
+    } input{owner, owner && IsWindowEnabled(owner) != FALSE};
+    if (input.enabled) EnableWindow(owner, FALSE);
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
     sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
     sei.hwnd = owner;
@@ -849,10 +873,28 @@ DWORD RunElevated(const std::wstring &exe, const std::wstring &params, DWORD &ex
     sei.nShow = SW_SHOWNORMAL;
     if (!ShellExecuteExW(&sei)) return GetLastError();
     if (!sei.hProcess) return ERROR_INVALID_HANDLE;
-    WaitForSingleObject(sei.hProcess, INFINITE);
-    GetExitCodeProcess(sei.hProcess, &exitCode);
+    DWORD error = ERROR_SUCCESS;
+    bool quitting = false;
+    WPARAM quitCode = 0;
+    for (;;) {
+        // The calling thread owns the panel (or COM windows). A plain infinite
+        // wait starves messages and can deadlock a helper waiting on a broadcast.
+        DWORD wait = MsgWaitForMultipleObjectsEx(1, &sei.hProcess, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (wait == WAIT_OBJECT_0) break;
+        if (wait == WAIT_FAILED) { error = GetLastError(); break; }
+        if (wait != WAIT_OBJECT_0 + 1) { error = ERROR_GEN_FAILURE; break; }
+        MSG message{};
+        // Recheck the process even when another source continuously posts input.
+        for (int count = 0; count < 64 && PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++count) {
+            if (message.message == WM_QUIT) { quitting = true; quitCode = message.wParam; continue; }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    if (!error && !GetExitCodeProcess(sei.hProcess, &exitCode)) error = GetLastError();
     CloseHandle(sei.hProcess);
-    return ERROR_SUCCESS;
+    if (quitting) PostQuitMessage((int)quitCode);
+    return error;
 }
 
 DWORD RunAndWait(const std::wstring &cmdLine, DWORD &exitCode, std::wstring *output)

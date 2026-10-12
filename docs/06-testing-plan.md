@@ -1,5 +1,94 @@
 # Testing and verification
 
+## Diagnosing-bugs pass, control panel 0.1.0.26 (2026-10-12)
+
+Two repeatable failures were isolated using production helpers before applying
+fixes. A service already in `STOP_PENDING` rejected a second STOP request with
+error 1061, preventing Stop, upgrade and uninstall from waiting for completion.
+The upgrade helper also opened a PID whose validity Windows does not guarantee
+during shutdown. Tests with longer deadlines still failed immediately; counting
+STOP calls and process opens identified the incorrect state handling.
+
+The service regression now covers 20 checks, including an existing pending stop,
+a concurrent stop between query and control, timeout without deleting registration,
+and an inaccessible stale PID. It substitutes Windows service/process calls and
+never mutates a real service. Run the focused loop with:
+
+```powershell
+.\build\build.ps1 -Target service-tests -Config Release
+.\out\Release\service_failure_test.exe
+```
+
+`process_wait_test.exe` exercises the real elevated-helper wait with a worker
+thread substituted for process launch. Real Win32 wait handles and synchronous
+cross-thread messages reproduce the blocked UI: the helper's message timed out,
+even with a longer deadline. The fixed wait dispatches messages, disables owner
+input, retains quit messages and propagates wait/exit-code failures. Its 13 checks
+also verify owner-state restoration after cancellation and failure. No elevation
+or driver operation occurs in this test. Run its loop with:
+
+```powershell
+.\build\build.ps1 -Target process-tests -Config Release
+.\out\Release\process_wait_test.exe
+```
+
+Both loops failed repeatedly before their fixes and pass after them. They are
+included in normal verification and AddressSanitizer runs. The panel now launches
+driver operations in its helper even when already elevated, with device events
+and duplicate commands deferred or suppressed while the helper runs.
+
+The documented API constraints are in Microsoft's
+[ControlService](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-controlservice),
+[QueryServiceStatusEx](https://learn.microsoft.com/en-us/windows/win32/api/winsvc/nf-winsvc-queryservicestatusex)
+and [WaitForSingleObject](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)
+references. Red/green evidence is retained in `out/diagnosing-services-*.log` and
+`out/diagnosing-process-*.log`. These fixes change application/service management;
+the installed signed kernel driver remains 0.1.0.16.
+
+Final verification passed 21 software groups, six Windows-mode groups and nine
+installer-signing checks. Reports are under `out/verification/20261012-162941/`,
+`windows-mode-20261012-162941/` and `setup-signing-20261012-162941-9128af32/`.
+The application-only installer successfully updated this machine to 0.1.0.26;
+installed hashes match the package, configuration is unchanged, and the existing
+codec-host PID and kernel/host hashes are unchanged. A five-second silent WASAPI
+stream submitted and drained 240,000 frames on the Sony at 48 kHz. Bluetooth
+packet counters increased with zero drops, write failures or latency trims.
+This silent stream checks transport, not subjective listening quality. Other
+Bluetooth receiver codecs remain outside this machine's hardware coverage.
+
+## Bug review, control panel 0.1.0.25 (2026-10-12)
+
+Reviewed configuration import/export, device-event recovery, modal dialogs,
+Windows audio endpoint ownership, driver operations and installer/service error
+handling. Four new configuration-parser regressions failed on the previous code
+and passed after the fixes. Configuration-file tests cover Unicode filenames,
+UTF-8 BOMs, invalid UTF-8, embedded NULs, empty/missing/oversized files, atomic
+replacement and preservation of an existing export when replacement is blocked.
+Retry tests cover immediate repeated failures, different devices, manual reset
+and system uptime beyond the 32-bit tick rollover.
+
+`service_failure_test.exe` compiles the production service helpers against fake
+Windows service/process calls. Its 13 checks inject stop refusal, status-query
+failure, timeout, delete failure, inaccessible processes and failed process waits.
+No real service is created, stopped or deleted by these tests.
+
+The full verification run passed 18 groups, including AddressSanitizer for core,
+SBC and control helpers, encoder tests, independent SBC/AAC/aptX-family decoding,
+endpoint discovery, boot policy, payload matching and GUI startup. Windows mode
+passed six additional groups; signing policy passed nine. LDAC passes encoder
+and packet-layout tests, but has no independent decoder check in this suite.
+
+Interactive demo checks verified the dirty-settings Cancel path, successful file
+export and rejection of a malformed blob while retaining edits. Driver operations
+in demo mode are now intercepted before elevation, including service controls and
+package operations. The signed kernel driver remains 0.1.0.16; this update does
+not change encoding or transport algorithms.
+
+Reports: `out/bug-hunt-baseline.log`, `out/bug-hunt-fixed.log`,
+`out/bug-hunt-service.log`, `out/verification/20261012-155644/`, and the
+`windows-mode-20261012-160007` / `setup-signing-20261012-155722-c4c222ba`
+verification folders. Broader hardware limitations below still apply.
+
 ## Local verification, 2026-10-11
 
 Machine: Windows 11 Pro build 26300, x64, Qualcomm FastConnect 7800 Bluetooth.

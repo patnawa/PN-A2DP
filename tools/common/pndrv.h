@@ -90,7 +90,7 @@ struct ServiceInfo {
 bool  QueryService(const wchar_t *name, ServiceInfo &info);
 DWORD StartServiceByName(const wchar_t *name, DWORD waitMs = 10000);
 DWORD StopServiceByName(const wchar_t *name, DWORD waitMs = 10000);
-DWORD StopServiceAndWaitForExit(const wchar_t *name, DWORD waitMs = 15000);   /* also waits until the service process is gone */
+DWORD StopServiceAndWaitForExit(const wchar_t *name, DWORD waitMs = 15000);   /* also waits for process exit when SCM provides a valid PID */
 DWORD CreateHostService(const std::wstring &exePath);
 DWORD DeleteServiceByName(const wchar_t *name);
 const wchar_t *ServiceStateName(DWORD state);

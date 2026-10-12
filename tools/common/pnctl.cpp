@@ -694,10 +694,13 @@ static std::wstring Trim(const std::wstring &s)
 
 static bool ParseNumber(const std::wstring &v, ULONG &out)
 {
-    wchar_t *end = nullptr;
-    unsigned long n = wcstoul(v.c_str(), &end, 10);
-    if (end == v.c_str() || (end && *end)) return false;
-    out = (ULONG)n;
+    if (v.empty()) return false;
+    ULONG n = 0;
+    for (wchar_t digit : v) {
+        if (digit < L'0' || digit > L'9' || n > (MAXDWORD - (digit - L'0')) / 10) return false;
+        n = n * 10 + (digit - L'0');
+    }
+    out = n;
     return true;
 }
 
@@ -723,27 +726,36 @@ bool ConfigFromText(const std::wstring &text, PNA2DP_CONFIG &c)
     PNA2DP_CONFIG n;
     ConfigDefaults(n);
     bool haveBlob = false;
-    size_t bp = text.find(L"blob=");
-    while (bp != std::wstring::npos && (bp == 0 || text[bp - 1] == L'\n' || text[bp - 1] == L'\r')) {
-        size_t e = text.find_first_of(L"\r\n", bp);
-        std::wstring hex = Trim(text.substr(bp + 5, e == std::wstring::npos ? std::wstring::npos : e - bp - 5));
-        if (hex.size() != sizeof(PNA2DP_CONFIG) * 2) break;
+    // Parse actual lines, not the first substring "blob=" (which may be a comment).
+    for (size_t pos = 0; pos < text.size();) {
+        size_t e = text.find_first_of(L"\r\n", pos);
+        std::wstring line = Trim(text.substr(pos, e == std::wstring::npos ? std::wstring::npos : e - pos));
+        pos = e == std::wstring::npos ? text.size() : e + 1;
+        size_t eq = line.find(L'=');
+        if (line.empty() || line[0] == L'#' || eq == std::wstring::npos || _wcsicmp(Trim(line.substr(0, eq)).c_str(), L"blob")) continue;
+        std::wstring hex = Trim(line.substr(eq + 1));
+        if (haveBlob || hex.size() != sizeof(PNA2DP_CONFIG) * 2) return false;
         PNA2DP_CONFIG tmp = {};
         UCHAR *p = (UCHAR *)&tmp;
-        bool ok = true;
-        for (size_t i = 0; i < sizeof(tmp) && ok; i++) {
-            unsigned v = 0;
-            if (swscanf_s(hex.substr(i * 2, 2).c_str(), L"%2x", &v) != 1) ok = false;
-            p[i] = (UCHAR)v;
+        auto nibble = [](wchar_t ch) -> int {
+            if (ch >= L'0' && ch <= L'9') return ch - L'0';
+            if (ch >= L'a' && ch <= L'f') return ch - L'a' + 10;
+            if (ch >= L'A' && ch <= L'F') return ch - L'A' + 10;
+            return -1;
+        };
+        for (size_t i = 0; i < sizeof(tmp); i++) {
+            int high = nibble(hex[i * 2]), low = nibble(hex[i * 2 + 1]);
+            if (high < 0 || low < 0) return false;
+            p[i] = (UCHAR)((high << 4) | low);
         }
-        if (ok && tmp.Size == sizeof(tmp) && tmp.Version == PNA2DP_ABI_VERSION) { n = tmp; haveBlob = true; }
-        break;
+        if (tmp.Size != sizeof(tmp) || tmp.Version != PNA2DP_ABI_VERSION) return false;
+        n = tmp; haveBlob = true;
     }
     size_t pos = 0;
     int recognised = 0;
     while (pos < text.size()) {
         size_t e = text.find_first_of(L"\r\n", pos);
-        std::wstring line = text.substr(pos, e == std::wstring::npos ? std::wstring::npos : e - pos);
+        std::wstring line = Trim(text.substr(pos, e == std::wstring::npos ? std::wstring::npos : e - pos));
         pos = (e == std::wstring::npos) ? text.size() : e + 1;
         size_t eq = line.find(L'=');
         if (line.empty() || line[0] == L'#' || eq == std::wstring::npos) continue;
@@ -796,6 +808,78 @@ bool ConfigFromText(const std::wstring &text, PNA2DP_CONFIG &c)
     n.EnabledCodecMask |= PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);
     c = n;
     return true;
+}
+
+namespace {
+struct ConfigFileHandle {
+    HANDLE value;
+    explicit ConfigFileHandle(HANDLE file) : value(file) {}
+    ~ConfigFileHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+};
+}
+
+DWORD ReadConfigFile(const std::wstring &path, PNA2DP_CONFIG &c)
+{
+    ConfigFileHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+    if (file.value == INVALID_HANDLE_VALUE) return GetLastError();
+    if (GetFileType(file.value) != FILE_TYPE_DISK) return ERROR_INVALID_DATA;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file.value, &size)) return GetLastError();
+    if (size.QuadPart <= 0) return ERROR_INVALID_DATA;
+    if (size.QuadPart > 1024 * 1024) return ERROR_FILE_TOO_LARGE;
+    std::string bytes((size_t)size.QuadPart, '\0');
+    DWORD offset = 0;
+    while (offset < bytes.size()) {
+        DWORD read = 0;
+        if (!ReadFile(file.value, &bytes[offset], (DWORD)bytes.size() - offset, &read, nullptr)) return GetLastError();
+        if (!read) return ERROR_HANDLE_EOF;
+        offset += read;
+    }
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), (int)bytes.size(), nullptr, 0);
+    if (!length) return GetLastError();
+    std::wstring text(length, L'\0');
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), (int)bytes.size(), &text[0], length)) return GetLastError();
+    if (!text.empty() && text[0] == 0xfeff) text.erase(0, 1);
+    if (text.find(L'\0') != std::wstring::npos) return ERROR_INVALID_DATA;
+    PNA2DP_CONFIG parsed{};
+    if (!ConfigFromText(text, parsed)) return ERROR_INVALID_DATA;
+    c = parsed;
+    return ERROR_SUCCESS;
+}
+
+DWORD WriteConfigFile(const std::wstring &path, const PNA2DP_CONFIG &c)
+{
+    std::wstring text = ConfigToText(c);
+    int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    if (!length) return GetLastError();
+    std::string bytes(length, '\0');
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(), (int)text.size(), &bytes[0], length, nullptr, nullptr)) return GetLastError();
+    wchar_t full[MAX_PATH]{}, temporary[MAX_PATH]{};
+    DWORD size = GetFullPathNameW(path.c_str(), _countof(full), full, nullptr);
+    if (!size) return GetLastError();
+    if (size >= _countof(full)) return ERROR_FILENAME_EXCED_RANGE;
+    std::wstring destination(full);
+    auto separator = destination.find_last_of(L"\\/");
+    if (separator == std::wstring::npos || separator == destination.size() - 1) return ERROR_INVALID_NAME;
+    std::wstring folder = destination.substr(0, separator + 1);
+    if (!GetTempFileNameW(folder.c_str(), L"pna", 0, temporary)) return GetLastError();
+    DWORD error = ERROR_SUCCESS;
+    {
+        ConfigFileHandle file(CreateFileW(temporary, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (file.value == INVALID_HANDLE_VALUE) error = GetLastError();
+        DWORD offset = 0;
+        while (!error && offset < bytes.size()) {
+            DWORD written = 0;
+            if (!WriteFile(file.value, bytes.data() + offset, (DWORD)bytes.size() - offset, &written, nullptr)) error = GetLastError();
+            else if (!written) error = ERROR_WRITE_FAULT;
+            else offset += written;
+        }
+        if (!error && !FlushFileBuffers(file.value)) error = GetLastError();
+    }
+    // Same-directory replacement only after every byte has been written and flushed.
+    if (!error && !MoveFileExW(temporary, full, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) error = GetLastError();
+    if (error) DeleteFileW(temporary);
+    return error;
 }
 
 } // namespace pn

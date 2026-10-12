@@ -10,6 +10,7 @@
 #include <algorithm>
 #include "pnctl.h"
 #include "pndrv.h"
+#include "pnretry.h"
 
 static int g_fail = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { g_fail++; printf("FAIL %s:%d  ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -62,6 +63,72 @@ static void TestConfigText()
     CHECK(b.TargetLatencyMs == 60, "non-numeric latency keeps default (got %u)", b.TargetLatencyMs);
     CHECK(b.Sbc.MaxBitpool == 0, "out-of-range bitpool keeps default (got %u)", b.Sbc.MaxBitpool);
     CHECK((b.EnabledCodecMask & PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC)) != 0, "SBC always enabled");
+    CHECK(pn::ConfigFromText(L"# example blob=ignored\n" + t, b) && memcmp(&a, &b, sizeof(a)) == 0,
+          "a comment mentioning blob must not hide the actual saved configuration");
+    std::wstring malformed = t;
+    size_t blob = malformed.find(L"blob=");
+    malformed[blob + 5 + 2 * offsetof(PNA2DP_CONFIG, Reserved)] = L'z';
+    b = a;
+    CHECK(!pn::ConfigFromText(malformed, b) && memcmp(&a, &b, sizeof(a)) == 0,
+          "invalid hex in the saved blob rejects the import without changing the destination");
+    CHECK(!pn::ConfigFromText(L"blob=00\nlatency=100\n", b), "truncated blob cannot silently fall back to defaults");
+    CHECK(pn::ConfigFromText(L"latency=-1\naac.bitrate=4294967296\n", b) && b.TargetLatencyMs == 60 && b.Aac.BitrateBps == 0,
+          "negative and overflowing numeric preferences are ignored rather than wrapped");
+}
+
+static void TestConfigFiles()
+{
+    wchar_t root[MAX_PATH]{}, temporary[MAX_PATH]{};
+    CHECK(GetTempPathW(_countof(root), root) && GetTempFileNameW(root, L"pnt", 0, temporary), "create unique config test directory");
+    if (!temporary[0]) return;
+    DeleteFileW(temporary);
+    CHECK(CreateDirectoryW(temporary, nullptr), "create test directory");
+    std::wstring path = std::wstring(temporary) + L"\\settings-\u0e44\u0e17\u0e22.txt";
+    PNA2DP_CONFIG a{}, b{};
+    pn::ConfigDefaults(a); a.TargetLatencyMs = 90; a.ReconnectDelayMs = 4321;
+    CHECK(pn::WriteConfigFile(path, a) == ERROR_SUCCESS, "export Unicode path");
+    CHECK(pn::ReadConfigFile(path, b) == ERROR_SUCCESS && !memcmp(&a, &b, sizeof(a)), "file round trip preserves all fields");
+    HANDLE locked = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    CHECK(locked != INVALID_HANDLE_VALUE, "lock original against replacement");
+    PNA2DP_CONFIG changed = a; changed.TargetLatencyMs = 150;
+    CHECK(pn::WriteConfigFile(path, changed) != ERROR_SUCCESS, "locked destination reports export failure");
+    if (locked != INVALID_HANDLE_VALUE) CloseHandle(locked);
+    CHECK(pn::ReadConfigFile(path, b) == ERROR_SUCCESS && !memcmp(&a, &b, sizeof(a)), "failed replacement leaves original export intact");
+    CHECK(pn::WriteConfigFile(path, changed) == ERROR_SUCCESS && pn::ReadConfigFile(path, b) == ERROR_SUCCESS && !memcmp(&changed, &b, sizeof(b)), "successful replacement updates complete export");
+    auto raw = [&](const std::string &bytes) {
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        DWORD written = 0;
+        CHECK(f != INVALID_HANDLE_VALUE && WriteFile(f, bytes.data(), (DWORD)bytes.size(), &written, nullptr) && written == bytes.size(), "write config fixture");
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    };
+    raw("\xef\xbb\xbflatency=100\n");
+    CHECK(pn::ReadConfigFile(path, b) == ERROR_SUCCESS && b.TargetLatencyMs == 100, "UTF-8 BOM accepted");
+    for (const auto &bad : {std::string(), std::string("latency=100\n\xff"), std::string("latency=100\0junk", 16), std::string("blob=00\nlatency=100\n")}) {
+        raw(bad); b = a;
+        CHECK(pn::ReadConfigFile(path, b) != ERROR_SUCCESS && !memcmp(&a, &b, sizeof(a)), "invalid import preserves destination");
+    }
+    HANDLE large = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    LARGE_INTEGER size{}; size.QuadPart = 1024 * 1024 + 1;
+    CHECK(large != INVALID_HANDLE_VALUE && SetFilePointerEx(large, size, nullptr, FILE_BEGIN) && SetEndOfFile(large), "create oversized fixture");
+    if (large != INVALID_HANDLE_VALUE) CloseHandle(large);
+    b = a;
+    CHECK(pn::ReadConfigFile(path, b) == ERROR_FILE_TOO_LARGE && !memcmp(&a, &b, sizeof(a)), "oversized import rejected before allocation");
+    CHECK(DeleteFileW(path.c_str()), "remove fixture");
+    CHECK(pn::ReadConfigFile(path, b) == ERROR_FILE_NOT_FOUND && !memcmp(&a, &b, sizeof(a)), "missing import preserves destination");
+    CHECK(RemoveDirectoryW(temporary), "no temporary export files left behind");
+}
+
+static void TestEventRetry()
+{
+    pn::EventRetryLimiter retry;
+    CHECK(!retry.ShouldPause(L"device-a", 0), "first failure recovers even at uptime zero");
+    CHECK(retry.ShouldPause(L"DEVICE-A", 1000), "reopened instance must pause repeated failures");
+    CHECK(!retry.ShouldPause(L"device-b", 1100), "another headset gets its own recovery");
+    CHECK(!retry.ShouldPause(L"device-b", 11100), "recovery permitted after backoff");
+    CHECK(retry.ShouldPause(L"device-b", 12000), "next immediate failure pauses again");
+    retry.Reset();
+    CHECK(!retry.ShouldPause(L"device-b", 12001), "explicit Refresh permits retry");
+    CHECK(!retry.ShouldPause(L"device-a", 0xffffffffull + 500) && retry.ShouldPause(L"device-a", 0xffffffffull + 1500), "long system uptime keeps backoff intact");
 }
 
 static void TestPresets()
@@ -239,6 +306,8 @@ static void TestMachine()
 int main()
 {
     TestConfigText();
+    TestConfigFiles();
+    TestEventRetry();
     TestPresets();
     TestSbcNumbers();
     TestCodecActivation();

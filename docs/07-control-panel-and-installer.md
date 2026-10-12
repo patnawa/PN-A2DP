@@ -197,6 +197,40 @@ the local gain path is used when receiver-volume integration is unavailable.
   assigned to the read-only `$host` and skipped `freeaptx.dll`; non-ASCII checkout paths
   broke the installer resource script; a missing plugin submodule aborted the package.
 
+### Control panel 0.1.0.26: service shutdown and responsive operations
+
+Stopping, upgrading or removing the codec host waits when shutdown has already
+started, instead of issuing a duplicate STOP and failing with error 1061. A race
+with another stop request is accepted only after confirming the service is stopped
+or stopping. Upgrade never opens a process ID reported in a state where Windows
+does not guarantee its validity. Status, process and timeout errors remain visible.
+
+Driver/service operations run in a helper process even when the panel is already
+elevated. The waiting panel processes Windows messages while its controls are
+disabled and device updates are deferred. This prevents a stalled message loop
+and duplicate actions. Cancellation restores the previous input state; wait and
+exit-code failures are reported rather than interpreted as successful operations.
+
+### Control panel 0.1.0.25: settings and lifecycle reliability
+
+Settings import reads at most 1 MiB and requires valid UTF-8. Malformed, truncated
+or incompatible blobs reject the import without replacing existing settings.
+Comments containing `blob=` no longer hide the real saved configuration; negative
+and overflowing numeric preferences cannot wrap into unintended values. Export
+writes and flushes a temporary file before replacing the destination, and reports
+write/replacement errors rather than claiming success.
+
+Device recovery retains its retry limit across session reopenings. File dialogs
+and prompts defer driver events, then process them for the current session.
+Device identities passed through dialogs and Windows audio COM calls are owned
+copies, and stale volume/mute results cannot overwrite a newer selection.
+
+Refresh, device selection and driver operations offer Cancel when settings are
+unsaved. A driver operation asks about edits before closing the control session.
+Demo mode intercepts all driver/service operations before elevation. Uninstall
+stops when device enumeration or service shutdown fails, keeping the installation
+available for retry. Shutdown also propagates process/status/wait errors.
+
 ### Control panel 0.1.0.20: visible version and program description
 
 The upper-left brand area shows the panel version and the description

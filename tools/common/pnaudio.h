@@ -16,10 +16,12 @@ struct WindowsAudioInfo {
 
 // Exact PnP ancestry match, active render endpoints only. Never uses a friendly
 // name or silently falls back to the default output. Each call owns its COM scope.
-WindowsAudioInfo QueryWindowsAudio(const std::wstring &a2dpInstanceId);
+// Own the identifiers before entering COM, which may dispatch UI messages that
+// replace the caller's selected device or endpoint strings.
+WindowsAudioInfo QueryWindowsAudio(std::wstring a2dpInstanceId);
 // expectedEndpointId prevents an old slider interaction targeting a recreated output.
-HRESULT SetWindowsVolume(const std::wstring &a2dpInstanceId, const std::wstring &expectedEndpointId, float scalar);
-HRESULT SetWindowsMute(const std::wstring &a2dpInstanceId, const std::wstring &expectedEndpointId, bool muted);
+HRESULT SetWindowsVolume(std::wstring a2dpInstanceId, std::wstring expectedEndpointId, float scalar);
+HRESULT SetWindowsMute(std::wstring a2dpInstanceId, std::wstring expectedEndpointId, bool muted);
 std::wstring WindowsAudioFormat(const WindowsAudioInfo &info);
 std::wstring WindowsAudioReport(const WindowsAudioInfo &info);
 }

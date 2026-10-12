@@ -164,7 +164,7 @@ HRESULT ChangeVolume(const std::wstring &instance, const std::wstring &expected,
 }
 }
 
-WindowsAudioInfo QueryWindowsAudio(const std::wstring &instance)
+WindowsAudioInfo QueryWindowsAudio(std::wstring instance)
 {
     WindowsAudioInfo info;
     Apartment apartment;
@@ -212,9 +212,9 @@ WindowsAudioInfo QueryWindowsAudio(const std::wstring &instance)
     return info;
 }
 
-HRESULT SetWindowsVolume(const std::wstring &instance, const std::wstring &expected, float scalar)
+HRESULT SetWindowsVolume(std::wstring instance, std::wstring expected, float scalar)
 { return ChangeVolume(instance, expected, &scalar, nullptr); }
-HRESULT SetWindowsMute(const std::wstring &instance, const std::wstring &expected, bool muted)
+HRESULT SetWindowsMute(std::wstring instance, std::wstring expected, bool muted)
 { return ChangeVolume(instance, expected, nullptr, &muted); }
 
 std::wstring WindowsAudioFormat(const WindowsAudioInfo &info)

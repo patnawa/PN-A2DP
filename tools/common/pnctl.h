@@ -98,5 +98,8 @@ void ApplyPreset(PNA2DP_CONFIG &c, Preset p);
  * exists, plus a hex dump of the whole structure for exact restore). */
 std::wstring ConfigToText(const PNA2DP_CONFIG &c);
 bool         ConfigFromText(const std::wstring &text, PNA2DP_CONFIG &c);
+// UTF-8, maximum 1 MiB. Failed reads preserve c; failed writes preserve the old file.
+DWORD        ReadConfigFile(const std::wstring &path, PNA2DP_CONFIG &c);
+DWORD        WriteConfigFile(const std::wstring &path, const PNA2DP_CONFIG &c);
 
 } // namespace pn

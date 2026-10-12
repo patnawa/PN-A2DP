@@ -597,7 +597,12 @@ static DWORD DoUninstall(Log &log, bool &reboot)
     DWORD firstError = ERROR_SUCCESS;
     auto fail = [&](DWORD e) { if (firstError == ERROR_SUCCESS) firstError = e; };
     std::wstring dir = pn::InstallDir();
-    auto nodes = pn::EnumerateA2dpSinkNodes();
+    DWORD enumerationError = ERROR_SUCCESS;
+    auto nodes = pn::EnumerateA2dpSinkNodes(&enumerationError);
+    if (enumerationError != ERROR_SUCCESS) {
+        log(L"Removal stopped: cannot inspect Bluetooth devices: %s. Application files and drivers have been retained.", pn::Win32ErrorText(enumerationError).c_str());
+        return enumerationError;
+    }
     auto staged = pn::FindStagedPackages();
     int ours = 0;
     for (auto &n : nodes) if (n.usesPnA2dp()) ours++;
@@ -642,7 +647,7 @@ static DWORD DoUninstall(Log &log, bool &reboot)
 
     /* files: everything we know about; the uninstaller itself is deleted after exit */
     const wchar_t *names[] = { L"pna2dp-codechost.exe", L"pna2dp-panel.exe", L"pna2dpctl.exe", L"freeaptx.dll", L"LICENSE", L"THIRD-PARTY-NOTICES.md", L"README.md",
-                               L"pna2dp-setup.log", L"driver\\pna2dp.inf", L"driver\\pna2dp.sys", L"driver\\pna2dp.cat", L"driver\\pna2dp-test.cer" };
+                               L"13-windows-mode.md", L"pna2dp-setup.log", L"driver\\pna2dp.inf", L"driver\\pna2dp.sys", L"driver\\pna2dp.cat", L"driver\\pna2dp-test.cer" };
     for (auto n : names) { std::wstring p = pn::JoinPath(dir, n); if (pn::FileExists(p) && !DeleteFileW(p.c_str())) MoveFileExW(p.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT); }
     /* the uninstaller copy, unless it is the running module (then ScheduleSelfDelete removes it) */
     std::wstring uninstCopy = pn::JoinPath(dir, L"uninstall.exe");

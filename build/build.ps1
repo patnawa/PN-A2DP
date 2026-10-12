@@ -6,6 +6,8 @@
   .\build\build.ps1                  # everything, Release x64
   .\build\build.ps1 -Target driver   # driver only
   .\build\build.ps1 -Target tests    # SBC self test
+  .\build\build.ps1 -Target service-tests # focused Windows service failure tests
+  .\build\build.ps1 -Target process-tests # helper-process responsiveness tests
   .\build\build.ps1 -Target windows  # application-only Windows mode installer + portable
   .\build\build.ps1 -Target gui      # control panel (pna2dp-panel.exe)
   .\build\build.ps1 -Target setup    # installer (pna2dp-setup.exe) embedding everything found in out\<Config>
@@ -18,7 +20,7 @@
   WDK NuGet layout (see get-wdk.ps1 and toolchain.ps1).
 #>
 param(
-    [ValidateSet('all','driver','host','cli','tests','gui','setup','package','dist','windows')][string]$Target = 'all',
+    [ValidateSet('all','driver','host','cli','tests','service-tests','process-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
     [ValidateSet('Release','Debug')][string]$Config = 'Release',
     [switch]$Sign,
     [switch]$Sanitize,
@@ -147,7 +149,17 @@ function Build-UserExe([string]$name, [string[]]$sources, [string[]]$extraIncs, 
     Write-Host "built $exe"
 }
 
+function Build-ServiceTests {
+    Build-UserExe 'service_failure_test' @((Join-Path $Root 'tools\common\test\service_failure_test.cpp')) @("/I$(Join-Path $Root 'tools\common')", "/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib') @()
+}
+
+function Build-ProcessTests {
+    Build-UserExe 'process_wait_test' @((Join-Path $Root 'tools\common\test\process_wait_test.cpp')) @("/I$(Join-Path $Root 'tools\common')", "/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib') @()
+}
+
 function Build-Tests {
+    Build-ServiceTests
+    Build-ProcessTests
     Build-UserExe 'boot_mode_test' @((Join-Path $Root 'tools\common\test\boot_mode_test.cpp'), (Join-Path $Root 'tools\common\pnboot.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib','uuid.lib') @()
     Build-UserExe 'windows_audio_test' @((Join-Path $Root 'tools\audio-test\windows_audio_test.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib','uuid.lib') @()
     Build-UserExe 'signing_test' @((Join-Path $Root 'tools\common\test\signing_test.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp')) @() @() @()
@@ -335,6 +347,8 @@ switch ($Target) {
     'windows' { Build-Cli; Build-Gui; Build-Setup; Build-Dist }
     'driver'  { Build-Driver }
     'tests'   { Build-Tests }
+    'service-tests' { Build-ServiceTests }
+    'process-tests' { Build-ProcessTests }
     'cli'     { Build-Cli }
     'host'    { Build-Host }
     'gui'     { Build-Gui }
