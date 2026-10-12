@@ -18,19 +18,73 @@ const wchar_t *HealthLevelName(HealthLevel level) {
     default: return L"UNKNOWN";
     }
 }
+void QualityHistory::RecordEvent(ULONGLONG tick, const std::wstring &text) {
+    if (!events.empty() && tick < events.back().tick) events.clear();
+    events.push_back({tick, text});
+    if (events.size() > 32) events.erase(events.begin());
+}
+std::wstring QualityHistory::EventText(ULONGLONG now) const {
+    if (events.empty()) return L"No quality events observed yet.";
+    std::wstring text;
+    for (auto it = events.rbegin(); it != events.rend(); ++it)
+        text += Number(now >= it->tick ? (now-it->tick)/1000 : 0) + L" s ago: " + it->text + L"\r\n";
+    return text;
+}
+static bool Active(const PNA2DP_STATUS &s) { return s.State == PNA2DP_STATE_STREAMING && (s.Flags & PNA2DP_STATUS_FLAG_AUDIO_ACTIVE); }
+bool QualityHistory::SuggestSbcFallback(ULONGLONG now) const {
+    if (samples.size() < 6 || now < samples.back().tick || now-samples.back().tick > 2500) return false;
+    const auto &last = samples.back();
+    if (!Active(last.status) || (last.status.Codec != PNA2DP_CODEC_APTX &&
+        last.status.Codec != PNA2DP_CODEC_APTX_HD && last.status.Codec != PNA2DP_CODEC_APTX_LL)) return false;
+    size_t first = samples.size()-1;
+    // Include the sample immediately before the boundary: real timers jitter,
+    // so requiring an observation at exactly ten seconds suppresses the offer.
+    while (first && last.tick-samples[first].tick < 10000) --first;
+    if (last.tick-samples[first].tick < 10000) return false;
+    if (last.stats.PacketsSent == samples[first].stats.PacketsSent) return true;
+    unsigned bad = 0;
+    for (size_t i = first+1; i < samples.size(); ++i) {
+        const auto &a = samples[i], &b = samples[i-1];
+        if ((a.qualityValid && a.quality.Health == PNA2DP_QUALITY_CONGESTED) ||
+            a.stats.WriteFailures > b.stats.WriteFailures || a.stats.PacketsDropped > b.stats.PacketsDropped) ++bad;
+    }
+    return bad >= 5; // persistent recent trouble, not a single historical counter
+}
 void QualityHistory::Observe(ULONGLONG tick, bool valid, const PNA2DP_STATUS &s, const PNA2DP_STATS &t,
                              bool qv, const PNA2DP_QUALITY &q) {
-    if (!valid) { Reset(); return; }
+    if (!valid) {
+        if (!samples.empty()) RecordEvent(tick, L"Observations interrupted; connection health is unknown.");
+        samples.clear(); return;
+    }
     if (!samples.empty()) {
         const auto &p = samples.back();
+        if (tick < p.tick) { Reset(); Observe(tick, valid, s, t, qv, q); return; }
+        if (tick-p.tick >= 900) {
+            if (s.Codec != p.status.Codec) RecordEvent(tick, L"Codec changed: " + std::wstring(CodecName(p.status.Codec)) + L" -> " + CodecName(s.Codec));
+            else if (Active(s) && Active(p.status) && tick-p.tick <= 5000 && s.BitrateBps && p.status.BitrateBps && s.BitrateBps != p.status.BitrateBps) {
+                std::wstring reason = L"cause unavailable (settings or unobserved change)";
+                if (qv && p.qualityValid && (q.Flags & p.quality.Flags & PNA2DP_QUALITY_CHANGE_DETAILS) && q.ChangeSequence > p.quality.ChangeSequence) {
+                    reason.clear();
+                    if (q.LastChangeReason & PNA2DP_QUALITY_REASON_RECOVERY) reason += L"healthy-traffic recovery; ";
+                    if (q.LastChangeReason & PNA2DP_QUALITY_REASON_SLOW) reason += L"slow transport writes; ";
+                    if (q.LastChangeReason & PNA2DP_QUALITY_REASON_FAILED) reason += L"write failures; ";
+                    if (q.LastChangeReason & PNA2DP_QUALITY_REASON_PRESSURE) reason += L"send queue pressure; ";
+                    if (q.LastChangeReason & PNA2DP_QUALITY_REASON_BACKLOG) reason += L"audio backlog; ";
+                    if (reason.empty()) reason = L"driver adaptation";
+                }
+                RecordEvent(tick, Number(p.status.BitrateBps/1000) + L" -> " + Number(s.BitrateBps/1000) + L" kbps: " + reason);
+            }
+            if (s.State != p.status.State || Active(s) != Active(p.status)) RecordEvent(tick, L"Stream state: " + std::wstring(StateName(s.State)) + (Active(s) ? L"; audio active" : L"; audio idle"));
+        }
         // No deltas across resets, reconnects, codec changes or unobserved time.
         if (tick < p.tick || tick - p.tick > 5000 || s.Codec != p.status.Codec || s.State != p.status.State ||
             ((s.Flags ^ p.status.Flags) & PNA2DP_STATUS_FLAG_AUDIO_ACTIVE) ||
             t.PacketsSent < p.stats.PacketsSent || t.PacketsDropped < p.stats.PacketsDropped ||
             t.WriteFailures < p.stats.WriteFailures || t.Underruns < p.stats.Underruns ||
-            t.PcmFramesConsumed < p.stats.PcmFramesConsumed) Reset();
+            t.PcmFramesConsumed < p.stats.PcmFramesConsumed) samples.clear();
         else if (tick - p.tick < 900) return;
     }
+    else RecordEvent(tick, L"Observations started; " + std::wstring(CodecName(s.Codec)) + L". Counters start a new window.");
     samples.push_back({tick, s, t, qv, q});
     while (samples.size() > 61 || (!samples.empty() && tick - samples.front().tick > 60000)) samples.erase(samples.begin());
 }
@@ -67,8 +121,9 @@ QualitySummary QualityHistory::Summary(ULONGLONG now) const {
             L"Adaptive bitrate is off. Persistent congestion may require lower quality settings.";
     } else if (last.qualityValid && last.quality.Health == PNA2DP_QUALITY_RECOVERING) {
         result.level = HealthLevel::Info; result.title = L"Quality recovering";
+        ULONG target = (last.quality.Flags & PNA2DP_QUALITY_CHANGE_DETAILS) && last.quality.RecoveryTargetMs >= 5000 && last.quality.RecoveryTargetMs <= 60000 ? last.quality.RecoveryTargetMs : 30000;
         result.reason = (last.quality.Flags & PNA2DP_QUALITY_ABR) ?
-            L"Reduced bitrate; " + Number((30000 - (std::min)(last.quality.HealthyMs, 30000ul) + 999) / 1000) + L" s of healthy traffic still required before the next upward step." :
+            L"Reduced bitrate; " + Number((target - (std::min)(last.quality.HealthyMs, target) + 999) / 1000) + L" s of healthy traffic still required before the next upward step." :
             L"Bitrate is reduced. Adaptive bitrate is currently off.";
     } else if (result.seconds >= 3 && result.packets) {
         result.level = HealthLevel::Pass; result.title = L"Transport healthy";
@@ -183,6 +238,7 @@ std::wstring DiagnosticReport(const HealthSnapshot &h, const QualityHistory &his
     }
     out << L"\r\nRecent timeline (up to 60 seconds, resets at gaps/reconnects/counter resets; sampled after the saved check, ages relative to export):\r\nage_ms,codec,bitrate_bps,packets,drops,write_failures,latency_trims\r\n";
     for (const auto &sample : history.Samples()) out << (now >= sample.tick ? now - sample.tick : 0) << L"," << CodecName(sample.status.Codec) << L"," << sample.status.BitrateBps << L"," << sample.stats.PacketsSent << L"," << sample.stats.PacketsDropped << L"," << sample.stats.WriteFailures << L"," << sample.stats.Underruns << L"\r\n";
+    out << L"\r\nQuality events (up to 32; observed times; retained across reconnects for this selection):\r\n" << history.EventText(now);
     out << L"\r\nNo acoustic measurement or bandwidth/RSSI test was performed. Unknown data is not a pass.\r\n";
     return out.str();
 }

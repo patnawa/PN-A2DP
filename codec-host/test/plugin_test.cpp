@@ -46,6 +46,22 @@ static void FillParams(PNA2DP_STREAM_PARAMS &p, uint32_t codec)
 
 static uint32_t BytesPerSample(uint32_t fmt) { return fmt == PNA2DP_FMT_S16 ? 2 : fmt == PNA2DP_FMT_S24 ? 3 : 4; }
 
+static void TestOpenContract(const PnCodecPlugin *api, uint32_t codec)
+{
+    for (unsigned variant = 0; variant < 5; ++variant) {
+        PNA2DP_STREAM_PARAMS p; FillParams(p, codec);
+        switch (variant) {
+        case 0: p.SampleRate = 12345; break;
+        case 1: p.Channels = 3; break;
+        case 2: p.PcmFormat = 0x80000000u; break;
+        case 3: p.Codec = PNA2DP_CODEC_NONE; break;
+        case 4: p.CodecInfoLength = sizeof(p.CodecInfo)+1; break;
+        }
+        auto encoder = api->open(&p);
+        if (encoder) { printf("FAIL codec %u accepted invalid open variant %u\n", codec, variant); ++failures; api->close(encoder); }
+    }
+}
+
 static void TestCodec(const PnCodecPlugin *api, const PNA2DP_STREAM_PARAMS &p, uint32_t framesPerBlock)
 {
     uint32_t codec = p.Codec;
@@ -151,6 +167,21 @@ static void TestCodec(const PnCodecPlugin *api, const PNA2DP_STREAM_PARAMS &p, u
     if (totalFrames + afterFrames > expectedAfter || totalFrames + afterFrames + buffered < expectedAfter) {
         puts("  missing or duplicated PCM after reconfiguration"); ++failures;
     }
+    for (unsigned cycle = 0; cycle < 4; ++cycle) {
+        if (api->flush) api->flush(e);
+        if (api->reconfigure && api->reconfigure(e, codec == PNA2DP_CODEC_LDAC ? (cycle % 3) : p.QualityIndex,
+            cycle % 2 ? 128000 : 320000)) { puts("  repeated reconfiguration failed"); ++failures; break; }
+        uint64_t emitted = 0;
+        for (unsigned block=0; block<64; ++block) {
+            PnCodecOutput output{}; output.buffer = out.data()+16; output.capacity = cap;
+            int rc = api->encode(e, pcm.data(), (uint32_t)pcm.size(), framesPerBlock, &output);
+            bool valid = !rc && output.written <= cap && (codec == PNA2DP_CODEC_AAC || output.written <= p.MediaMtu);
+            for (unsigned k=0; k<16; ++k) valid = valid && out[k] == 0xcd && out[cap+16+k] == 0xcd;
+            if (!valid) { puts("  output invalid after flush/reconfiguration"); ++failures; break; }
+            emitted += output.written;
+        }
+        if (!emitted) { puts("  no output after flush/reconfiguration"); ++failures; }
+    }
     api->close(e);
     if (encoded && fclose(encoded)) ++failures;
     if (reference && fclose(reference)) ++failures;
@@ -176,6 +207,7 @@ int main(int argc, char **argv)
         printf("%ls: %s %s (%s) codecs 0x%08x\n", fd.cFileName, api->name, api->version, api->license, api->codec_mask);
         for (uint32_t c = 1; c < PNA2DP_CODEC_MAX; c++) {
             if (!(api->codec_mask & PNA2DP_CODEC_BIT(c))) continue;
+            TestOpenContract(api, c);
             for (uint32_t rate : {44100u, 48000u, 88200u, 96000u}) {
                 if (c != PNA2DP_CODEC_LDAC && c != PNA2DP_CODEC_AAC && rate > 48000) continue;
                 for (uint32_t mtu : {337u, 1011u}) {

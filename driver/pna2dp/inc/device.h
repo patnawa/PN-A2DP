@@ -64,6 +64,9 @@ typedef struct PNA2DP_DEVICE {
     KTIMER              ReconnectTimer;
     KDPC                ReconnectDpc;
     ULONG               ReconnectAttempts;
+    LONG                ResetReconnectBudget;
+    LONG                PowerSuspended;
+    LONG                PowerResumePending;
     LONG                Removing;
     BOOLEAN             Stopped;           /* DeviceStop done */
     BOOLEAN             TornDown;          /* DeviceTeardown done */
@@ -122,6 +125,7 @@ VOID     DeviceNotifyEvent(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG EventMask);     
 NTSTATUS DeviceQueueWaitEvent(_Inout_ PPNA2DP_DEVICE D, _In_ PIRP Irp);
 VOID     DeviceFlushWaitersForFile(_Inout_ PPNA2DP_DEVICE D, _In_ PFILE_OBJECT File);
 VOID     DeviceHostChanged(_Inout_ PPNA2DP_DEVICE D);                                 /* codec host (un)registered */
+VOID     DevicePowerChanged(_Inout_ PPNA2DP_DEVICE D, DEVICE_POWER_STATE State);
 
 /* Scheduling */
 VOID     DeviceQueueConnect(_Inout_ PPNA2DP_DEVICE D);

@@ -21,7 +21,7 @@
   WDK NuGet layout (see get-wdk.ps1 and toolchain.ps1).
 #>
 param(
-    [ValidateSet('all','driver','host','cli','tests','service-tests','process-tests','health-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
+    [ValidateSet('all','driver','host','cli','tests','security-tests','core-tests','plugin-tests','service-tests','process-tests','health-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
     [ValidateSet('Release','Debug')][string]$Config = 'Release',
     [switch]$Sign,
     [switch]$Sanitize,
@@ -37,6 +37,7 @@ if ($Production -and ($Sign -or $Config -ne 'Release' -or !$DriverPackage)) { th
 if (($Production -or $DriverPackage) -and $Target -notin @('setup','dist')) { throw 'Use -Target setup or dist to preserve the signed driver bytes.' }
 if ($DriverPackage) { $DriverPackage = (Resolve-Path -LiteralPath $DriverPackage).Path }
 . (Join-Path $PSScriptRoot 'toolchain.ps1')
+. (Join-Path $PSScriptRoot 'codec-distribution.ps1')
 Write-ToolchainSummary
 
 $Out = Join-Path $Root "out\$Config"
@@ -163,6 +164,7 @@ function Build-HealthTests {
 }
 
 function Build-Tests {
+    Build-SecurityTests
     Build-HealthTests
     Build-ServiceTests
     Build-ProcessTests
@@ -178,6 +180,14 @@ function Build-Tests {
     Build-UserExe 'plugin_test' @((Join-Path $Root 'codec-host\test\plugin_test.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @() @()
     Build-UserExe 'pnctl_test' @((Join-Path $Root 'tools\common\test\pnctl_test.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) `
         @("/I$(Join-Path $Root 'tools\common')", "/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib') @()
+}
+
+function Build-SecurityTests {
+    Build-UserExe 'secure_path_test' @((Join-Path $Root 'tools\common\test\secure_path_test.cpp')) @("/I$(Join-Path $Root 'tools\common')") @('advapi32.lib') @()
+}
+
+function Build-CoreTests {
+    Build-UserExe 'core_test' @((Join-Path $Root 'driver\pna2dp\test\core_test.cpp'), (Join-Path $Root 'driver\pna2dp\src\a2dp_codec.cpp'), (Join-Path $Root 'driver\pna2dp\src\rtp.cpp'), (Join-Path $Root 'driver\pna2dp\src\pcm.cpp'), (Join-Path $Root 'driver\pna2dp\src\avdtp_wire.cpp'), (Join-Path $Root 'common\sbc\sbc.c')) @() @() @()
 }
 
 function Build-Cli {
@@ -267,6 +277,7 @@ function Build-Setup {
         @{ file = (Join-Path $Root 'README.md');            sub = '';        comp = 'core';     required = $false }
     )
     if ($WindowsMode) { $items = @($items | Where-Object { $_.comp -in @('panel','cli','core') }) }
+    else { $items += @(Get-CodecRedistributionItems $Out) }
     # The payload files are copied next to the generated .rc under ASCII names and referenced
     # relatively (rc.exe resolves them through /I$objd), so the checkout path never appears in
     # the resource script and non-ASCII paths work.
@@ -292,11 +303,12 @@ function Build-Setup {
     $indexFile = Join-Path $objd 'payload\index.txt'
     [IO.File]::WriteAllText($indexFile, ($index -join "`r`n") + "`r`n", [Text.Encoding]::ASCII)
     $rcLines += 'PAYLOAD_INDEX PAYLOAD "payload\\index.txt"'
-    $version = '0.1.0.0'
-    $infPath = Join-Path $pkg 'pna2dp.inf'
-    if (Test-Path $infPath) { $m = [regex]::Match((Get-Content $infPath -Raw), 'DriverVer\s*=\s*[^,]+,\s*([\d\.]+)'); if ($m.Success) { $version = $m.Groups[1].Value } }
-    if ($WindowsMode) { $version = ([regex]::Match((Get-Content (Join-Path $Root 'tools\pna2dp-panel\version.h') -Raw), 'PN_PANEL_VERSION_TEXT\s+"([^"]+)"')).Groups[1].Value }
-    $rcLines += "#define PN_PAYLOAD_VERSION `"$version`""
+    $versionMatch = [regex]::Match((Get-Content (Join-Path $Root 'tools\pna2dp-panel\version.h') -Raw), 'PN_PANEL_VERSION_TEXT\s+"(\d+\.\d+\.\d+\.\d+)"')
+    if (!$versionMatch.Success) { throw 'Application release version is unavailable.' }
+    $version = $versionMatch.Groups[1].Value
+    if ((Get-Item (Join-Path $Out 'pna2dp-panel.exe')).VersionInfo.ProductVersion -ne $version) {
+        throw 'Control panel version does not match setup. Build -Target gui before packaging existing binaries.'
+    }
     [IO.File]::WriteAllText((Join-Path $objd 'payload.rc'), ($rcLines -join "`r`n") + "`r`n", [Text.Encoding]::ASCII)
     $srcs = @((Join-Path $Root 'tools\pna2dp-setup\setup.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp')) + $CommonSrcs
     Build-WinExe 'pna2dp-setup' $srcs (Join-Path $Root 'tools\pna2dp-setup\setup.rc') @() @() @("/I$objd")
@@ -331,6 +343,11 @@ function Build-Dist {
     Copy-Item -LiteralPath (Join-Path $Out 'pna2dp-setup.exe') -Destination (Join-Path $dist 'portable') -Force
     foreach ($f in $(if ($WindowsMode) { @('pna2dp-panel.exe','pna2dpctl.exe') } else { @('pna2dp-codechost.exe','pna2dp-panel.exe','pna2dpctl.exe','freeaptx.dll') })) { $p = Join-Path $Out $f; if (Test-Path $p) { Copy-Item $p (Join-Path $dist 'portable') -Force } }
     if (!$WindowsMode) { Get-ChildItem $Out -Filter 'pna2dp-codec-*.dll' | Copy-Item -Destination (Join-Path $dist 'portable') -Force }
+    if (!$WindowsMode) {
+        foreach ($item in @(Get-CodecRedistributionItems $Out)) {
+            Copy-Item -LiteralPath $item.file -Destination (Join-Path $dist 'portable') -Force
+        }
+    }
     foreach ($f in @('LICENSE','THIRD-PARTY-NOTICES.md','README.md')) { $p = Join-Path $Root $f; if (Test-Path $p) { Copy-Item $p (Join-Path $dist 'portable') -Force } }
     Copy-Item -LiteralPath (Join-Path $Root 'docs\13-windows-mode.md') -Destination (Join-Path $dist 'portable') -Force
     Copy-Item -LiteralPath (Join-Path $Root 'docs\14-audio-diagnostics.md') -Destination (Join-Path $dist 'portable') -Force
@@ -355,6 +372,9 @@ switch ($Target) {
     'windows' { Build-Cli; Build-Gui; Build-Setup; Build-Dist }
     'driver'  { Build-Driver }
     'tests'   { Build-Tests }
+    'security-tests' { Build-SecurityTests }
+    'core-tests' { Build-CoreTests }
+    'plugin-tests' { Build-UserExe 'plugin_test' @((Join-Path $Root 'codec-host\test\plugin_test.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @() @() }
     'service-tests' { Build-ServiceTests }
     'process-tests' { Build-ProcessTests }
     'health-tests' { Build-HealthTests }

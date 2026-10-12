@@ -42,6 +42,7 @@ try {
     }
     Invoke-Check 'inf-verification' { & $INFVERIF /w /v (Join-Path $outputDir 'package\pna2dp.inf') }
     Invoke-Check 'core' { & (Join-Path $outputDir 'core_test.exe') }
+    Invoke-Check 'protected-service-paths' { & (Join-Path $outputDir 'secure_path_test.exe') }
     Invoke-Check 'boot-mode' { & (Join-Path $outputDir 'boot_mode_test.exe') }
     $vectors = Join-Path $reportDir 'vectors'
     New-Item -ItemType Directory -Path $vectors | Out-Null
@@ -49,6 +50,7 @@ try {
     $pluginVectors = Join-Path $reportDir 'plugin-vectors'
     New-Item -ItemType Directory -Path $pluginVectors | Out-Null
     Invoke-Check 'plugins' { & (Join-Path $outputDir 'plugin_test.exe') $outputDir $pluginVectors }
+    Invoke-Check 'plugin-discovery' { & (Join-Path $PSScriptRoot 'test-plugin-discovery.ps1') -OutputDirectory $outputDir }
     Invoke-Check 'controls-and-machine' { & (Join-Path $outputDir 'pnctl_test.exe') }
     Invoke-Check 'service-failure-handling' { & (Join-Path $outputDir 'service_failure_test.exe') }
     Invoke-Check 'process-wait' { & (Join-Path $outputDir 'process_wait_test.exe') }
@@ -68,6 +70,7 @@ try {
             $env:PATH = (Split-Path $CL) + ';' + $env:PATH
             $asanDir = Join-Path $projectRoot "out\$Config-Asan"
             Invoke-Check 'asan-core' { & (Join-Path $asanDir 'core_test.exe') }
+            Invoke-Check 'asan-protected-service-paths' { & (Join-Path $asanDir 'secure_path_test.exe') }
             Invoke-Check 'asan-sbc' { & (Join-Path $asanDir 'sbc_test.exe') }
             Invoke-Check 'asan-controls' { & (Join-Path $asanDir 'pnctl_test.exe') }
             Invoke-Check 'asan-services' { & (Join-Path $asanDir 'service_failure_test.exe') }
@@ -75,6 +78,12 @@ try {
             Invoke-Check 'asan-audio-health' { & (Join-Path $asanDir 'health_test.exe') }
         } finally { $env:PATH = $savedPath }
     }
+    Invoke-Check 'installer-version' { & (Join-Path $PSScriptRoot 'test-installer-version.ps1') -Setup (Join-Path $outputDir 'pna2dp-setup.exe') -Panel (Join-Path $outputDir 'pna2dp-panel.exe') }
+    Invoke-Check 'codec-redistribution' {
+        & (Join-Path $PSScriptRoot 'test-distribution-compliance.ps1') -Setup (Join-Path $outputDir 'pna2dp-setup.exe')
+        & (Join-Path $PSScriptRoot 'test-distribution-compliance.ps1') -Folder (Join-Path $outputDir 'dist\portable')
+    }
+    Invoke-Check 'codec-distribution-guards' { & (Join-Path $PSScriptRoot 'test-codec-distribution-guards.ps1') -OutputDirectory $outputDir }
     Invoke-Check 'installer-payload' {
         $extractDir = Join-Path $reportDir 'extracted'
         $setup = Join-Path $outputDir 'pna2dp-setup.exe'

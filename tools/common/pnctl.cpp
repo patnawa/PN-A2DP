@@ -633,7 +633,10 @@ std::wstring QualityReport(const PNA2DP_QUALITY &q)
     out += L"\r\nClean traffic: " + num(q.HealthyMs / 1000) + L" s; sustained congestion: " + num(q.CongestedMs) + L" ms\r\n";
     out += L"Last " + num(q.ObservationMs) + L" ms: " + num(q.CompletedPackets) + L" completions, " + num(q.SlowPackets) + L" slow, " + num(q.FailedPackets) + L" failures\r\n";
     out += L"Peak audio backlog in that window: " + num(q.BacklogPeakUs / 1000) + L" ms\r\n\r\n";
-    out += L"A sustained 1 s of congestion can lower bitrate (2 s between steps). Recovery requires 30 s of clean traffic per step.\r\n";
+    ULONG target = (q.Flags & PNA2DP_QUALITY_CHANGE_DETAILS) && q.RecoveryTargetMs >= 5000 && q.RecoveryTargetMs <= 60000 ? q.RecoveryTargetMs : 30000;
+    out += L"A sustained 1 s of congestion can lower bitrate (2 s between steps). Current recovery target: " + num(target / 1000) + L" s of clean traffic.\r\n";
+    if (q.Flags & PNA2DP_QUALITY_CHANGE_DETAILS)
+        out += L"Continuous recovery steps require 30, then 10, then 5 s; a quick relapse requires 60 s before retrying.\r\n";
     out += L"EDR values describe adapter capabilities, not usable bandwidth or current link speed. Distance, interference, the receiver and host load still matter.\r\n";
     return out;
 }

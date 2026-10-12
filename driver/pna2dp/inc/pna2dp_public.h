@@ -310,6 +310,12 @@ typedef struct _PNA2DP_CONFIG {
 #define PNA2DP_QUALITY_AUTO              0x00000002
 #define PNA2DP_QUALITY_ABR               0x00000004
 #define PNA2DP_QUALITY_CONSERVATIVE      0x00000008
+#define PNA2DP_QUALITY_CHANGE_DETAILS   0x00000010
+#define PNA2DP_QUALITY_REASON_SLOW      0x00000001
+#define PNA2DP_QUALITY_REASON_FAILED    0x00000002
+#define PNA2DP_QUALITY_REASON_PRESSURE  0x00000004
+#define PNA2DP_QUALITY_REASON_BACKLOG   0x00000008
+#define PNA2DP_QUALITY_REASON_RECOVERY  0x00000010
 #define PNA2DP_QUALITY_IDLE              0
 #define PNA2DP_QUALITY_SAMPLING          1
 #define PNA2DP_QUALITY_STABLE            2
@@ -340,7 +346,12 @@ typedef struct _PNA2DP_QUALITY {
     ULONG FailedPackets;
     ULONG BacklogPeakUs;
     ULONG ObservationMs;
-    ULONG Reserved[4];
+    /* Former reserved words: structure size and ABI 1 remain unchanged.
+     * Read only with CHANGE_DETAILS; older drivers leave these words zero. */
+    ULONG RecoveryTargetMs;
+    ULONG ChangeSequence;
+    ULONG LastChangeReason;
+    ULONG Reserved;
 } PNA2DP_QUALITY;
 
 /* Event mask returned by IOCTL_PNA2DP_WAIT_EVENT (output ULONG). */

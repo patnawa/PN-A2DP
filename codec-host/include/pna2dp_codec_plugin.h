@@ -2,7 +2,7 @@
  * pna2dp_codec_plugin.h - plugin interface of the PN-A2DP user-mode codec host.
  *
  * A plugin is a DLL exporting `PnCodecPluginGetInfo`. The host loads every
- * `pna2dp-codec-*.dll` next to its executable (and from %ProgramData%\PN-A2DP\plugins),
+ * `pna2dp-codec-*.dll` next to its executable (and in its plugins subdirectory),
  * asks for the codecs it provides and registers the union with the driver. Encoders
  * run in the host process: a plugin crash only takes the service down, never the kernel.
  *

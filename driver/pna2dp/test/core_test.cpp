@@ -4,6 +4,7 @@
 #include "avdtp_wire.h"
 #include "audio_policy.h"
 #include <stdio.h>
+#include "../../../common/recovery_policy.h"
 #include <vector>
 #include <cmath>
 
@@ -70,6 +71,27 @@ static void TestCodecNegotiation()
         {0x14, 0x15, 2, 250}, // dual: max 128
     };
     for (const auto &bad : invalidSbc) CHECK(!A2dpParseConfig(A2DP_CODEC_SBC, bad, sizeof(bad), &cfg));
+
+    // A receiver can initiate a joint-stereo stream even when the saved setting
+    // prefers dual channel. Reconcile must apply the same supported format as a
+    // locally initiated stream, including when the sample rate already matches.
+    {
+        UCHAR sonyCaps[] = {0x3f, 0xff, 2, 53};
+        UCHAR remoteOffer[] = {0x11, 0x15, 2, 53};
+        PNA2DP_CONFIG saved = {}; saved.Flags = PNA2DP_CFG_DUAL_CHANNEL_PREFER;
+        A2DP_CODEC_CONFIG active, selected;
+        CHECK(A2dpParseCaps(A2DP_CODEC_SBC, sonyCaps, sizeof(sonyCaps), &caps, NULL, NULL));
+        CHECK(A2dpParseConfig(A2DP_CODEC_SBC, remoteOffer, sizeof(remoteOffer), &active));
+        CHECK(A2dpSelectConfig(&caps, &saved, 48000, 16, &selected));
+        CHECK(active.BitrateBps == 357000 && selected.BitrateBps == 672000);
+        CHECK(PnStreamFormatNeedsUpdate(active.Codec, active.SampleRate, active.ChannelMode, selected.SampleRate, selected.ChannelMode));
+        CHECK(!PnStreamFormatNeedsUpdate(selected.Codec, selected.SampleRate, selected.ChannelMode, selected.SampleRate, selected.ChannelMode));
+        CHECK(PnStreamFormatNeedsUpdate(active.Codec, 44100, active.ChannelMode, 48000, active.ChannelMode));
+        caps.ChannelModeMask = PNA2DP_CHMODE_JOINT;
+        CHECK(A2dpSelectConfig(&caps, &saved, 48000, 16, &selected));
+        CHECK(!PnStreamFormatNeedsUpdate(active.Codec, active.SampleRate, active.ChannelMode, selected.SampleRate, selected.ChannelMode));
+        CHECK(!PnStreamFormatNeedsUpdate(PNA2DP_CODEC_AAC, 48000, PNA2DP_CHMODE_STEREO, 48000, PNA2DP_CHMODE_MONO));
+    }
 
     // Every advertised codec selects and round-trips at each supported rate.
     pref = {};
@@ -212,6 +234,33 @@ static void TestAudioPolicy()
     CHECK(PnQualityBoundBitrate(96000, 128000, 320000) == 128000);
     CHECK(PnQualityBoundBitrate(96000, 500000, 192000) == 192000);
     PN_QUALITY_WINDOW window = {};
+    CHECK(PnReconnectDelayMs(10, 1000) == 30000); // receiver can return after the initial retries
+    CHECK(PnReconnectDelayMs(0, 1000) == 1500);
+    CHECK(PnReconnectDelayMs(0xffffffffu, 0xffffffffu) == 30000);
+    CHECK(PnReconnectDelayMs(9, 0xffffffffu) == 30000);
+    PnHostRetry retry = {};
+    for (unsigned i = 0; i < 50; ++i) { PnHostRetryFailed(&retry, 1000); CHECK(retry.next > 1000 && retry.next <= 31000); }
+    retry.started = 1000; PnHostRetryHealthy(&retry, 2000); CHECK(retry.failures == 5);
+    PnHostRetryHealthy(&retry, 31000); CHECK(retry.failures == 0);
+    {
+        PN_QUALITY_WINDOW recovery = {};
+        ULONG level = 7;
+        for (ULONG ms = 0; ms < 65000; ms += 250) {
+            int change = PnQualityObserve(&recovery, 250, TRUE, FALSE, TRUE, level, 24);
+            if (change < 0) --level;
+        }
+        CHECK(level == 0); // continued clean traffic should recover seven steps in 65 s
+        recovery = {};
+        for (ULONG ms = 0; ms < 30000; ms += 250) PnQualityObserve(&recovery, 250, TRUE, FALSE, TRUE, 2, 24);
+        CHECK(PnQualityRecoveryTarget(&recovery) == 10000);
+        int last = 0;
+        for (ULONG ms = 0; ms < 2000; ms += 250) last = PnQualityObserve(&recovery, 250, TRUE, TRUE, TRUE, 1, 24);
+        CHECK(last == 1 && PnQualityRecoveryTarget(&recovery) == 60000);
+        for (ULONG ms = 0; ms < 59750; ms += 250) CHECK(PnQualityObserve(&recovery, 250, TRUE, FALSE, TRUE, 2, 24) == 0);
+        CHECK(PnQualityObserve(&recovery, 250, TRUE, FALSE, TRUE, 2, 24) == -1);
+        PnQualityObserve(&recovery, 250, FALSE, FALSE, TRUE, 1, 24);
+        CHECK(PnQualityRecoveryTarget(&recovery) == 30000); // idle resets fast recovery
+    }
     for (unsigned i = 0; i < 240; ++i) CHECK(PnQualityObserve(&window, 250, TRUE, i % 8 == 0, TRUE, 0, 3) == 0); // transient spikes
     for (unsigned i = 0; i < 3; ++i) CHECK(PnQualityObserve(&window, 250, TRUE, TRUE, TRUE, 0, 3) == 0);
     CHECK(PnQualityObserve(&window, 250, TRUE, TRUE, TRUE, 0, 3) == 1); // sustained congestion

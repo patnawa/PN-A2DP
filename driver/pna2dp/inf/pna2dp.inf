@@ -12,7 +12,7 @@ Signature   = "$Windows NT$"
 Class       = MEDIA
 ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
-DriverVer   = 10/11/2026,0.1.0.16
+DriverVer   = 10/12/2026,0.1.0.18
 CatalogFile = pna2dp.cat
 PnpLockDown = 1
 

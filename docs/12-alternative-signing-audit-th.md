@@ -14,7 +14,7 @@ PN-A2DP ใช้กระบวนการเดียวกันได้เ
 
 ไฟล์ต้นทาง:
 
-`C:\Users\Alpha\Downloads\Programs\AlternativeA2dpSetup-1.8.3.1.msi`
+`%USERPROFILE%\Downloads\Programs\AlternativeA2dpSetup-1.8.3.1.msi`
 
 ขนาด 6,115,328 bytes; SHA-256:
 

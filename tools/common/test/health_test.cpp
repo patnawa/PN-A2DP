@@ -130,6 +130,37 @@ int wmain(int argc, wchar_t **argv) {
     if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
     CHECK(pn::WriteUtf8FileAtomic(path, L"") == ERROR_INVALID_DATA, "empty export rejected");
     DeleteFileW(path);
+    h = Good(); history.Reset();
+    h.quality.Flags |= PNA2DP_QUALITY_CHANGE_DETAILS;
+    history.Observe(1000, true, h.status, h.stats, true, h.quality);
+    h.status.BitrateBps = 320000; h.quality.ChangeSequence = 1; h.quality.LastChangeReason = PNA2DP_QUALITY_REASON_SLOW;
+    history.Observe(2000, true, h.status, h.stats, true, h.quality);
+    CHECK(history.EventText(2000).find(L"slow transport writes") != std::wstring::npos, "bitrate event retains driver cause");
+    history.Observe(3000, false, {}, {}, false, {});
+    CHECK(history.Samples().empty() && history.EventText(3000).find(L"slow transport writes") != std::wstring::npos, "events survive interrupted observations without joining counters");
+    history.Observe(4000, true, h.status, h.stats, true, h.quality);
+    CHECK(pn::DiagnosticReport(h, history, 4000, L"test").find(L"slow transport writes") != std::wstring::npos, "events included in diagnostic export");
+    history.Reset(); CHECK(history.EventText(5000).find(L"slow transport writes") == std::wstring::npos, "changing selection clears event history");
+    for (unsigned i=0; i<100; ++i) history.RecordEvent(i, L"bounded event");
+    auto eventText = history.EventText(100);
+    CHECK(std::count(eventText.begin(), eventText.end(), L'\n') == 32, "event history bounded to 32 entries");
+    history.Reset(); h = Good(); h.status.Codec = PNA2DP_CODEC_APTX;
+    for (unsigned i=0; i<=10; ++i) history.Observe(i*1000, true, h.status, h.stats, true, h.quality);
+    CHECK(history.SuggestSbcFallback(10000), "persistent fixed-rate stall offers user-controlled fallback");
+    CHECK(!history.SuggestSbcFallback(15000), "stale evidence cannot offer fallback");
+    history.Reset();
+    for (unsigned i=0; i<=10; ++i) history.Observe(i*1017, true, h.status, h.stats, true, h.quality);
+    CHECK(history.SuggestSbcFallback(10170), "normal timer jitter does not prevent a persistent stall offer");
+    history.Reset(); h = Good();
+    for (unsigned i=0; i<=10; ++i) history.Observe(i*1000, true, h.status, h.stats, true, h.quality);
+    CHECK(!history.SuggestSbcFallback(10000), "SBC never offers a pointless SBC fallback");
+    history.Reset(); h = Good(); h.status.Codec = PNA2DP_CODEC_APTX_HD;
+    for (unsigned i=0; i<=10; ++i) { h.stats.PacketsSent++; if (i==1) h.stats.WriteFailures++; history.Observe(i*1000, true, h.status, h.stats, true, h.quality); }
+    CHECK(!history.SuggestSbcFallback(10000), "one old failure cannot trigger fallback offer");
+    h.quality.Flags = PNA2DP_QUALITY_ABR | PNA2DP_QUALITY_CHANGE_DETAILS;
+    h.quality.Health = PNA2DP_QUALITY_RECOVERING; h.quality.HealthyMs = 2000; h.quality.RecoveryTargetMs = 5000;
+    h.stats.WriteFailures = 0; history.Reset(); history.Observe(0, true, h.status, h.stats, true, h.quality);
+    CHECK(history.Summary(0).reason.find(L"3 s") != std::wstring::npos, "countdown uses driver recovery target");
     printf("Audio health: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -19,6 +19,10 @@
 #define IDD_PAGE_WINDOWS        113
 #define IDD_BOOT_MODE           114
 #define IDD_PAGE_QUALITY        115
+#define IDD_QUALITY_EVENTS      116
+#define IDC_QUALITY_EVENTS      2511
+#define IDC_EVENT_TEXT          2512
+#define IDC_EVENT_FALLBACK      2513
 #define IDC_QUALITY_TITLE       2501
 #define IDC_QUALITY_REASON      2502
 #define IDC_QUALITY_BITRATE     2503

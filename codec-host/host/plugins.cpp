@@ -33,7 +33,8 @@ void PluginRegistry::LoadDirectory(const std::wstring &dir)
 {
     WIN32_FIND_DATAW fd;
     wchar_t full[MAX_PATH];
-    if (!GetFullPathNameW(dir.c_str(), MAX_PATH, full, NULL)) return;   /* LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR needs an absolute path */
+    DWORD length = GetFullPathNameW(dir.c_str(), MAX_PATH, full, NULL);
+    if (!length || length >= MAX_PATH) return;   /* Never use a truncated DLL directory. */
     std::wstring base(full);
     std::wstring pattern = base + L"\\pna2dp-codec-*.dll";
     HANDLE h = FindFirstFileW(pattern.c_str(), &fd);

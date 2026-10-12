@@ -372,6 +372,8 @@ private:
     int m_sel = -1;
     Session m_s;
     pn::QualityHistory m_history;
+    std::wstring m_historyId;
+    ULONGLONG m_fallbackRequestedAt = 0;
     pn::HealthSnapshot m_health;
     bool m_healthValid = false;
     pn::HealthAction m_healthAction = pn::HealthAction::None;
@@ -486,6 +488,8 @@ private:
     void LoadReadiness();
     void LoadAdapter();
     void LoadQuality(bool observe = false);
+    void ShowQualityEvents();
+    bool CanOfferFallback() const;
     void CheckAudio();
     void FinishAudioCheck();
     void ExportDiagnostics();
@@ -1307,7 +1311,7 @@ void Panel::RefreshDevices(bool keepSelection)
 void Panel::CloseSession()
 {
     StopEventThread();
-    m_history.Reset();
+    m_history.Observe(GetTickCount64(), false, {}, {}, false, {});
     m_healthValid = false;
     m_healthAction = pn::HealthAction::None;
     SetText(m_page[PG_QUALITY], IDC_HEALTH_RESULTS, L"Press Check my audio for a fresh device, output, volume and codec check.");
@@ -1346,6 +1350,9 @@ void Panel::SelectDevice(int index)
     CloseSession();
     m_sel = index;
     const DeviceEntry d = m_devices[index];
+    if (_wcsicmp(m_historyId.c_str(), d.node.instanceId.c_str()) != 0) {
+        m_history.Reset(); m_historyId = d.node.instanceId; m_fallbackRequestedAt = 0;
+    }
     const unsigned generation = m_sessionGen;
     m_s.Reset();
     if (d.demo && d.node.usesPnA2dp()) {
@@ -1579,6 +1586,7 @@ void Panel::LoadQuality(bool observe)
     if (!selected) { summary.title = L"Select a Bluetooth device"; summary.reason = L"Pair and connect a stereo receiver, then press Refresh."; }
     else if (WindowsMode()) { summary.title = m_devices[m_sel].node.usesWindowsA2dp() ? L"Windows manages Bluetooth quality" : L"System driver manages Bluetooth quality"; summary.reason = L"Codec, bitrate and packet health are unavailable in this mode. Check my audio can inspect the output, volume and device state."; summary.recent = L"Bluetooth measurements unavailable"; }
     if (m_demo) summary.title = L"Demo: " + summary.title;
+    if (CanOfferFallback()) summary.reason += L" Open Events for optional SBC recovery.";
     SetText(d, IDC_QUALITY_TITLE, summary.title);
     SetText(d, IDC_QUALITY_REASON, summary.reason);
     SetText(d, IDC_QUALITY_RECENT, summary.recent);
@@ -1587,7 +1595,46 @@ void Panel::LoadQuality(bool observe)
     EnableItem(d, IDC_HEALTH_CHECK, selected && !m_healthJob);
     EnableItem(d, IDC_HEALTH_EXPORT, m_healthValid && !m_healthJob);
     EnableItem(d, IDC_HEALTH_FIX, m_healthValid && m_healthAction != pn::HealthAction::None && !m_demo);
+    EnableItem(d, IDC_QUALITY_EVENTS, selected);
     InvalidateRect(GetDlgItem(d, IDC_QUALITY_GRAPH), nullptr, FALSE);
+}
+
+bool Panel::CanOfferFallback() const
+{
+    ULONGLONG now = GetTickCount64();
+    return !m_demo && !m_dirty && m_s.open && m_s.telemetryValid &&
+        (!m_fallbackRequestedAt || now-m_fallbackRequestedAt >= 60000) &&
+        pn::CanActivateCodec(m_s.caps, m_s.ver, PNA2DP_CODEC_SBC) && m_history.SuggestSbcFallback(now);
+}
+
+void Panel::ShowQualityEvents()
+{
+    struct View { std::wstring text; bool fallback; } view{m_history.EventText(GetTickCount64()), CanOfferFallback()};
+    const unsigned generation = m_sessionGen;
+    INT_PTR result = DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_QUALITY_EVENTS), m_hwnd,
+        [](HWND dialog, UINT message, WPARAM wp, LPARAM lp) -> INT_PTR {
+            if (message == WM_INITDIALOG) {
+                auto view = (View *)lp;
+                SetDlgItemTextW(dialog, IDC_EVENT_TEXT, view->text.c_str());
+                EnableWindow(GetDlgItem(dialog, IDC_EVENT_FALLBACK), view->fallback);
+                return TRUE;
+            }
+            if (message == WM_COMMAND && (LOWORD(wp) == IDCANCEL || LOWORD(wp) == IDC_EVENT_FALLBACK)) {
+                EndDialog(dialog, LOWORD(wp)); return TRUE;
+            }
+            return FALSE;
+        }, (LPARAM)&view);
+    // Revalidate after the modal loop: device state can change while it is open.
+    if (result != IDC_EVENT_FALLBACK || generation != m_sessionGen || !CanOfferFallback()) return;
+    PNA2DP_CONFIG config = m_s.applied;
+    if (!pn::PreferCodec(config, m_s.caps, m_s.ver, PNA2DP_CODEC_SBC)) return;
+    config.Flags |= PNA2DP_CFG_ABR_ENABLE;
+    m_fallbackRequestedAt = GetTickCount64();
+    m_s.config = config; LoadAll(); SetDirty(true);
+    if (Apply()) {
+        m_history.RecordEvent(GetTickCount64(), L"User requested adaptive SBC fallback; saved SBC as first preference.");
+        SetStatusText(L"Requested adaptive SBC. The live codec confirms receiver acceptance; your other settings are preserved.");
+    } else m_history.RecordEvent(GetTickCount64(), L"SBC fallback request failed; inspect the driver status before retrying.");
 }
 
 void Panel::CheckAudio()
@@ -2249,6 +2296,7 @@ INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
         if (id == IDC_HEALTH_CHECK) { CheckAudio(); return TRUE; }
         if (id == IDC_HEALTH_EXPORT) { ExportDiagnostics(); return TRUE; }
         if (id == IDC_HEALTH_FIX) { OpenHealthAction(); return TRUE; }
+        if (id == IDC_QUALITY_EVENTS) { ShowQualityEvents(); return TRUE; }
         return TRUE; // diagnostics never create editable codec preferences
     }
     /* Windows controls apply immediately and never mark codec settings dirty. */

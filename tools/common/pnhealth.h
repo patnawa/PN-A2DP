@@ -45,8 +45,13 @@ struct QualitySummary {
 };
 class QualityHistory {
     std::vector<QualitySample> samples;
+    struct Event { ULONGLONG tick; std::wstring text; };
+    std::vector<Event> events;
 public:
-    void Reset() { samples.clear(); }
+    void Reset() { samples.clear(); events.clear(); }
+    void RecordEvent(ULONGLONG tick, const std::wstring &text);
+    std::wstring EventText(ULONGLONG now) const;
+    bool SuggestSbcFallback(ULONGLONG now) const;
     void Observe(ULONGLONG tick, bool valid, const PNA2DP_STATUS &status, const PNA2DP_STATS &stats,
                  bool qualityValid, const PNA2DP_QUALITY &quality);
     QualitySummary Summary(ULONGLONG now) const;

@@ -224,6 +224,7 @@ STDMETHODIMP_(void) CPnAdapterCommon::PowerChangeState(_In_ POWER_STATE NewState
 {
     PAGED_CODE();
     m_PowerState = NewState.DeviceState;
+    DevicePowerChanged(m_Device, m_PowerState);
     PN_INFO("power state D%u", (ULONG)m_PowerState - 1);
 }
 
@@ -249,6 +250,7 @@ STDMETHODIMP_(void) CPnAdapterCommon::PowerChangeState2(_In_ DEVICE_POWER_STATE 
     PAGED_CODE();
     UNREFERENCED_PARAMETER(NewSystemState);
     m_PowerState = NewDeviceState;
+    DevicePowerChanged(m_Device, m_PowerState);
 }
 
 #pragma code_seg("PAGE")
@@ -258,6 +260,7 @@ STDMETHODIMP_(void) CPnAdapterCommon::PowerChangeState3(_In_ DEVICE_POWER_STATE 
     UNREFERENCED_PARAMETER(NewSystemState);
     UNREFERENCED_PARAMETER(D3ExitLatency);
     m_PowerState = NewDeviceState;
+    DevicePowerChanged(m_Device, m_PowerState);
     PN_INFO("power state D%u", (ULONG)NewDeviceState - 1);
 }
 

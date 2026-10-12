@@ -1,6 +1,7 @@
 /* Exercise the production service helpers against a fault-injected Windows API.
  * No real services are opened, stopped or deleted. SPDX-License-Identifier: MIT */
 #include "pndrv.h"
+#include "pnsecurepath.h"
 #include <stdio.h>
 
 namespace fake {
@@ -11,7 +12,7 @@ struct State {
     DWORD settleAt = MAXDWORD;
     bool stuck = false;
     bool stoppingDuringControl = false;
-    int controls = 0, deletes = 0, processOpens = 0, processWaits = 0;
+    int controls = 0, deletes = 0, processOpens = 0, processWaits = 0, creates = 0;
 } state;
 BOOL Fail(DWORD error) { SetLastError(error); return FALSE; }
 SC_HANDLE WINAPI OpenSCManager(LPCWSTR, LPCWSTR, DWORD) { return (SC_HANDLE)1; }
@@ -20,6 +21,9 @@ SC_HANDLE WINAPI OpenService(SC_HANDLE, LPCWSTR, DWORD) {
     return (SC_HANDLE)2;
 }
 BOOL WINAPI CloseServiceHandle(SC_HANDLE) { return TRUE; }
+SC_HANDLE WINAPI CreateService(SC_HANDLE, LPCWSTR, LPCWSTR, DWORD, DWORD, DWORD, DWORD,
+    LPCWSTR, LPCWSTR, LPDWORD, LPCWSTR, LPCWSTR, LPCWSTR) { ++state.creates; return (SC_HANDLE)3; }
+BOOL WINAPI ChangeServiceConfig2(SC_HANDLE, DWORD, LPVOID) { return TRUE; }
 BOOL WINAPI ControlService(SC_HANDLE, DWORD, LPSERVICE_STATUS) {
     ++state.controls;
     if (state.stoppingDuringControl) state.state = SERVICE_STOP_PENDING;
@@ -64,6 +68,8 @@ void WINAPI Sleep(DWORD ms) {
 // Keep the substitutions in this test translation unit, out of shipped code.
 #define OpenSCManagerW fake::OpenSCManager
 #define OpenServiceW fake::OpenService
+#define CreateServiceW fake::CreateService
+#define ChangeServiceConfig2W fake::ChangeServiceConfig2
 #define CloseServiceHandle fake::CloseServiceHandle
 #define ControlService fake::ControlService
 #define QueryServiceStatus fake::QueryServiceStatus
@@ -80,6 +86,9 @@ static int failures = 0, checks = 0;
 #define CHECK(condition, text) do { ++checks; if (!(condition)) { ++failures; printf("FAIL: %s\n", text); } } while (0)
 int main()
 {
+    fake::state = {};
+    CHECK(pn::CreateHostService(pn::ModulePath()) == ERROR_ACCESS_DENIED && fake::state.creates == 0,
+          "user-owned executable cannot be registered as LocalSystem service");
     fake::state = {};
     CHECK(pn::DeleteServiceByName(L"fixture") == ERROR_SUCCESS && fake::state.deletes == 1, "stopped service is deleted");
     fake::state = {}; fake::state.controlError = ERROR_SERVICE_CANNOT_ACCEPT_CTRL;

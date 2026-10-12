@@ -34,6 +34,7 @@
 #include <thread>
 #include "resource.h"
 #include "pndrv.h"
+#include "pnsecurepath.h"
 #include "pnctl.h"
 #include "pnsigning.h"
 #include "../pna2dp-panel/version.h"
@@ -204,15 +205,11 @@ static bool WriteUtf8File(const std::wstring &path, const std::wstring &text)
     return ok != FALSE;
 }
 
-static std::wstring PayloadVersion(const std::vector<PayloadItem> &items)
+static std::wstring ProductVersion()
 {
-    std::wstring inf = PayloadText(items, L"pna2dp.inf");
-    size_t p = inf.find(L"DriverVer");
-    if (p == std::wstring::npos) return L"" PN_PANEL_VERSION_TEXT;
-    size_t c = inf.find(L',', p);
-    if (c == std::wstring::npos) return L"" PN_PANEL_VERSION_TEXT;
-    size_t e = inf.find_first_of(L"\r\n ", c + 1);
-    return inf.substr(c + 1, e == std::wstring::npos ? std::wstring::npos : e - c - 1);
+    // App releases can reuse an older signed kernel. DriverVer identifies that
+    // driver package, not the release shown by setup and Apps & features.
+    return L"" PN_PANEL_VERSION_TEXT;
 }
 
 static bool PayloadHas(const std::vector<PayloadItem> &items, const wchar_t *comp)
@@ -231,7 +228,7 @@ static const struct { const wchar_t *name; const wchar_t *comp; const wchar_t *d
     { L"Codec host service", L"host", L"Windows service that runs the codec plugins outside the kernel. Required for every codec except SBC." },
     { L"LDAC plugin", L"ldac", L"Sony LDAC encoder (330 / 660 / 990 kbps, up to 96 kHz 24-bit). Apache-2.0." },
     { L"aptX / aptX HD / aptX LL plugin", L"aptx", L"aptX family encoders from libfreeaptx. LGPL-2.1+ (freeaptx.dll is a separate DLL)." },
-    { L"AAC plugin", L"aac", L"Fraunhofer FDK AAC encoder (AAC-LC, HE-AAC). FDK AAC license." },
+    { L"AAC plugin", L"aac", L"Fraunhofer FDK AAC encoder (AAC-LC). License and source included; patent rights are separate." },
     { L"Control panel", L"panel", L"Windows mode: output volume, mute, format and spatial status. PN-A2DP driver mode adds advanced codec controls." },
     { L"Command line tool", L"cli", L"Windows mode: windows list / status / spatial. PN-A2DP driver commands: status, caps, config, set, watch, stats." },
     { L"Start menu shortcuts", L"startmenu", L"Shortcuts for the control panel and the uninstaller." },
@@ -424,9 +421,16 @@ static DWORD DoInstall(const Answers &a, const std::vector<PayloadItem> &items, 
     reboot = false;
     DWORD preflight = CheckPayload(a, items, log);
     if (preflight != ERROR_SUCCESS) return preflight;
+    // Setup writes elevated, even in Windows mode. Reject unsafe destinations
+    // before creating directories, stopping services or replacing any files.
+    preflight = pn::ValidateProtectedDirectory(a.folder, true);
+    if (!preflight && pn::DirExists(a.folder)) {
+        unsigned count = 0; preflight = pn::securepath::Tree(a.folder, 0, count);
+    }
+    if (preflight) { log(L"Unsafe installation folder. Choose an administrator-protected folder such as Program Files. No installation changes were made."); return preflight; }
     DWORD firstError = ERROR_SUCCESS;
     auto fail = [&](DWORD e) { if (firstError == ERROR_SUCCESS) firstError = e; };
-    std::wstring version = PayloadVersion(items);
+    std::wstring version = ProductVersion();
 
     /* count steps for the progress bar */
     log.total = 2;
@@ -440,6 +444,8 @@ static DWORD DoInstall(const Answers &a, const std::vector<PayloadItem> &items, 
     DWORD err = pn::CreateDirectoryRecursive(a.folder);
     if (err == ERROR_SUCCESS && a.comps[C_DRIVER]) err = pn::CreateDirectoryRecursive(pn::JoinPath(a.folder, L"driver"));
     if (err != ERROR_SUCCESS) { log(L"Cannot create the folder: %s", pn::Win32ErrorText(err).c_str()); return err; }
+    err = pn::ValidateProtectedDirectory(a.folder);
+    if (err) { log(L"The new folder does not have protected permissions; installation stopped."); return err; }
     log.Step();
 
     /* stop the service and anything that holds our files before overwriting */
@@ -647,6 +653,8 @@ static DWORD DoUninstall(Log &log, bool &reboot)
 
     /* files: everything we know about; the uninstaller itself is deleted after exit */
     const wchar_t *names[] = { L"pna2dp-codechost.exe", L"pna2dp-panel.exe", L"pna2dpctl.exe", L"freeaptx.dll", L"LICENSE", L"THIRD-PARTY-NOTICES.md", L"README.md",
+                               L"LICENSE-FDK-AAC.txt", L"LICENSE-LGPL-2.1.txt", L"LICENSE-LDAC.txt", L"NOTICE-LDAC.txt",
+                               L"sources-aac.zip", L"sources-aac.json", L"sources-aptx.zip", L"sources-aptx.json", L"sources-ldac.zip", L"sources-ldac.json",
                                L"13-windows-mode.md", L"14-audio-diagnostics.md", L"pna2dp-setup.log", L"driver\\pna2dp.inf", L"driver\\pna2dp.sys", L"driver\\pna2dp.cat", L"driver\\pna2dp-test.cer" };
     for (auto n : names) { std::wstring p = pn::JoinPath(dir, n); if (pn::FileExists(p) && !DeleteFileW(p.c_str())) MoveFileExW(p.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT); }
     /* the uninstaller copy, unless it is the running module (then ScheduleSelfDelete removes it) */
@@ -825,7 +833,7 @@ void Wizard::OnInit()
         m_page[i] = CreateDialogParamW(g_inst, MAKEINTRESOURCEW(dlg[i]), m_hwnd, PageProc, i);
         SetWindowPos(m_page[i], NULL, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
     }
-    std::wstring version = PayloadVersion(m_items);
+    std::wstring version = ProductVersion();
     if (m_mode != M_UNINSTALL && m_mode != M_ELEVATED_UNINSTALL && PayloadHas(m_items, L"driver")) m_trust = InspectPayloadTrust(m_items);
     std::wstring plugins;
     if (PayloadHas(m_items, L"ldac")) plugins += L"LDAC, ";
@@ -872,7 +880,7 @@ void Wizard::OnInit()
     SetDlgItemTextW(m_page[P_COMPONENTS], IDC_COMP_DESC, ComponentDescription(0).c_str());
 
     SetDlgItemTextW(m_page[P_FOLDER], IDC_FOLDER_EDIT, m_a.folder.c_str());
-    SetDlgItemTextW(m_page[P_FOLDER], IDC_FOLDER_NOTE, L"The driver package is copied to a \"driver\" sub-folder and staged in the Windows driver store from there. The codec host service and the plugins run from this folder; extra plugins can also be dropped into %ProgramData%\\PN-A2DP\\plugins.");
+    SetDlgItemTextW(m_page[P_FOLDER], IDC_FOLDER_NOTE, L"The driver package is copied to a \"driver\" sub-folder and staged in the Windows driver store from there. The codec host service and plugins run from this folder. Use an administrator-protected folder such as Program Files; plugin changes require administrator access.");
 
     lv = GetDlgItem(m_page[P_DEVICES], IDC_DEV_LIST);
     ListView_SetExtendedListViewStyle(lv, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT);
@@ -1244,7 +1252,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int)
         /* leave a log next to the installation for unattended runs */
         wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
         std::wstring logPath = pn::JoinPath(uninstall ? std::wstring(tmp) : a.folder, uninstall ? L"pna2dp-uninstall.log" : L"pna2dp-setup.log");
-        WriteUtf8File(logPath, log.text);
+        // A rejected install path must not become an elevated log-write target.
+        if (pn::securepath::Path(logPath, false, true) == ERROR_SUCCESS) WriteUtf8File(logPath, log.text);
+        else OutputDebugStringW(log.text.c_str());
         if (err == ERROR_SUCCESS && reboot) err = ERROR_SUCCESS_REBOOT_REQUIRED;
         ScheduleSelfDelete();
         return (int)err;

@@ -60,6 +60,7 @@ static int LdacChannelMode(uint32_t mode)
 
 static PnCodecEncoder *LdacOpen(const PNA2DP_STREAM_PARAMS *p)
 {
+    if (!p || p->CodecInfoLength > sizeof(p->CodecInfo)) return NULL;
     if (p->Codec != PNA2DP_CODEC_LDAC || (p->Channels != 1 && p->Channels != 2) ||
         (p->ChannelMode != PNA2DP_CHMODE_MONO && p->ChannelMode != PNA2DP_CHMODE_DUAL && p->ChannelMode != PNA2DP_CHMODE_STEREO) ||
         p->Channels != (p->ChannelMode == PNA2DP_CHMODE_MONO ? 1u : 2u) ||

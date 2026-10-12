@@ -46,9 +46,22 @@ BEGIN
     CONTROL         "Bitrate history; up to 60 seconds. Text measurements are above.", IDC_QUALITY_GRAPH, "Static", SS_OWNERDRAW, 4, 67, 392, 45
     LTEXT           "Check this device without changing settings or playing a tone.", IDC_HEALTH_TIMESTAMP, 4, 118, 392, 14, SS_NOPREFIX
     EDITTEXT        IDC_HEALTH_RESULTS, 4, 136, 392, 96, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      "Check my audio", IDC_HEALTH_CHECK, 4, 240, 96, 18
-    PUSHBUTTON      "Export diagnostics...", IDC_HEALTH_EXPORT, 106, 240, 115, 18
-    PUSHBUTTON      "Open suggested settings", IDC_HEALTH_FIX, 227, 240, 169, 18
+    PUSHBUTTON      "Check my audio", IDC_HEALTH_CHECK, 4, 240, 88, 18
+    PUSHBUTTON      "Export diagnostics...", IDC_HEALTH_EXPORT, 98, 240, 96, 18
+    PUSHBUTTON      "Open suggested settings", IDC_HEALTH_FIX, 200, 240, 136, 18
+    PUSHBUTTON      "Events...", IDC_QUALITY_EVENTS, 342, 240, 54, 18
+END
+
+IDD_QUALITY_EVENTS DIALOGEX 0, 0, 440, 288
+STYLE DS_SETFONT | DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "PN-A2DP - Quality events and recovery"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT "Recent changes for this device; newest first. Times show when changes were observed.", -1, 10, 8, 420, 20
+    EDITTEXT IDC_EVENT_TEXT, 10, 32, 420, 170, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    LTEXT "Optional recovery: after persistent aptX trouble, try your configured SBC settings with adaptive bitrate enabled. This saves SBC as first preference and may briefly interrupt audio. Other settings stay unchanged.", -1, 10, 210, 420, 40
+    PUSHBUTTON "Use adaptive SBC", IDC_EVENT_FALLBACK, 10, 258, 130, 20
+    DEFPUSHBUTTON "Close", IDCANCEL, 350, 258, 80, 20
 END
 
 // ------------------------------------------------------------------------------------

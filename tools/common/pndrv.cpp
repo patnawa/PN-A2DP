@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "pndrv.h"
+#include "pnsecurepath.h"
 #include <setupapi.h>
 #include <newdev.h>
 #include <cfgmgr32.h>
@@ -739,6 +740,8 @@ DWORD StopServiceAndWaitForExit(const wchar_t *name, DWORD waitMs)
 
 DWORD CreateHostService(const std::wstring &exePath)
 {
+    DWORD validation = ValidateProtectedService(exePath);
+    if (validation != ERROR_SUCCESS) return validation;
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
     if (!scm) return GetLastError();
     std::wstring cmd = L"\"" + exePath + L"\" --service";

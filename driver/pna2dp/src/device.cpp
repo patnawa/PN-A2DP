@@ -9,6 +9,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "pna2dp.h"
+#include "../../../common/recovery_policy.h"
 
 static LIST_ENTRY g_DeviceList;
 static KSPIN_LOCK g_DeviceListLock;
@@ -315,7 +316,7 @@ static AVDTP_REMOTE_SEP *ChooseConfig(_Inout_ PPNA2DP_DEVICE D, _Out_ PA2DP_CODE
 
 static VOID ScheduleReconnect(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG DelayMs)
 {
-    if (D->Removing) return;   /* DeviceStop cancels the timer after every source is stopped */
+    if (D->Removing || D->PowerSuspended) return;
     LARGE_INTEGER due;
     due.QuadPart = -PN_HNS_PER_MS * (LONGLONG)DelayMs;
     KeSetTimer(&D->ReconnectTimer, due, &D->ReconnectDpc);
@@ -416,6 +417,12 @@ static VOID Reconcile(_Inout_ PPNA2DP_DEVICE D, _In_ BOOLEAN SuspendDue)
 {
     PAGED_CODE();
     if (D->Removing) return;
+    if (D->PowerSuspended) { PumpStopStream(&D->Pump); return; }
+    if (InterlockedExchange(&D->ResetReconnectBudget, 0)) D->ReconnectAttempts = 0;
+    if (InterlockedExchange(&D->PowerResumePending, 0)) {
+        PumpStopStream(&D->Pump); AvdtpDisconnect(&D->Avdtp);
+        D->ActiveValid = FALSE; D->ReconnectAttempts = 0;
+    }
     BOOLEAN scoBlock = D->Link.ScoActive && (D->Config.Flags & PNA2DP_CFG_SUSPEND_ON_SCO);
     BOOLEAN want = (D->AudioRequest == PnAudioRun) && D->AudioStreamOpen && !scoBlock;
     AVDTP_STREAM_STATE st = AvdtpGetState(&D->Avdtp);
@@ -432,22 +439,35 @@ static VOID Reconcile(_Inout_ PPNA2DP_DEVICE D, _In_ BOOLEAN SuspendDue)
             D->ActiveValid = FALSE;
         }
         if (!NT_SUCCESS(EnsureSignalling(D))) {
-            if (D->ReconnectAttempts < 10) { D->ReconnectAttempts++; ScheduleReconnect(D, D->Config.ReconnectDelayMs + 500 * D->ReconnectAttempts); }
+            ULONG delay = PnReconnectDelayMs(D->ReconnectAttempts, D->Config.ReconnectDelayMs);
+            if (delay) { if (D->ReconnectAttempts < 10) D->ReconnectAttempts++; ScheduleReconnect(D, delay); }
             DeviceNotifyEvent(D, PNA2DP_EVENT_ERROR);
             return;
         }
         if (!NT_SUCCESS(EnsureDiscovered(D))) { DeviceNotifyEvent(D, PNA2DP_EVENT_ERROR); return; }
-        /* sample-rate mismatch between engine and negotiated config: reconfigure when the sink allows it */
+        /* A receiver-initiated SBC stream may ignore the saved channel preference.
+         * Select from its actual capabilities before comparing stream formats;
+         * in-band bitrate reductions do not require a stream reconfiguration. */
         st = AvdtpGetState(&D->Avdtp);
-        if (D->ActiveValid && D->AudioStreamOpen && D->Active.SampleRate != D->AudioRate && (st == AvdtpStateOpen || st == AvdtpStateStreaming || st == AvdtpStateConfigured)) {
+        if (D->ActiveValid && D->AudioStreamOpen && (st == AvdtpStateOpen || st == AvdtpStateStreaming || st == AvdtpStateConfigured)) {
             A2DP_CODEC_CONFIG cfg = D->Active;
             AVDTP_REMOTE_SEP *r = NULL;
             for (ULONG i = 0; i < D->Avdtp.RemoteSepCount; i++) if (D->Avdtp.RemoteSeps[i].Seid == D->Avdtp.RemoteSeid) r = &D->Avdtp.RemoteSeps[i];
             A2DP_CODEC_CAPS caps;
-            if (r && A2dpParseCaps(r->MediaCodecType, r->CodecCaps, r->CodecCapsLength, &caps, NULL, NULL) && (caps.RateMask & A2dpHzToRateMask(D->AudioRate))) {
+            BOOLEAN selected = r && A2dpParseCaps(r->MediaCodecType, r->CodecCaps, r->CodecCapsLength, &caps, NULL, NULL) && (caps.RateMask & A2dpHzToRateMask(D->AudioRate));
+            if (selected && cfg.Codec == PNA2DP_CODEC_SBC) {
+                caps.RateMask &= A2dpHzToRateMask(D->AudioRate);
+                selected = A2dpSelectConfig(&caps, &D->Config, D->AudioRate, D->AudioValidBits, &cfg);
+                if (selected && (D->Config.Flags & PNA2DP_CFG_AUTO_QUALITY) &&
+                    PnAdapterNeedsConservativeProfile(D->Link.RadioInfoValid, D->Link.RadioInfo.radioInfo.lmpSupportedFeatures))
+                    selected = A2dpConstrainBasicRadio(&cfg);
+            } else if (selected) {
                 cfg.SampleRate = D->AudioRate;
                 A2dpSerializeConfig(&cfg);
-                PN_INFO("reconfiguring stream to %u Hz for the audio engine", D->AudioRate);
+            }
+            if (selected && PnStreamFormatNeedsUpdate(D->Active.Codec, D->Active.SampleRate,
+                    D->Active.ChannelMode, cfg.SampleRate, cfg.ChannelMode)) {
+                PN_INFO("reconfiguring stream to %u Hz, channel mode %u for saved preferences", cfg.SampleRate, cfg.ChannelMode);
                 if (PumpIsStreaming(&D->Pump)) PumpStopStream(&D->Pump);
                 if (st == AvdtpStateStreaming) AvdtpSuspend(&D->Avdtp);
                 NTSTATUS rs = (AvdtpGetState(&D->Avdtp) == AvdtpStateOpen) ? AvdtpReconfigure(&D->Avdtp, cfg.Ies, cfg.IesLength) : STATUS_INVALID_DEVICE_STATE;
@@ -458,7 +478,7 @@ static VOID Reconcile(_Inout_ PPNA2DP_DEVICE D, _In_ BOOLEAN SuspendDue)
                     cfg.BitrateBps = cfg.MaxBitrateBps = A2dpNominalBitrate(&cfg);
                     D->Active = cfg;
                 }
-            } else {
+            } else if (!selected && D->Active.SampleRate != D->AudioRate) {
                 PN_WARN("sink does not support %u Hz for %s; selecting another codec", D->AudioRate, A2dpCodecName(cfg.Codec));
                 PumpStopStream(&D->Pump);
                 AvdtpClose(&D->Avdtp);
@@ -510,17 +530,18 @@ static VOID ConnectWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Conte
     if (!D) return;
     InterlockedExchange(&D->ConnectQueued, 0);
     PnMutexAcquire(&D->StateMutex);
-    if (!D->Removing) {
+    if (!D->Removing && !D->PowerSuspended) {
+        // Clear any pre-suspend session before idle capability discovery too.
+        Reconcile(D, FALSE);
         /* Opportunistic connect: bring the signalling channel up and learn capabilities so
          * the endpoint's format list matches the sink before audio starts. When audio is
          * already wanted, Reconcile does the same with retry scheduling; connecting here too
          * would double the time a speaker that is off holds StateMutex. */
         BOOLEAN want = D->AudioRequest == PnAudioRun && D->AudioStreamOpen;
-        if (!want && NT_SUCCESS(EnsureSignalling(D))) {
+        if (!want && !D->PowerSuspended && NT_SUCCESS(EnsureSignalling(D))) {
             EnsureDiscovered(D);
             if (D->Config.Flags & PNA2DP_CFG_AUTO_START_ON_CONNECT) EnsureConfiguredAndOpen(D);
         }
-        Reconcile(D, FALSE);
     }
     PnMutexRelease(&D->StateMutex);
     ExReleaseRundownProtection(&D->WorkRundown);   /* last access to D */
@@ -608,8 +629,25 @@ static VOID OnAcl(_In_ PVOID Context, _In_ BOOLEAN Connected)
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)Context;
     if (D->Removing) return;
     if (Connected) {
+        InterlockedExchange(&D->ResetReconnectBudget, 1);
         /* give the headset a chance to initiate AVDTP itself before we do */
         if (!D->Avdtp.SignallingUp) ScheduleReconnect(D, 2500);
+    }
+}
+
+VOID DevicePowerChanged(_Inout_ PPNA2DP_DEVICE D, DEVICE_POWER_STATE State)
+{
+    if (!D || D->Removing) return;
+    if (State != PowerDeviceD0) {
+        InterlockedExchange(&D->PowerSuspended, 1);
+        // Publish the required reset while still suspended; a worker must not
+        // observe D0 before it knows that the old Bluetooth session is stale.
+        InterlockedExchange(&D->PowerResumePending, 1);
+        KeCancelTimer(&D->ReconnectTimer);
+        QueueAudioWork(D, FALSE); // power callback never waits for Bluetooth I/O
+    } else if (InterlockedExchange(&D->PowerSuspended, 0)) {
+        InterlockedExchange(&D->ResetReconnectBudget, 1);
+        DeviceQueueConnect(D);
     }
 }
 

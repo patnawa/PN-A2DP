@@ -1,5 +1,129 @@
 # Testing and verification
 
+## Reliability update, application 0.1.0.30 / driver 0.1.0.18 (2026-10-12)
+
+Built and installed on this Sony/Qualcomm machine. **29 software groups** passed,
+including AddressSanitizer, 26,199 core checks, 50,000 malformed inputs, expanded
+codec validation and 54 diagnostic/history checks. **7 Windows-mode** and **7
+signing-policy** groups passed. The elevated installer rejected a user-writable
+destination with error 5 before creating files or changing the service.
+
+The loaded driver reports 0x00010012. Sony SBC held **672 kbps**, with no new
+transport errors in the 15-second observation and three reconnect cycles.
+Reconnects took **2.18–2.60 seconds**; **31 live KS checks** passed. Exact settings,
+default output, volume and mute were retained. The user reported a physical power
+cycle, but monitoring did not observe disconnection; it is not a verified recovery
+cycle. The user subsequently confirmed clear music, normal loudness and working
+Windows volume/mute on this update. Other receivers/codecs and sleep/wake remain pending. The
+[detailed record](16-reliability-improvements.md) separates evidence from remaining work.
+
+## Release audit, application 0.1.0.29 (2026-10-12)
+
+Historical audit snapshot: prepared locally; **not installed at that time**. The
+installed app/host were 0.1.0.28 and the reused kernel was test-signed 0.1.0.17. This run made no driver,
+service, security-setting or endpoint changes.
+
+- The old full installer failed all three external-codec notice/source checks.
+  Rebuilt full installer and portable payloads pass with complete licenses,
+  corresponding sources, rebuild instructions and matching hashes.
+- `test-codec-distribution-guards.ps1` exercises the production packaging gate:
+  complete artifacts are accepted; 14 missing/stale-artifact cases are rejected.
+- `test-plugin-discovery.ps1` reproduced loading a benign AAC plugin from a
+  simulated ProgramData directory through the host's actual discovery path.
+  After removing that search path, ProgramData/current-directory plugins are
+  ignored and installed-directory plugins plus built-in SBC remain available.
+  `--list-plugins` does not open devices or change service registration.
+- All AAC, aptX and LDAC source archives rebuilt successfully in separate
+  directories without Git metadata, using `-SkipSourceBundle`.
+- `verify.ps1 -SkipBuild -Interop`: **20 groups passed**, including 25,899 core
+  checks, 50,000 malformed packet inputs, codec tests, independent decoding,
+  payload matching and GUI startup. Windows-mode checks: **7 passed**;
+  installer signing-policy checks: **7 passed**. AddressSanitizer was not rerun
+  for this packaging/host-discovery update; prior results are recorded below.
+
+Logs: `out/commercial-audit`; verification report:
+`out/verification/20261012-181626/results.json`. This is software verification,
+not new audible receiver testing. Custom service-path enforcement was subsequently
+implemented and tested in 0.1.0.30 above. A wider security review, clean-machine
+tests, other receivers, LDAC independent decoding and production signing remain
+open. See [release readiness](15-commercial-readiness.md).
+
+## Connection recovery and installer, app 0.1.0.28 / driver 0.1.0.17 (2026-10-12)
+
+Two regressions were reproduced and fixed on the same Sony/Qualcomm machine:
+
+- Full setup and Apps & features reported the kernel package version instead of
+  the application release; the installer's numeric version was also fixed at
+  0.1.0.0. Setup now shares the panel's release version. Packaging rejects a stale
+  panel binary, and both full and Windows-mode metadata are checked automatically.
+- Receiver-initiated SBC playback retained joint stereo at 357 kbps even though
+  the saved dual-channel preference produced 672 kbps after a local reconnect.
+  Driver 0.1.0.17 selects the supported SBC channel mode before playback, including
+  when the sample rate already matches. The core regression uses the Sony's real
+  capabilities and checks same-rate reconciliation, joint-only receivers and scope
+  isolation from AAC. Bitrate-only adaptation does not trigger reconfiguration.
+
+The metadata loop failed six checks before the fix. The codec loop failed one of
+25,899 checks before the fix; all now pass. Full verification passed 24 groups,
+including AddressSanitizer, independent SBC/AAC/aptX-family decoding, payload
+matching and GUI startup. Windows-mode packaging passed seven groups; the rebuilt
+driver package passed seven signing-policy checks. These do not establish physical
+interoperability for codecs this Sony does not advertise.
+
+| Machine test | Observed result |
+|---|---|
+| Upgrade with the panel open | Exit 32; payload hashes and running service unchanged |
+| Windows-mode and full upgrades | Completed successfully with the panel closed |
+| Full uninstall, clean Windows-mode install/uninstall, full reinstall | Completed; uninstall restored the Microsoft driver binding; PN reinstall restored the endpoint and exact saved preferences |
+| Initial PnP restart while clients were open | Returned restart-required/pending-restart errors; not counted as a successful restart |
+| Idle PnP restart and device disable/enable | Passed after closing clients and stopping the host; host restarted and the endpoint returned |
+| Invalid installation root | Rejected with exit 123; installed release unchanged |
+| New driver deployment | Setup exit 0; live driver query reports 0x00010011, rather than relying only on the staged INF version |
+| Receiver-initiated playback after install | Reconfigured the Sony's 44.1 kHz joint-stereo offer to saved dual-channel SBC at the Windows 48 kHz rate, 672 kbps |
+| Device disable/enable on driver 0.1.0.17 | Endpoint ready about 0.55 seconds after the commands completed; subsequent playback reached 672 kbps |
+| Three live reconnects on driver 0.1.0.17 | Streaming and receiver absolute-volume integration returned in 2.20–2.52 seconds; 377–378 packets progressed per three-second observation, with no new drops, write failures or latency trims |
+| Exact-endpoint silent WASAPI streams | Submitted and drained successfully; packet counters progressed independently |
+| Preference and endpoint preservation | Exact configuration unchanged; Windows default selection, 63.5% volume and unmuted state retained |
+
+The user reported power-cycling the Sony, but the monitor did not observe a
+disconnect transition. Playback after its return passed; that is not a proven
+physical disconnect/reconnect test. Silent streams verify transport, not listening
+quality. Sleep/wake, radio power cycling, other receiver codecs and sustained
+Verifier/HLK stress remain outside this pass. No boot/security setting was changed
+and no system restart was performed.
+
+To repeat the live recovery check, play audio on one explicitly selected receiver:
+
+```powershell
+.\build\test-connection-recovery.ps1 -InstanceId '<exact Bluetooth A2DP instance ID>' -Cycles 3
+# Optional stable-link SBC quality assertion for this Sony's saved settings:
+.\build\test-connection-recovery.ps1 -InstanceId '<exact Bluetooth A2DP instance ID>' -ExpectedSbcKbps 672
+.\build\test-installer-version.ps1 -Installed
+```
+
+The script interrupts that receiver to reconnect it; it does not change codec
+settings, volume, device bindings or boot settings. Reports are local under
+`out/recovery-20261012-172746/`, `out/verification/20261012-174625/`,
+`windows-mode-20261012-173724/`, `setup-signing-20261012-174726-4d1a4914/` and
+`reconnect-20261012-174825-553/`. Older installer and driver backups remain in the
+recovery folder. Machine-specific reports are not included in Git.
+
+### Follow-up: reported SBC bitrate drop
+
+During subsequent music playback, the user noticed the bitrate changing without
+crackling or interruptions. The trace showed seven automatic reductions, down to
+276 kbps, following slow transport writes; the recorded completion maximum was
+about 175 ms. No packet drops, write failures or latency trims were recorded.
+Read-only observation then verified the complete recovery ladder back to 672 kbps,
+one step per 30 seconds of clean traffic. The final observation retained 672 kbps
+for at least 50 seconds, with no new queue waits or transport errors.
+
+This confirmed the configured adaptation/recovery behavior rather than a new
+codec failure. It does not identify the underlying cause of the earlier host/link
+stalls. No driver or user setting was changed during this investigation. Evidence
+is retained in `out/bitrate-drop-20261012-175150/`; the core regression suite still
+passes all 25,899 checks.
+
 ## Audio diagnostics, control panel 0.1.0.27 (2026-10-12)
 
 The new `health_test.exe` exercises the production audio-check model, bounded
@@ -203,8 +327,9 @@ refers to a callee that checks the MDL. These checks do not prove absence of bug
 
 ## Hardware verification completed and remaining coverage
 
-The Sony negotiated SBC joint stereo at 48 kHz, bitpool 53, approximately 357 kbps,
-with an outgoing media MTU of 895. Automatic selection uses the actual advertised
+The initial Sony tests negotiated SBC joint stereo at 48 kHz, bitpool 53,
+approximately 357 kbps, with an outgoing media MTU of 895. The 0.1.0.17 recovery
+tests above use the saved dual-channel preference at 672 kbps. Automatic selection uses the actual advertised
 capabilities and installed encoders. It does not force unsupported codecs or bitpools.
 The driver and applications are installed in `C:\Program Files\PN-A2DP`.
 

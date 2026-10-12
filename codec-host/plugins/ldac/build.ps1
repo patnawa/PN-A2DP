@@ -3,7 +3,7 @@
 # libldac is a single-translation-unit library: ldaclib.c #includes every other
 # encoder source, ldacBT.c #includes the Bluetooth wrapper. Only those two files and
 # the ABR helper are compiled.
-param([ValidateSet('Release','Debug')][string]$Config = 'Release', [switch]$FixedPoint)
+param([ValidateSet('Release','Debug')][string]$Config = 'Release', [switch]$FixedPoint, [switch]$SkipSourceBundle)
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 . (Join-Path $Root 'build\toolchain.ps1')
@@ -38,3 +38,7 @@ $libs = $UmLibDirs | ForEach-Object { "/LIBPATH:$_" }
 & $LINK /nologo /DLL /DEBUG "/OUT:$out\pna2dp-codec-ldac.dll" "/PDB:$out\pna2dp-codec-ldac.pdb" @libs @objs
 if ($LASTEXITCODE) { throw "link failed" }
 Write-Host "built $out\pna2dp-codec-ldac.dll"
+if (!$SkipSourceBundle) {
+    . (Join-Path $Root 'build\codec-distribution.ps1')
+    New-CodecSourceBundle -Codec ldac -OutputDirectory $out -BuildConfig $Config -BuildOptions $(if ($FixedPoint) { '-FixedPoint' } else { '' })
+}

@@ -33,10 +33,10 @@ observation window of up to 60 seconds. The graph shows bitrate over time; orang
 marks a bitrate reduction or an increase in transport errors.
 
 Idle, sampling, healthy transport, congestion, recovery and stalled packet progress
-have separate descriptions. Recovery explains the existing driver's 30-second
-healthy-traffic requirement; this is not a promise of a bitrate increase at a
-particular wall-clock time. Fixed-rate codecs cannot be lowered in-band. This
-release observes the existing adaptation policy; it does not modify that policy.
+have separate descriptions. Recovery uses the driver's current clean-traffic
+requirement (30/10/5 seconds, or 60 after a quick relapse, in driver 0.1.0.18).
+Older drivers retain the 30-second display. This is not a promise of a bitrate
+increase at a particular wall-clock time. Fixed-rate codecs cannot be lowered in-band.
 
 The window resets on failed samples, counter resets, codec/connection-state or
 audio-active transitions and gaps longer than five seconds. Samples older than
@@ -48,12 +48,28 @@ through these interfaces. The Quality page says unavailable and still offers the
 standard device/output checks. Demo mode is visibly marked and does not query the
 physical receiver through diagnostics.
 
+## Why quality changed
+
+**Quality > Events** shows the last 32 observed stream/codec/bitrate changes.
+Driver 0.1.0.18 supplies the latest adaptation reason: slow writes, failed writes,
+queue pressure, audio backlog or recovery. Unobserved changes and older drivers
+show an unavailable cause. Events survive observation interruptions for the same
+receiver; selecting another receiver clears them. This is an observation history,
+not a complete driver trace. The dialog is a snapshot; reopen it to refresh.
+
+After at least ten seconds of persistent trouble on aptX, aptX HD or aptX LL,
+**Use adaptive SBC** can become available. It requires current observations,
+receiver/encoder SBC support and no unsaved edits. Clicking it saves SBC first in
+the codec preference list and enables ABR using the saved SBC settings; playback
+may briefly interrupt. It never silently changes codecs, and a 60-second cooldown
+prevents repeated requests. Settings on other codec pages remain saved.
+
 ## Diagnostic export
 
 After a completed check, **Export diagnostics** saves a local UTF-8 `.txt` report.
 It contains the check snapshot/time, app and driver versions, platform state,
 codec/receiver capabilities, saved preferences, lifetime error counters and the
-recent numeric timeline. Lifetime counters can include earlier incidents; the
+recent numeric timeline and observed quality events. Lifetime counters can include earlier incidents; the
 timeline is observed later than the saved check and uses ages relative to export.
 
 The report uses an explicit field allowlist. Device names, Bluetooth addresses,

@@ -72,6 +72,8 @@ typedef struct _PN_ABR {
     ULONG       FloorBps;
     ULONG       Downgrades;
     ULONG       Upgrades;
+    ULONG       ChangeSequence;
+    ULONG       LastChangeReason;
 } PN_ABR;
 
 typedef struct _PN_PUMP {

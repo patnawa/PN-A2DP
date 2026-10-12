@@ -16,6 +16,9 @@ function SetupRun([string[]]$arguments) {
     if (!$process.WaitForExit(30000)) { $process.Kill(); throw 'Package check timed out.' }
     if ($process.ExitCode -ne 0) { throw "Setup returned $($process.ExitCode)" }
 }
+Check 'application-only release version' {
+    & (Join-Path $PSScriptRoot 'test-installer-version.ps1') -Setup $setup -Panel (Join-Path $bin 'pna2dp-panel.exe')
+}
 Check 'application-only preflight' {
     $path = Join-Path $report 'preflight.txt'
     SetupRun @('--check','--report',('"' + $path + '"'))

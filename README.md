@@ -7,7 +7,7 @@
 A Windows Bluetooth audio control panel with automatic codec selection,
 adaptive quality, and diagnostics you can understand.
 
-**Windows 10 / 11 · x64 · Control panel v0.1.0.27 · MIT project license**
+**Windows 10 / 11 · x64 · Control panel v0.1.0.30 · MIT project license**
 
 [Get started](#get-started) · [Choose a mode](#choose-a-mode) · [Codec support](#codec-support) · [Documentation](#documentation)
 
@@ -115,6 +115,11 @@ and receiver. AAC support is LC; HE-AAC is not advertised.
 
 Read more about [automatic adapter quality](docs/10-adapter-quality.md) and
 [codec licensing](docs/05-codec-licensing.md).
+
+Redistribution bundles include full codec notices and corresponding source
+archives. This does not establish patent clearance or product certification.
+Before publishing free binaries or selling the program, see the
+[release-readiness audit and costs](docs/15-commercial-readiness.md).
 
 ## Build and verify the full project
 

@@ -1,5 +1,5 @@
 # Builds pna2dp-codec-aac.dll from third_party/fdk-aac (encoder libraries only) + aac_plugin.cpp
-param([ValidateSet('Release','Debug')][string]$Config = 'Release')
+param([ValidateSet('Release','Debug')][string]$Config = 'Release', [switch]$SkipSourceBundle)
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 . (Join-Path $Root 'build\toolchain.ps1')
@@ -37,3 +37,7 @@ $libs = $UmLibDirs | ForEach-Object { "/LIBPATH:$_" }
 & $LINK /nologo /DLL /DEBUG "/OUT:$out\pna2dp-codec-aac.dll" "/PDB:$out\pna2dp-codec-aac.pdb" @libs @objs
 if ($LASTEXITCODE) { throw "link failed" }
 Write-Host "built $out\pna2dp-codec-aac.dll"
+if (!$SkipSourceBundle) {
+    . (Join-Path $Root 'build\codec-distribution.ps1')
+    New-CodecSourceBundle -Codec aac -OutputDirectory $out -BuildConfig $Config
+}

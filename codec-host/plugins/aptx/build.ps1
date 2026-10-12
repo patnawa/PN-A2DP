@@ -1,5 +1,5 @@
 # Builds freeaptx.dll (LGPL-2.1+, kept as its own DLL) and pna2dp-codec-aptx.dll (MIT adapter)
-param([ValidateSet('Release','Debug')][string]$Config = 'Release')
+param([ValidateSet('Release','Debug')][string]$Config = 'Release', [switch]$SkipSourceBundle)
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 . (Join-Path $Root 'build\toolchain.ps1')
@@ -40,3 +40,7 @@ $o = Join-Path $obj 'aptx_plugin.obj'
 & $LINK /nologo /DLL /DEBUG "/OUT:$out\pna2dp-codec-aptx.dll" "/PDB:$out\pna2dp-codec-aptx.pdb" @libs $o "$obj\freeaptx.lib"
 if ($LASTEXITCODE) { throw "link plugin failed" }
 Write-Host "built $out\pna2dp-codec-aptx.dll (+ freeaptx.dll)"
+if (!$SkipSourceBundle) {
+    . (Join-Path $Root 'build\codec-distribution.ps1')
+    New-CodecSourceBundle -Codec aptx -OutputDirectory $out -BuildConfig $Config
+}

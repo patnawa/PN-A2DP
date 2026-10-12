@@ -27,6 +27,8 @@ struct PnCodecEncoder {
 
 static PnCodecEncoder *AptxOpen(const PNA2DP_STREAM_PARAMS *p)
 {
+    if (!p || p->CodecInfoLength > sizeof(p->CodecInfo) ||
+        (p->SampleRate != 16000 && p->SampleRate != 32000 && p->SampleRate != 44100 && p->SampleRate != 48000)) return NULL;
     if (p->Codec != PNA2DP_CODEC_APTX && p->Codec != PNA2DP_CODEC_APTX_HD && p->Codec != PNA2DP_CODEC_APTX_LL) return NULL;
     if (p->PcmFormat != PNA2DP_FMT_S24 || p->Channels != 2) return NULL;   /* libfreeaptx: 24-bit stereo, 3 bytes per sample little endian */
     if (p->MediaMtu < (p->Codec == PNA2DP_CODEC_APTX_HD ? 12u : 8u)) return NULL;

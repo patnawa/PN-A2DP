@@ -306,12 +306,19 @@ static VOID AbrTick(_Inout_ PPN_PUMP P)
     int change = PnQualityObserve(&P->Abr.Window, elapsed, completed != 0, bad,
         P->Abr.Enabled, P->Abr.Level, P->Abr.MaxLevel);
     if (change > 0) {
+        P->Abr.LastChangeReason = (failed ? PNA2DP_QUALITY_REASON_FAILED : 0) |
+            (pressure ? PNA2DP_QUALITY_REASON_PRESSURE : 0) |
+            (backlog > P->TargetLatencyMs * 1000 ? PNA2DP_QUALITY_REASON_BACKLOG : 0) |
+            (slow >= 2 && (ULONGLONG)slow * 10 >= completed ? PNA2DP_QUALITY_REASON_SLOW : 0);
+        ++P->Abr.ChangeSequence;
         P->Abr.Level++;
         P->Abr.Downgrades++;
         P->Stats.AbrDowngrades++;
         AbrApplyLevel(P);
         DeviceNotifyEvent(P->Device, PNA2DP_EVENT_STATE_CHANGED);
     } else if (change < 0) {
+        P->Abr.LastChangeReason = PNA2DP_QUALITY_REASON_RECOVERY;
+        ++P->Abr.ChangeSequence;
         P->Abr.Level--;
         P->Abr.Upgrades++;
         P->Stats.AbrUpgrades++;
@@ -320,7 +327,7 @@ static VOID AbrTick(_Inout_ PPN_PUMP P)
     }
     PNA2DP_QUALITY q = {};
     q.Size = sizeof(q);
-    q.Flags = P->Abr.Enabled ? PNA2DP_QUALITY_ABR : 0;
+    q.Flags = PNA2DP_QUALITY_CHANGE_DETAILS | (P->Abr.Enabled ? PNA2DP_QUALITY_ABR : 0);
     q.Health = bad ? PNA2DP_QUALITY_CONGESTED : !completed ? PNA2DP_QUALITY_IDLE :
         P->Abr.Level ? PNA2DP_QUALITY_RECOVERING : P->Abr.Window.GoodMs >= 3000 ? PNA2DP_QUALITY_STABLE : PNA2DP_QUALITY_SAMPLING;
     q.Codec = P->Cfg.Codec; q.BitrateBps = P->Cfg.BitrateBps;
@@ -329,6 +336,8 @@ static VOID AbrTick(_Inout_ PPN_PUMP P)
     q.HealthyMs = P->Abr.Window.GoodMs; q.CongestedMs = P->Abr.Window.BadMs;
     q.CompletedPackets = completed; q.SlowPackets = slow; q.FailedPackets = failed;
     q.BacklogPeakUs = backlog; q.ObservationMs = elapsed;
+    q.RecoveryTargetMs = PnQualityRecoveryTarget(&P->Abr.Window);
+    q.ChangeSequence = P->Abr.ChangeSequence; q.LastChangeReason = P->Abr.LastChangeReason;
     KIRQL irql;
     KeAcquireSpinLock(&P->Lock, &irql);
     P->Quality = q;

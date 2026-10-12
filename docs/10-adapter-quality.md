@@ -24,8 +24,14 @@ and adapter policy. This preserves volume, buffering and the configured bitrate 
   approximately 250 ms windows. Sustained congestion for one second can reduce
   bitrate, with at least two seconds between reductions. Short isolated spikes
   do not change quality. Completion time is host transport latency, not RSSI.
-- Raises quality by one step only after 30 seconds of continuously healthy traffic.
-  Idle periods, congestion and long scheduling gaps reset the recovery evidence.
+- Driver 0.1.0.18 raises quality after 30 seconds of continuously healthy traffic,
+  then 10 seconds for the next step and 5 seconds for later steps. Idle periods,
+  congestion and long scheduling gaps reset accelerated recovery. A reduction within
+  10 seconds of an upgrade requires 60 clean seconds before retrying. Seven upward
+  steps take 65 seconds in the uninterrupted healthy-traffic policy test. Older
+  drivers require 30 seconds per step. A changing bitrate with clear sound
+  and no packet loss can therefore be normal; compare the live transport counters
+  and recovery timer before treating the number alone as an audio failure.
 - Keeps reductions within the configured floor, negotiated ceiling and codec limits.
   Discrete LDAC and SBC steps may stop above the floor. If the requested floor is
   higher than the ceiling, the ceiling wins. AAC supports the 256/192/128/96 kbps
@@ -39,6 +45,14 @@ new device defaults enable it. `pna2dpctl set autoquality=1` enables policy with
 resetting codec settings. To turn off adaptation explicitly, set both
 `autoquality=0 abr=0`; `abrfloor=128000` specifies the floor in bits per second.
 
+Driver 0.1.0.17 also reapplies the supported SBC channel preference when the
+receiver initiates a connection. Previously, the Sony could choose joint stereo
+and stay at 357 kbps despite a saved dual-channel preference; a PN-initiated
+connection with the same settings reached 672 kbps. Before playback, the driver
+now selects from the receiver's advertised capabilities at the Windows stream's
+rate and applies the existing adapter limit. Stream reconfiguration compares rate
+and SBC channel mode, leaving automatic in-band bitrate reductions alone.
+
 ## Limits and interpretation
 
 Bluetooth version, manufacturer ID, LE features and PHY rate cannot establish
@@ -51,7 +65,10 @@ currently negotiated PHY rate. It does not change power policies or antenna sett
 aptX, aptX HD and aptX LL have fixed bitrates at a given sample rate. Their health
 is monitored, but the driver cannot reduce their bitrate in band. Persistent trouble
 on one of these requires a different codec or better radio conditions; the policy
-does not repeatedly disconnect playback to force codec changes. The existing
+does not repeatedly disconnect playback to force codec changes. Panel 0.1.0.30 can
+offer **Quality > Events > Use adaptive SBC** after persistent fixed-rate codec
+trouble. This requires an explicit click, saves SBC as the first preference and
+enables ABR using the saved SBC settings. The existing
 bounded queue, latency guard and encoder-failure fallback remain active.
 
 Automatic quality does not add codecs to the receiver, create lossless bandwidth,

@@ -28,7 +28,7 @@ headset and is saved per headset by the driver (`Services\pna2dp\Parameters\Devi
 | Status | Live connection state, codec, format, encoder owner, bitrate and ceiling, estimated latency, sink delay report, MTU, AVDTP version, flags, last NTSTATUS; transport statistics (packets, bytes, drops, queue depth, write completion time, ABR level, codec host round trip); driver version, codec host service state, encoders available. Refreshes on every driver event (pended `WAIT_EVENT` IOCTL on a worker thread) and once a second. |
 | Codecs | Live codec/rate/bitrate, receiver support, live state, and saved or edited settings. Activate selected puts a supported codec first and applies it with SBC fallback. Auto quality + codecs restores automatic selection. The preset picker is a loader, not an indicator of saved settings. SBC cannot be disabled. |
 | SBC | Max bitpool (slider, or the headset's maximum), min bitpool, bitpool override (XQ), dual channel preference, rate / channel mode / block / subband / allocation masks, live bitrate estimate at 44.1 and 48 kHz. |
-| AAC | Target and peak bitrate or sink maximum, VBR, object type (auto / LC / HE-AAC v1 / v2), afterburner, rate and channel masks. |
+| AAC | Target and peak bitrate or sink maximum, VBR, AAC-LC, afterburner, rate and channel masks. HE-AAC is not advertised. |
 | aptX | Rate and channel masks for aptX, aptX HD (plus 16/24-bit input) and aptX LL (plus target buffer level). |
 | LDAC | Quality (HQ / SQ / MQ / adaptive), ABR step-down, encoder input format, rate and channel masks, bitrate preview. |
 | Adapter | Actual radio name/address, Classic EDR capability, live health, effective bitrate range and observation counters. Auto quality + codecs detects receiver support and enables adapter-aware limits with live adaptation. |
@@ -76,6 +76,12 @@ counters) so the UI can be exercised without the driver. `--page <name>` opens a
 directly (`--page Driver`).
 
 ## 2. Installer (`pna2dp-setup.exe`)
+
+Starting with application release **0.1.0.28**, the installer wizard, executable
+version resources, and Apps & features registration all use the application
+release version. The bundled signed kernel keeps its independent driver version
+(currently 0.1.0.17). Packaging rejects a stale control-panel binary instead of
+labelling it as the new app release.
 
 `build.ps1 -Target setup` scans `out\<Config>` and embeds every deliverable it finds as a
 `PAYLOAD` resource together with an index (`name|file|subdir|component|size`), so the
