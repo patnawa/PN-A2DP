@@ -62,7 +62,14 @@ a self-signed certificate does not replace that requirement. See the
 
 ## Get started
 
-There are currently no packaged GitHub releases. Build from source using
+Download the [v0.1.0.30 experimental release](https://github.com/patnawa/PN-A2DP/releases/tag/v0.1.0.30)
+and choose the **Windows-mode installer** for use without Test Mode. The separate
+**Test Mode installer** contains custom driver 0.1.0.18; follow the
+[setup and recovery guide](docs/17-test-mode-release-guide.md), including certificate
+verification and the explicit developer option. SHA-256 checksums accompany the
+downloads. A private repository's release requires repository access.
+
+To build from source, use
 **Visual Studio 2022 Build Tools** with the C++ x64 toolset and
 **Windows SDK 10.0.26100**. The scripts discover the toolchain; the Visual Studio
 IDE is not required.
