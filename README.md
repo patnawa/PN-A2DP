@@ -1,153 +1,188 @@
+<div align="center">
+
 # PN-A2DP
 
-An open-source Bluetooth A2DP **source** driver for Windows 10/11 that replaces the
-inbox `BthA2dp.sys` for a chosen headset and lets you pick and tune the codec:
-SBC (XQ-style bitpools, dual channel), AAC-LC, aptX, aptX HD, aptX Low Latency and LDAC,
-with live reconfiguration, adaptive bitrate, latency reporting and an open plugin
-host for encoders.
+**Bluetooth audio, tuned for you.**
 
-It was designed after a deep teardown of the commercial "Alternative A2DP Driver"
-(Bluetooth Goodies) and of the Windows Bluetooth audio stack; see `docs/`.
+A Windows Bluetooth audio control panel with automatic codec selection,
+adaptive quality, and diagnostics you can understand.
 
-```
-docs/01-alternative-a2dp-analysis.md       what the commercial driver does and how
-docs/02-windows-bluetooth-audio-internals.md how Windows loads, enumerates and drives A2DP
-docs/03-architecture.md                    PN-A2DP design and why it is better
-docs/04-build-sign-install.md              building, signing, installing, debugging
-docs/05-codec-licensing.md                 which encoder may be shipped where
-docs/06-testing-plan.md                    what has been verified and what has not
-docs/07-control-panel-and-installer.md     the GUI, per-device driver switching and the installer
-docs/09-spatial-audio.md                   Dolby/DTS headphone compatibility, Windows detection and transport limits
-```
+**Windows 10 / 11 · x64 · Control panel v0.1.0.27 · MIT project license**
 
-## Layout
+[Get started](#get-started) · [Choose a mode](#choose-a-mode) · [Codec support](#codec-support) · [Documentation](#documentation)
 
-```
-driver/pna2dp/       kernel driver (KMDF miniport + PortCls WaveRT), INF
-common/sbc/          SBC encoder/decoder shared by kernel, host and tests (+ self test)
-codec-host/          user-mode codec host service and plugins (SBC built-in; LDAC, aptX, AAC adapters)
-tools/pna2dpctl/     command line control
-tools/pna2dp-panel/  control panel (codec priority, per-codec tuning, latency, live status, driver switching)
-tools/pna2dp-setup/  installer / uninstaller (single exe, embeds driver, service, plugins, tools)
-tools/common/        shared user-mode code: IOCTL wrapper, SetupAPI driver management, services, signing
-build/               toolchain discovery, build, test signing, installation and packaging scripts
-third_party/         codec libraries (git submodules; see docs/05)
-```
+</div>
 
-## Build (no Visual Studio IDE needed)
+![PN-A2DP Quality dashboard showing an active Sony SBC stream, a 60-second bitrate graph, and audio health checks](docs/images/quality-dashboard.jpg)
 
-```powershell
-.\build\get-wdk.ps1            # once: downloads the WDK NuGet layout to %USERPROFILE%\wdk\c
-.\build\build.ps1              # driver, codec host, control tool, control panel, SBC self test
-.\out\Release\sbc_test.exe     # codec self test
-.\build\build.ps1 -Target package   # + plugins + installer -> out\Release\dist\pna2dp-setup.exe
-.\build\verify.ps1 -Sign -Sanitize -Interop   # reproducible software verification
-.\out\Release\pna2dp-panel.exe --demo   # control panel with a simulated headset
-```
+*Actual control panel v0.1.0.27 on Windows 11, streaming to a Sony CMT-SBT40D.
+The dashboard reports observed transport health; it does not measure acoustic quality.*
 
-Requires Visual Studio 2022 Build Tools with the C++ x64 toolset and the Windows SDK
-10.0.26100. The optional `-Interop` checks also need Python and FFmpeg in PATH.
+## What you can do
 
-## Windows mode (no custom driver)
+- **Check my audio.** Inspect the selected device, its Windows output, volume,
+  mute, format, and available codec information without changing your settings.
+- **See live quality.** In PN driver mode, follow a rolling 60-second bitrate
+  graph, packet progress, drops, write failures, and automatic quality recovery.
+- **Let compatibility guide the codec.** Detect receiver support, match it with
+  available encoders, and choose automatically or set your own priorities.
+- **Start high and adapt.** Automatic quality respects the receiver's limits and
+  your configured ceilings, reducing supported variable bitrates during sustained
+  congestion and recovering after healthy traffic.
+- **Switch per device.** Use the Windows Bluetooth audio driver or the PN-A2DP
+  driver for each paired receiver, with readiness checks and clear restart status.
+- **Export useful diagnostics.** Save a local text report that omits device names,
+  Bluetooth addresses, endpoint IDs, user paths, and raw logs. No audio is recorded
+  and no report is uploaded automatically.
 
-Control panel 0.1.0.21 also works with the Microsoft Bluetooth audio driver.
-Use `out/Release/dist-windows/pna2dp-setup.exe` or its portable panel. This package
-contains only application tools and needs no Test Mode or custom driver certificate.
-Select **Driver > Use Windows mode** for a device currently using PN-A2DP; restart
-manually if Windows requests it. Devices on the Windows driver show output volume,
-mute and format. Windows manages their codec and bitrate; the
-advanced codec controls remain available for devices on the PN-A2DP driver.
+## Choose a mode
 
-Build with `.\build\build.ps1 -Target windows`. See [Windows mode](docs/13-windows-mode.md)
-for capabilities, limitations, switching, and tests.
+| Capability | Windows mode | PN driver mode |
+|---|---|---|
+| Bluetooth audio driver | Microsoft's built-in driver | PN-A2DP custom source driver |
+| Output volume, mute, and Windows mix format | Available in the Audio tab | Integrated with Windows audio controls |
+| Check my audio and diagnostic export | Device and output checks | Adds codec, encoder, service, and transport checks |
+| Codec selection and tuning | Managed by Windows | SBC, AAC-LC, aptX family, and LDAC, subject to receiver support |
+| Live Bluetooth bitrate and packet health | Not exposed by this backend | Available in the Quality tab |
+| Automatic quality management | Managed by Windows | Receiver-aware policy for supported variable-rate codecs |
+| Custom kernel driver required | No | Yes |
+| Current installation path | Application-only installer or portable panel | Development package on a prepared test machine |
 
-## Install
+**Start with Windows mode** for device controls and diagnostics without installing
+a custom driver. It needs no Test Mode, driver certificate, or Microsoft developer
+account. Installing this package preserves existing device driver assignments;
+use **Driver → Use Windows mode** to move a device off the PN driver.
 
-Run `pna2dp-setup.exe` (from `out\Release\dist` or a release). The wizard lets you pick
-the components, the paired headsets that should use PN-A2DP (the others keep the
-Microsoft driver), and verifies Microsoft driver signatures for normal-mode installation. It does
-not enable Test Mode or install test certificates. It registers in Apps & features; `uninstall.exe` restores the inbox driver on
-every headset. `pna2dp-setup.exe --silent` installs unattended.
+**PN driver mode is currently a development build.** The validated configuration
+requires Test Mode on, Secure Boot off, and Memory Integrity off. The panel checks
+these requirements before activation. Normal-mode distribution of the custom
+driver requires a Microsoft-signed driver package; accepting a warning or adding
+a self-signed certificate does not replace that requirement. See the
+[build and installation guide](docs/04-build-sign-install.md).
 
-Afterwards use the **PN-A2DP Control Panel** (Start menu) to switch headsets between the
-drivers, order the codecs, tune SBC / AAC / aptX / LDAC, set the buffer size and watch
-the live status, or the command line tool:
+## Get started
+
+There are currently no packaged GitHub releases. Build from source using
+**Visual Studio 2022 Build Tools** with the C++ x64 toolset and
+**Windows SDK 10.0.26100**. The scripts discover the toolchain; the Visual Studio
+IDE is not required.
 
 ```powershell
-pna2dpctl list
-pna2dpctl status
-pna2dpctl spatial
-pna2dpctl set codecs=ldac,aac,sbc sbc.bitpool=76 sbc.dual=1
-pna2dpctl watch
+git clone --recurse-submodules https://github.com/patnawa/PN-A2DP.git
+cd PN-A2DP
+.\build\get-wdk.ps1
+.\build\build.ps1 -Target windows -Config Release
 ```
 
-Script-based alternative for development machines:
+Choose one of the generated Windows-mode packages:
+
+| Package | Output |
+|---|---|
+| Installer | `out/Release/dist-windows/pna2dp-setup.exe` |
+| Portable control panel | `out/Release/dist-windows/portable/pna2dp-panel.exe` |
+
+Pair your speaker or headphones in Windows, open the panel, select the device,
+and press **Check my audio** on the **Quality** tab. The **Audio** tab provides
+volume and mute controls for devices using the Windows driver.
+
+To explore the interface with simulated devices:
 
 ```powershell
-.\build\build.ps1 -Sign                              # test-signs with a self-signed cert
-bcdedit /set testsigning on                          # elevated; restart manually when ready
-.\build\install.ps1 -Package .\out\Release\package -AllowTestDriver  # elevated; prepared development PC
+.\out\Release\pna2dp-panel.exe --demo
 ```
 
-For normal-mode releases, see the [account and Microsoft signing guide](docs/11-production-signing-th.md).
-The current local driver remains a development build. Developer setup requires
-an already prepared test machine and the explicit `--allow-test-driver` option
-(or `-AllowTestDriver` with `install.ps1`).
+Demo mode is visibly labelled and does not demonstrate physical receiver support.
+For switching, installation details, and limitations, see [Windows mode](docs/13-windows-mode.md).
 
-`.\build\install.ps1 -Uninstall` restores the inbox Microsoft driver.
+## Codec support
 
-## Status
+These controls apply to **PN driver mode**. A codec must be supported by both
+the receiver and an available encoder. Windows mode uses Windows' own selection.
 
-Control panel **0.1.0.27** adds a **Quality** page in both driver modes.
-**Check my audio** checks the selected device, output, volume and available codec
-information in the background. PN mode also shows a rolling bitrate chart and
-recent transport errors. **Export diagnostics** saves a local UTF-8 report with
-device identifiers omitted and no audio recording. See
-[audio diagnostics](docs/14-audio-diagnostics.md) for coverage and limitations.
+| Codec | Implementation and controls | Current validation |
+|---|---|---|
+| **SBC** | Built-in encoder and kernel fallback; receiver-limited bitpool and channel modes | Software tests, independent decoding, and physical Sony playback |
+| **AAC-LC** | FDK AAC plugin; bitrate controls and adaptation | Software tests and independent decoding |
+| **aptX / aptX HD** | libfreeaptx plugin; fixed codec bitrates | Software tests and independent decoding |
+| **aptX Low Latency** | aptX encoder with LL negotiation and transport support | Software checks; receiver interoperability and latency remain unverified |
+| **LDAC** | Sony libldac plugin; quality levels and adaptive bitrate | Encoder and parameter tests; independent decoding and physical receiver validation remain outstanding |
 
-Development status: the x64 driver, codec host, tools, installer and three external
-codec plugins build locally. The test suite covers production codec negotiation,
-AVDTP parsing/reassembly, PCM conversion and RTP, with 50,000 malformed packet inputs
-under AddressSanitizer. All 316 plugin parameter combinations pass. SBC configurations
-and full-scale bass/transient regressions also decode with FFmpeg's independent decoder.
+Automatic quality uses measured transport behavior as well as reported adapter
+capabilities. Bluetooth version and EDR support alone do not establish usable
+bandwidth. Fixed-rate aptX codecs cannot be reduced in-band. The driver does not
+resample: the Windows audio engine rate must be supported by the selected codec
+and receiver. AAC support is LC; HE-AAC is not advertised.
 
-Real SBC music playback has been tested on Windows 11 build 26300 with a Sony
-CMT-SBT40D and Qualcomm FastConnect 7800. The user confirmed normal loudness and
-working Windows volume/mute. Windows receiver-volume integration avoids double
-attenuation, with software gain as a fallback. Version 0.1.0.13 also fixes an SBC
-joint-stereo overflow on loud bass transients and retains PCM during temporary
-Bluetooth write congestion. Endpoint icons follow the receiver's Bluetooth device class.
-Use **Automatic** in the panel or `pna2dpctl auto` to negotiate supported codecs
-without manually enabling incompatible receiver modes. It starts LDAC at HQ
-(990/909 kbps) or AAC-LC at up to 320 kbps, respects receiver limits, and reduces
-bitrate if the link becomes congested. Version 0.1.0.14 fixes LDAC's ABR quality
-ceiling and honors its per-codec ABR switch.
-Version 0.1.0.16 adds the **Adapter** tab and `pna2dpctl quality`: it identifies
-this receiver's actual radio, reports Classic EDR capabilities and measured transport
-health, and automatically adapts supported variable-bitrate codecs. Use **Auto quality
-+ codecs** to start at the highest supported settings. See [automatic adapter quality](docs/10-adapter-quality.md).
-Control panel 0.1.0.19 adds a resizable layout, device cards with readable state
-and codec information, a live output summary on every tab, and clear Apply/Undo
-actions with an unsaved-changes indicator.
-Version 0.1.0.18 makes automatic preferences explicit in the SBC, AAC,
-aptX and LDAC tabs, reads the SBC maximum from the receiver and shows live codec
-status alongside saved preferences. Version 0.1.0.17 added **Activate selected** to the Codecs tab and shows the
-live codec, receiver compatibility and actual saved settings. The preset menu now
-clearly previews settings to load instead of always showing Balanced.
-Version **0.1.0.24** removes the Spatial tab and adds **Driver** readiness lights
-for Test Mode, Secure Boot and Memory Integrity. Development-driver activation is
-blocked until its requirements pass; **Requirements...** explains any blockers.
-Close the boot-settings window before switching drivers and restart manually
-when a setting requires it. The program verifies the package and platform again
-in the elevated activation helper. See [Windows mode](docs/13-windows-mode.md).
-Windows spatial sound is managed in Windows Sound settings; the CLI retains
-read-only discovery. See [spatial audio](docs/09-spatial-audio.md) for transport limits.
-See [verification details and remaining hardware coverage](docs/06-testing-plan.md).
-The driver does not resample: the audio engine's rate must be supported by the selected
-codec and sink. AAC supports LC; HE-AAC is not advertised. aptX LL transport and latency
-remain unverified with an actual aptX LL receiver.
+Read more about [automatic adapter quality](docs/10-adapter-quality.md) and
+[codec licensing](docs/05-codec-licensing.md).
+
+## Build and verify the full project
+
+Build the driver, codec host, encoder plugins, tools, and installer:
+
+```powershell
+.\build\build.ps1 -Target package -Config Release
+.\build\verify.ps1 -SkipBuild -Sanitize -Interop
+```
+
+The full installer is generated at `out/Release/dist/pna2dp-setup.exe`.
+Building a package does not prepare Windows to load a development driver.
+Follow the [signing and installation guide](docs/04-build-sign-install.md) before
+attempting PN driver activation. The optional `-Interop` checks require Python
+and FFmpeg on `PATH`.
+
+The verification suite covers codec negotiation, AVDTP parsing and reassembly,
+PCM conversion, RTP, configuration handling, diagnostics, service operations,
+Windows-mode behavior, and installer signing checks. It includes AddressSanitizer
+runs, 50,000 malformed packet inputs, and 316 plugin parameter combinations.
+
+**Hardware tested:** Windows 11 build 26300, Qualcomm FastConnect 7800, and Sony
+CMT-SBT40D using SBC. Volume, mute, and audible playback have been checked on this
+setup. Other codec receivers, Driver Verifier/HLK, and broader power/PnP stress
+coverage remain work in progress. See the [test record and remaining coverage](docs/06-testing-plan.md).
+
+<details>
+<summary><strong>Repository layout</strong></summary>
+
+```text
+driver/pna2dp/       KMDF / PortCls WaveRT driver and INF
+common/sbc/         Shared SBC encoder, decoder, and tests
+codec-host/         User-mode codec host and encoder plugins
+tools/pna2dp-panel/ Native Windows control panel
+tools/pna2dpctl/    Command-line diagnostics and configuration
+tools/pna2dp-setup/ Installer and uninstaller
+tools/common/      Shared device, audio, driver, and diagnostic helpers
+build/             Toolchain, build, packaging, and verification scripts
+third_party/       Codec library submodules and their licenses
+docs/              Architecture, installation, and validation notes
+```
+
+</details>
+
+## Documentation
+
+| Guide | Contents |
+|---|---|
+| [Audio diagnostics](docs/14-audio-diagnostics.md) | Check my audio, live quality, export contents, and privacy |
+| [Windows mode](docs/13-windows-mode.md) | Standard driver controls, switching, and boot-mode readiness |
+| [Automatic quality](docs/10-adapter-quality.md) | Adapter detection, congestion response, and recovery |
+| [Control panel and installer](docs/07-control-panel-and-installer.md) | Device controls, configuration, and installation behavior |
+| [Build, sign, and install](docs/04-build-sign-install.md) | Development setup and driver deployment |
+| [Production signing — ภาษาไทย](docs/11-production-signing-th.md) | Microsoft signing requirements and submission preparation |
+| [Architecture](docs/03-architecture.md) | Driver, codec host, plugins, and control interfaces |
+| [Testing](docs/06-testing-plan.md) | Reproducible checks, hardware results, and open coverage |
+
+## Contributing
+
+For a bug report, include the panel version, driver mode, receiver model, steps to
+reproduce, and expected versus actual behavior. A report from **Quality → Export
+diagnostics** can help; review it before sharing. For code changes, run the relevant
+checks and state which codecs and hardware you actually tested.
 
 ## License
 
-MIT for everything in this repository. Third-party codec libraries keep their own
-licenses (Apache-2.0 for libldac, LGPL-2.1+ for libfreeaptx, Fraunhofer FDK AAC license).
+PN-A2DP's own code is licensed under [MIT](LICENSE). Third-party codec libraries
+retain their respective licenses: Apache-2.0 for libldac, LGPL-2.1-or-later for
+libfreeaptx, and the Fraunhofer FDK AAC license. See
+[third-party notices](THIRD-PARTY-NOTICES.md) and the
+[codec licensing guide](docs/05-codec-licensing.md) before redistribution.
