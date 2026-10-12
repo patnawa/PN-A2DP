@@ -13,7 +13,7 @@
  */
 #pragma once
 
-#define PNA2DP_DRIVER_VERSION   0x00010000u   /* 0.1.0.0 */
+#define PNA2DP_DRIVER_VERSION   0x00010010u   /* 0.1.0.16 */
 
 #ifdef PN_DEFINE_GUIDS
 #include <initguid.h>      /* driver.cpp defines every GUID exactly once */
@@ -62,6 +62,10 @@ void __cdecl operator delete(void *p, POOL_FLAGS);
 /* Tracing: DbgPrintEx with a runtime level (registry "DebugLevel")           */
 /* ------------------------------------------------------------------------- */
 extern ULONG g_PnDebugLevel;    /* 0 none, 1 error, 2 warning, 3 info, 4 verbose */
+VOID PnTraceInitialize();
+VOID PnTraceWrite(ULONG Level, PCSTR Format, ...);
+VOID PnTraceRead(PNA2DP_TRACE *Trace);
+NTSTATUS PnPortDispatchIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 #define PN_LEVEL_ERROR   1
 #define PN_LEVEL_WARN    2
@@ -70,6 +74,7 @@ extern ULONG g_PnDebugLevel;    /* 0 none, 1 error, 2 warning, 3 info, 4 verbose
 
 #define PN_TRACE(level, fmt, ...) \
     do { if (g_PnDebugLevel >= (level)) { \
+        PnTraceWrite((level), fmt, __VA_ARGS__); \
         DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL, "pna2dp: " fmt "\n", __VA_ARGS__); } } while (0)
 
 #define PN_ERR(fmt, ...)   PN_TRACE(PN_LEVEL_ERROR,   "[E] " fmt, __VA_ARGS__)
@@ -115,10 +120,26 @@ __forceinline VOID PnFree(_In_opt_ PVOID p, _In_ ULONG tag)
     if (p) ExFreePoolWithTag(p, tag);
 }
 
+/* Mutex for PASSIVE_LEVEL sections. ExAcquireFastMutex would raise to APC_LEVEL, but the
+ * sections hold KMDF synchronous sends, Zw* registry calls and IRPs that complete through
+ * a special kernel APC, all of which need PASSIVE_LEVEL. A critical region blocks normal
+ * kernel APCs (thread suspension) while keeping IRQL at PASSIVE. */
+__forceinline VOID PnMutexAcquire(_Inout_ PFAST_MUTEX m)
+{
+    KeEnterCriticalRegion();
+    ExAcquireFastMutexUnsafe(m);
+}
+__forceinline VOID PnMutexRelease(_Inout_ PFAST_MUTEX m)
+{
+    ExReleaseFastMutexUnsafe(m);
+    KeLeaveCriticalRegion();
+}
+
 /* Monotonic time in 100 ns units (interrupt time, precise). */
 __forceinline LONGLONG PnNowHns(void)
 {
-    return (LONGLONG)KeQueryInterruptTimePrecise(NULL);
+    ULONG64 qpc;
+    return (LONGLONG)KeQueryInterruptTimePrecise(&qpc);
 }
 
 #include "bthlink.h"

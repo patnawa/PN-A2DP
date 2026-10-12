@@ -54,12 +54,15 @@ static NTSTATUS CompleteIrp(_In_ PIRP Irp, _In_ NTSTATUS Status, _In_ ULONG_PTR 
     return Status;
 }
 
+/* Each control handle holds a reference on the device context (released at CLOSE), so the
+ * context outlives the handle even after a surprise removal. IOCTLs and CLEANUP run under
+ * the device's control rundown, which DeviceStop waits for before it drains the queues. */
 NTSTATUS ControlDispatchCreate(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
     PAGED_CODE();
-    if (!IsControlOpen(Irp)) return PcDispatchIrp(DeviceObject, Irp);
-    PPNA2DP_DEVICE D = DeviceFromFdo(DeviceObject);
-    if (!D || D->Removing) return CompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+    if (!IsControlOpen(Irp)) return PnPortDispatchIrp(DeviceObject, Irp);
+    PPNA2DP_DEVICE D = DeviceReferenceFromFdo(DeviceObject);
+    if (!D) return CompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
     sp->FileObject->FsContext2 = PN_CTL_FILE_MAGIC;
     sp->FileObject->FsContext = D;
@@ -71,11 +74,13 @@ NTSTATUS ControlDispatchCleanup(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP I
 {
     PAGED_CODE();
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
-    if (!ControlIsOurFile(sp->FileObject)) return PcDispatchIrp(DeviceObject, Irp);
+    if (!ControlIsOurFile(sp->FileObject)) return PnPortDispatchIrp(DeviceObject, Irp);
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)sp->FileObject->FsContext;
-    if (D && D->Signature == PNA2DP_DEVICE_SIGNATURE) {
+    /* After DeviceStop the queues are already drained and the host unregistered. */
+    if (D && D->Signature == PNA2DP_DEVICE_SIGNATURE && ExAcquireRundownProtection(&D->ControlRundown)) {
         DeviceFlushWaitersForFile(D, sp->FileObject);
         CodecHostFlushFile(&D->Host, sp->FileObject);
+        ExReleaseRundownProtection(&D->ControlRundown);
     }
     return CompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
@@ -84,20 +89,37 @@ NTSTATUS ControlDispatchClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp
 {
     PAGED_CODE();
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
-    if (!ControlIsOurFile(sp->FileObject)) return PcDispatchIrp(DeviceObject, Irp);
+    if (!ControlIsOurFile(sp->FileObject)) return PnPortDispatchIrp(DeviceObject, Irp);
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)sp->FileObject->FsContext;
-    if (D && D->Signature == PNA2DP_DEVICE_SIGNATURE) InterlockedDecrement(&D->OpenHandles);
     sp->FileObject->FsContext2 = NULL;
     sp->FileObject->FsContext = NULL;
+    if (D && D->Signature == PNA2DP_DEVICE_SIGNATURE) {
+        InterlockedDecrement(&D->OpenHandles);
+        DeviceRelease(D);   /* may free D */
+    }
     return CompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
+
+static NTSTATUS ControlDeviceControl(_In_ PPNA2DP_DEVICE D, _Inout_ PIRP Irp);
 
 NTSTATUS ControlDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
-    if (!ControlIsOurFile(sp->FileObject)) return PcDispatchIrp(DeviceObject, Irp);
+    if (!ControlIsOurFile(sp->FileObject)) return PnPortDispatchIrp(DeviceObject, Irp);
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)sp->FileObject->FsContext;
-    if (!D || D->Signature != PNA2DP_DEVICE_SIGNATURE || D->Removing) return CompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+    if (!D || D->Signature != PNA2DP_DEVICE_SIGNATURE || !ExAcquireRundownProtection(&D->ControlRundown)) {
+        return CompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+    }
+    NTSTATUS status = D->Removing ? CompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0) : ControlDeviceControl(D, Irp);
+    ExReleaseRundownProtection(&D->ControlRundown);
+    return status;
+}
+
+/* Runs under the control rundown. Pended IRPs are owned by a cancel-safe queue as soon as
+ * IoCsqInsertIrp returns (it also marks them pending), so they must not be touched after. */
+static NTSTATUS ControlDeviceControl(_In_ PPNA2DP_DEVICE D, _Inout_ PIRP Irp)
+{
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
 
     ULONG code = sp->Parameters.DeviceIoControl.IoControlCode;
     ULONG inLen = sp->Parameters.DeviceIoControl.InputBufferLength;
@@ -109,6 +131,21 @@ NTSTATUS ControlDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ 
     if (METHOD_FROM_CTL_CODE(code) != METHOD_BUFFERED) return CompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 
     switch (code) {
+    case IOCTL_PNA2DP_SBC_SAMPLE: {
+        if (inLen != sizeof(ULONG)) { status = STATUS_INVALID_PARAMETER; break; }
+        ULONG arm = *(ULONG *)buf;
+        if (arm > 2) { status = STATUS_INVALID_PARAMETER; break; }
+        if (!arm && outLen < sizeof(PNA2DP_SBC_SAMPLE)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        status = PumpSbcSample(&D->Pump, arm, arm ? NULL : (PNA2DP_SBC_SAMPLE *)buf);
+        if (!arm && NT_SUCCESS(status)) info = sizeof(PNA2DP_SBC_SAMPLE);
+        break;
+    }
+    case IOCTL_PNA2DP_GET_TRACE:
+        if (outLen < sizeof(PNA2DP_TRACE)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        PnTraceRead((PNA2DP_TRACE *)buf);
+        info = sizeof(PNA2DP_TRACE);
+        status = STATUS_SUCCESS;
+        break;
     case IOCTL_PNA2DP_GET_VERSION: {
         if (outLen < sizeof(PNA2DP_VERSION)) { status = STATUS_BUFFER_TOO_SMALL; break; }
         PNA2DP_VERSION *v = (PNA2DP_VERSION *)buf;
@@ -143,7 +180,7 @@ NTSTATUS ControlDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ 
         break;
     case IOCTL_PNA2DP_WAIT_EVENT:
         status = DeviceQueueWaitEvent(D, Irp);
-        if (status == STATUS_PENDING) { IoMarkIrpPending(Irp); return STATUS_PENDING; }
+        if (status == STATUS_PENDING) return STATUS_PENDING;
         if (NT_SUCCESS(status)) info = Irp->IoStatus.Information;
         break;
     case IOCTL_PNA2DP_RECONNECT:
@@ -155,6 +192,29 @@ NTSTATUS ControlDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ 
         info = sizeof(PNA2DP_STATS);
         status = STATUS_SUCCESS;
         break;
+    case IOCTL_PNA2DP_GET_QUALITY: {
+        if (outLen < sizeof(PNA2DP_QUALITY)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        PNA2DP_QUALITY *q = (PNA2DP_QUALITY *)buf;
+        PumpGetQuality(&D->Pump, q);
+        q->LocalAddress = D->Link.LocalAddress;
+        q->RadioQueryStatus = D->Link.RadioQueryStatus;
+        if (D->Link.RadioInfoValid) {
+            const BTH_LOCAL_RADIO_INFO *r = &D->Link.RadioInfo;
+            q->Flags |= PNA2DP_QUALITY_RADIO_VALID;
+            q->LmpFeatures = r->radioInfo.lmpSupportedFeatures;
+            q->Manufacturer = r->radioInfo.mfg;
+            q->HciRevision = r->hciRevision; q->HciVersion = r->hciVersion;
+            q->LmpSubversion = r->radioInfo.lmpSubversion; q->LmpVersion = r->radioInfo.lmpVersion;
+        }
+        PNA2DP_CONFIG cfg;
+        DeviceGetConfig(D, &cfg);
+        if (cfg.Flags & PNA2DP_CFG_AUTO_QUALITY) {
+            q->Flags |= PNA2DP_QUALITY_AUTO;
+            if (PnAdapterNeedsConservativeProfile(D->Link.RadioInfoValid, q->LmpFeatures)) q->Flags |= PNA2DP_QUALITY_CONSERVATIVE;
+        }
+        info = sizeof(*q); status = STATUS_SUCCESS;
+        break;
+    }
     case IOCTL_PNA2DP_RESET_STATS:
         PumpResetStats(&D->Pump);
         status = STATUS_SUCCESS;
@@ -170,9 +230,10 @@ NTSTATUS ControlDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ 
         break;
     case IOCTL_PNA2DP_CODEC_GET_WORK:
         status = CodecHostQueueGetWork(&D->Host, Irp);
-        if (status == STATUS_PENDING) { IoMarkIrpPending(Irp); return STATUS_PENDING; }
+        if (status == STATUS_PENDING) return STATUS_PENDING;
         break;
     case IOCTL_PNA2DP_CODEC_PUT_RESULT: {
+        if (!D->Host.Registered || D->Host.OwnerFile != sp->FileObject) { status = STATUS_ACCESS_DENIED; break; }
         if (inLen < sizeof(PNA2DP_CODEC_RESULT)) { status = STATUS_BUFFER_TOO_SMALL; break; }
         const PNA2DP_CODEC_RESULT *r = (const PNA2DP_CODEC_RESULT *)buf;
         if (r->Size != inLen || r->PayloadBytes + sizeof(*r) > inLen) { status = STATUS_INVALID_PARAMETER; break; }

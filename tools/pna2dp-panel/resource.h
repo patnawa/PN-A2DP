@@ -1,0 +1,258 @@
+/* resource.h - PN-A2DP Control Panel resource identifiers. SPDX-License-Identifier: MIT */
+#pragma once
+
+#define IDI_APP                 1
+#define IDR_MANIFEST            1
+
+#define IDD_MAIN                100
+#define IDD_PAGE_STATUS         101
+#define IDD_PAGE_CODECS         102
+#define IDD_PAGE_SBC            103
+#define IDD_PAGE_AAC            104
+#define IDD_PAGE_APTX           105
+#define IDD_PAGE_LDAC           106
+#define IDD_PAGE_TRANSPORT      107
+#define IDD_PAGE_SINK           108
+#define IDD_PAGE_DRIVER         109
+#define IDD_ABOUT               110
+#define IDD_PAGE_ADAPTER        112
+#define IDD_PAGE_WINDOWS        113
+#define IDD_BOOT_MODE           114
+#define IDC_BOOT_STATE          2401
+#define IDC_BOOT_PLATFORM       2402
+#define IDC_BOOT_DEVICES        2403
+#define IDC_BOOT_NOTICE         2404
+#define IDC_BOOT_ENABLE         2405
+#define IDC_BOOT_DISABLE        2406
+#define IDC_BOOT_REFRESH        2407
+#define IDC_WIN_MODE            2301
+#define IDC_WIN_ENDPOINT        2302
+#define IDC_WIN_STATE           2303
+#define IDC_WIN_FORMAT          2304
+#define IDC_WIN_DEFAULT         2305
+#define IDC_WIN_VOLUME          2306
+#define IDC_WIN_LEVEL           2307
+#define IDC_WIN_MUTE            2308
+#define IDC_WIN_ADAPTER         2309
+#define IDC_WIN_DRIVER          2310
+#define IDC_WIN_NOTE            2311
+#define IDC_WIN_SOUND           2312
+#define IDC_WIN_BLUETOOTH       2313
+#define IDC_WIN_REFRESH         2314
+#define IDC_WIN_DETAILS         2315
+#define IDC_AD_NAME             2201
+#define IDC_AD_AUTO             2202
+#define IDC_AD_REPORT           2203
+#define IDC_AD_BEST             2204
+
+/* main */
+#define IDC_DEVICES             1001
+#define IDC_REFRESH             1002
+#define IDC_TAB                 1003
+#define IDC_APPLY               1004
+#define IDC_REVERT              1005
+#define IDC_DEFAULTS            1006
+#define IDC_IMPORT              1007
+#define IDC_EXPORT              1008
+#define IDC_STATUSTEXT          1009
+#define IDC_ABOUT               1010
+#define IDC_PRESET              1011
+#define IDC_PRESET_APPLY        1012
+#define IDC_PRESET_DESC         1013
+#define IDC_BRAND               1020
+#define IDC_BRAND_SUB           1021
+#define IDC_DEVICE_LABEL        1022
+#define IDC_OUTPUT_TITLE        1023
+#define IDC_OUTPUT_SUMMARY      1024
+#define IDC_SAVE_HINT           1025
+#define IDC_BRAND_VERSION       1026
+
+/* status page: value statics */
+#define IDC_ST_DEVICE           1101
+#define IDC_ST_ADDRESS          1102
+#define IDC_ST_STATE            1103
+#define IDC_ST_CODEC            1104
+#define IDC_ST_FORMAT           1105
+#define IDC_ST_ENCODER          1106
+#define IDC_ST_BITRATE          1107
+#define IDC_ST_LATENCY          1108
+#define IDC_ST_SINKDELAY        1109
+#define IDC_ST_MTU              1110
+#define IDC_ST_AVDTP            1111
+#define IDC_ST_SEID             1112
+#define IDC_ST_FLAGS            1113
+#define IDC_ST_LASTERR          1114
+#define IDC_ST_PCM              1120
+#define IDC_ST_PACKETS          1121
+#define IDC_ST_BYTES            1122
+#define IDC_ST_FRAMES           1123
+#define IDC_ST_DROPPED          1124
+#define IDC_ST_WRITEFAIL        1125
+#define IDC_ST_TRIMS            1126
+#define IDC_ST_QUEUE            1127
+#define IDC_ST_TXTIME           1128
+#define IDC_ST_ABR              1129
+#define IDC_ST_HOSTRTT          1130
+#define IDC_ST_HOSTTO           1131
+#define IDC_ST_HOSTSVC          1140
+#define IDC_ST_ENCODERS         1141
+#define IDC_ST_DRIVERVER        1142
+#define IDC_ST_RESETSTATS       1150
+#define IDC_ST_RECONNECT        1151
+
+/* codecs page */
+#define IDC_CODEC_LIST          1201
+#define IDC_CODEC_UP            1202
+#define IDC_CODEC_DOWN          1203
+#define IDC_CODEC_ENABLEALL     1204
+#define IDC_CODEC_HOSTONLY      1205
+#define IDC_CODEC_APPLYLIVE     1206
+#define IDC_CODEC_NOTE          1207
+#define IDC_CODEC_ACTIVATE      1208
+#define IDC_CODEC_LIVE          1209
+
+/* sbc page */
+#define IDC_SBC_MAX_SLIDER      1301
+#define IDC_SBC_MAX_EDIT        1302
+#define IDC_SBC_MAX_SPIN        1303
+#define IDC_SBC_MAX_SINK        1304
+#define IDC_SBC_MIN_EDIT        1305
+#define IDC_SBC_MIN_SPIN        1306
+#define IDC_SBC_OVERRIDE        1307
+#define IDC_SBC_DUAL            1308
+#define IDC_SBC_R16             1310
+#define IDC_SBC_R32             1311
+#define IDC_SBC_R44             1312
+#define IDC_SBC_R48             1313
+#define IDC_SBC_CMONO           1314
+#define IDC_SBC_CDUAL           1315
+#define IDC_SBC_CSTEREO         1316
+#define IDC_SBC_CJOINT          1317
+#define IDC_SBC_B4              1318
+#define IDC_SBC_B8              1319
+#define IDC_SBC_B12             1320
+#define IDC_SBC_B16             1321
+#define IDC_SBC_S4              1322
+#define IDC_SBC_S8              1323
+#define IDC_SBC_ALOUD           1324
+#define IDC_SBC_ASNR            1325
+#define IDC_SBC_BITRATE         1326
+#define IDC_SBC_NOTE            1327
+#define IDC_SBC_RAUTO           1330
+#define IDC_SBC_CAUTO           1331
+#define IDC_SBC_BAUTO           1332
+#define IDC_SBC_SAUTO           1333
+#define IDC_SBC_AAUTO           1334
+
+/* aac page */
+#define IDC_AAC_BITRATE         1401
+#define IDC_AAC_SINKMAX         1402
+#define IDC_AAC_PEAK            1403
+#define IDC_AAC_VBR             1404
+#define IDC_AAC_OBJECT          1405
+#define IDC_AAC_AFTERBURNER     1406
+#define IDC_AAC_R16             1410
+#define IDC_AAC_R32             1411
+#define IDC_AAC_R44             1412
+#define IDC_AAC_R48             1413
+#define IDC_AAC_R88             1414
+#define IDC_AAC_R96             1415
+#define IDC_AAC_CMONO           1416
+#define IDC_AAC_CSTEREO         1417
+#define IDC_AAC_NOTE            1418
+#define IDC_AAC_RAUTO           1420
+#define IDC_AAC_CAUTO           1421
+
+/* aptx page: base + offsets per variant (0 = aptX, 20 = HD, 40 = LL) */
+#define IDC_APTX_BASE           1500
+#define IDC_APTX_R16            0
+#define IDC_APTX_R32            1
+#define IDC_APTX_R44            2
+#define IDC_APTX_R48            3
+#define IDC_APTX_CMONO          4
+#define IDC_APTX_CSTEREO        5
+#define IDC_APTX_F16            6
+#define IDC_APTX_F24            7
+#define IDC_APTX_LLTARGET       8
+#define IDC_APTX_LLSPIN         9
+#define IDC_APTX_RAUTO          10
+#define IDC_APTX_ID(variant, which)  (IDC_APTX_BASE + (variant) * 20 + (which))
+#define IDC_APTX_NOTE           1580
+
+/* ldac page */
+#define IDC_LDAC_QHQ            1601
+#define IDC_LDAC_QSQ            1602
+#define IDC_LDAC_QMQ            1603
+#define IDC_LDAC_QABR           1604
+#define IDC_LDAC_ABR            1605
+#define IDC_LDAC_F16            1606
+#define IDC_LDAC_F24            1607
+#define IDC_LDAC_F32            1608
+#define IDC_LDAC_FF32           1609
+#define IDC_LDAC_FAUTO          1610
+#define IDC_LDAC_R44            1611
+#define IDC_LDAC_R48            1612
+#define IDC_LDAC_R88            1613
+#define IDC_LDAC_R96            1614
+#define IDC_LDAC_CMONO          1615
+#define IDC_LDAC_CDUAL          1616
+#define IDC_LDAC_CSTEREO        1617
+#define IDC_LDAC_BITRATE        1618
+#define IDC_LDAC_NOTE           1619
+#define IDC_LDAC_RAUTO          1620
+#define IDC_LDAC_CAUTO          1621
+
+/* transport page */
+#define IDC_TR_TARGET_SLIDER    1701
+#define IDC_TR_TARGET_EDIT      1702
+#define IDC_TR_MAX_SLIDER       1703
+#define IDC_TR_MAX_EDIT         1704
+#define IDC_TR_ABR              1705
+#define IDC_TR_ABRFLOOR         1706
+#define IDC_TR_RECONNECT        1707
+#define IDC_TR_SUSPENDSCO       1708
+#define IDC_TR_AUTOSTART        1709
+#define IDC_TR_ALLRATES         1710
+#define IDC_TR_SWVOLUME         1711
+#define IDC_TR_DELAYREPORT      1712
+#define IDC_TR_VOLUME           1713
+#define IDC_TR_VOLUME_SPIN      1714
+#define IDC_TR_NOTE             1715
+
+/* sink page */
+#define IDC_SINK_INFO           1801
+#define IDC_SINK_LIST           1802
+#define IDC_SINK_DETAIL         1803
+#define IDC_SINK_REFRESH        1804
+
+/* driver page */
+#define IDC_DRV_CURRENT         1901
+#define IDC_DRV_PROVIDER        1902
+#define IDC_DRV_VERSION         1903
+#define IDC_DRV_INF             1904
+#define IDC_DRV_STATUS          1905
+#define IDC_DRV_USE_PNA2DP      1906
+#define IDC_DRV_USE_INBOX       1907
+#define IDC_DRV_PKG             1908
+#define IDC_DRV_STAGE           1909
+#define IDC_DRV_UNSTAGE         1910
+#define IDC_DRV_SIGNING         1911
+#define IDC_DRV_SVC             1912
+#define IDC_DRV_SVC_START       1913
+#define IDC_DRV_SVC_STOP        1914
+#define IDC_DRV_SVC_INSTALL     1915
+#define IDC_DRV_SVC_REMOVE      1916
+#define IDC_DRV_PLUGINS         1917
+#define IDC_DRV_INSTALLDIR      1918
+#define IDC_DRV_OPENDIR         1919
+#define IDC_DRV_RESCAN          1920
+#define IDC_DRV_BOOT_MODE       1921
+#define IDC_DRV_TEST_LIGHT      1922
+#define IDC_DRV_SECURE_LIGHT    1923
+#define IDC_DRV_HVCI_LIGHT      1924
+#define IDC_DRV_READINESS       1925
+#define IDC_DRV_REQUIREMENTS    1926
+#define IDC_DRV_SECURITY        1927
+
+/* about */
+#define IDC_ABOUT_TEXT          2001

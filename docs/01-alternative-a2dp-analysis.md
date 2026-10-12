@@ -1,5 +1,8 @@
 # Deep analysis: Bluetooth Goodies "Alternative A2DP Driver" (v1.8.3.1)
 
+Follow-up: [2026-10-12 signing and installer audit (Thai)](12-alternative-signing-audit-th.md)
+records verified MSI/catalog/embedded signatures and the actual MSI OS launch conditions.
+
 Analysis date: 2026-10-10. Sources: the public site (bluetoothgoodies.com/a2dp), the
 installed product on the analysis PC (`C:\Program Files\Luculent Systems\AltA2DP`), the
 driver package in the Driver Store (`alta2dp.inf_amd64_f81fce6c1599eba4`), PE import and

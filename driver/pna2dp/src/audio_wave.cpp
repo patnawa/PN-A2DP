@@ -31,12 +31,20 @@ static PCEVENT_ITEM g_WaveFilterEvents[] = {
 };
 DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(g_WaveFilterAutomation, g_WaveFilterProps, g_WaveFilterEvents);
 
+/* The bridge advertises analog audio. Describe the PCM-to-output conversion so
+ * AudioEndpointBuilder can trace a render path through the wave filter. The
+ * physical DAC is in the Bluetooth receiver, not on this computer. */
+static PCNODE_DESCRIPTOR g_WaveNodes[] = {
+    { 0, NULL, &KSNODETYPE_DAC, NULL },
+};
 static PCCONNECTION_DESCRIPTOR g_WaveConnections[] = {
-    { PCFILTER_NODE, PN_WAVE_PIN_SYSTEM, PCFILTER_NODE, PN_WAVE_PIN_BRIDGE },
+    { PCFILTER_NODE, PN_WAVE_PIN_SYSTEM, 0, 1 },
+    { 0, 0, PCFILTER_NODE, PN_WAVE_PIN_BRIDGE },
 };
 
 PCFILTER_DESCRIPTOR g_PnWaveFilterDescriptor = {
-    0, &g_WaveFilterAutomation, sizeof(PCPIN_DESCRIPTOR), 2, NULL, sizeof(PCNODE_DESCRIPTOR), 0, NULL,
+    0, &g_WaveFilterAutomation, sizeof(PCPIN_DESCRIPTOR), 2, NULL,
+    sizeof(PCNODE_DESCRIPTOR), SIZEOF_ARRAY(g_WaveNodes), g_WaveNodes,
     SIZEOF_ARRAY(g_WaveConnections), g_WaveConnections, 0, NULL
 };
 
@@ -110,8 +118,8 @@ NTSTATUS CPnMiniportWaveRT::BuildFormatTable()
     }
     BOOLEAN hiRes = (formatMask & (PNA2DP_FMT_S24 | PNA2DP_FMT_S32)) != 0 && d && d->ActiveValid && d->Active.Codec != PNA2DP_CODEC_SBC && d->Active.Codec != PNA2DP_CODEC_AAC;
 
-    KIRQL irql;
-    KeAcquireSpinLock(&m_Lock, &irql);
+    /* Runs from Init only, before the filter is registered: nothing else reads the table yet
+     * (and a spin lock must not be held in pageable code). */
     m_FormatCount = 0;
     /* put the negotiated rate first so Windows 11's single-format endpoint picks it */
     ULONG firstRate = (d && d->ActiveValid) ? d->Active.SampleRate : 48000;
@@ -143,17 +151,8 @@ NTSTATUS CPnMiniportWaveRT::BuildFormatTable()
     m_DataRange.MaximumSampleFrequency = maxRate;
     m_DataRangePointers[0] = (PKSDATARANGE)&m_DataRange;
     m_DataRangePointers[1] = (PKSDATARANGE)&g_ModeAttributeList;
-    KeReleaseSpinLock(&m_Lock, irql);
     PN_INFO("wave formats: %u entries, %u..%u Hz, %u..%u bit", m_FormatCount, minRate, maxRate, minBits, maxBits);
     return STATUS_SUCCESS;
-}
-
-#pragma code_seg("PAGE")
-VOID CPnMiniportWaveRT::RebuildFormats()
-{
-    PAGED_CODE();
-    BuildFormatTable();
-    GeneratePinCapsChange();
 }
 
 #pragma code_seg("PAGE")
@@ -163,27 +162,39 @@ VOID CPnMiniportWaveRT::GeneratePinCapsChange()
     if (m_PortEvents) m_PortEvents->GenerateEventList((GUID *)&KSEVENTSETID_PinCapsChange, KSEVENT_PINCAPS_FORMATCHANGE, TRUE, PN_WAVE_PIN_SYSTEM, FALSE, ULONG(-1));
 }
 
+/* Returns the table entry that matches Format, or NULL. Every field that is later used for
+ * arithmetic (block align, byte rate) must match the table, and an extensible format must
+ * really be as large as it claims. */
 #pragma code_seg("PAGE")
-BOOLEAN CPnMiniportWaveRT::IsFormatSupported(_In_ PKSDATAFORMAT Format)
+const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *CPnMiniportWaveRT::MatchFormat(_In_ PKSDATAFORMAT Format)
 {
     PAGED_CODE();
     PWAVEFORMATEX w = GetWaveFormatEx(Format);
-    if (!w) return FALSE;
-    if (!IsEqualGUIDAligned(Format->SubFormat, KSDATAFORMAT_SUBTYPE_PCM) && !IsEqualGUIDAligned(Format->SubFormat, KSDATAFORMAT_SUBTYPE_WAVEFORMATEX)) return FALSE;
+    if (!w) return NULL;
+    if (!IsEqualGUIDAligned(Format->SubFormat, KSDATAFORMAT_SUBTYPE_PCM) && !IsEqualGUIDAligned(Format->SubFormat, KSDATAFORMAT_SUBTYPE_WAVEFORMATEX)) return NULL;
     ULONG valid = w->wBitsPerSample;
-    if (w->wFormatTag == WAVE_FORMAT_EXTENSIBLE && w->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+    if (w->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        if (Format->FormatSize < sizeof(KSDATAFORMAT) + sizeof(WAVEFORMATEXTENSIBLE) || w->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) return NULL;
         PWAVEFORMATEXTENSIBLE x = (PWAVEFORMATEXTENSIBLE)w;
-        if (!IsEqualGUIDAligned(x->SubFormat, KSDATAFORMAT_SUBTYPE_PCM)) return FALSE;
+        if (!IsEqualGUIDAligned(x->SubFormat, KSDATAFORMAT_SUBTYPE_PCM)) return NULL;
         valid = x->Samples.wValidBitsPerSample;
     } else if (w->wFormatTag != WAVE_FORMAT_PCM) {
-        return FALSE;
+        return NULL;
     }
     for (ULONG i = 0; i < m_FormatCount; i++) {
         const WAVEFORMATEXTENSIBLE *f = &m_Formats[i].WaveFormatExt;
         if (f->Format.nSamplesPerSec == w->nSamplesPerSec && f->Format.nChannels == w->nChannels && f->Format.wBitsPerSample == w->wBitsPerSample &&
-            f->Samples.wValidBitsPerSample == valid) return TRUE;
+            f->Format.nBlockAlign == w->nBlockAlign && f->Format.nAvgBytesPerSec == w->nAvgBytesPerSec &&
+            f->Samples.wValidBitsPerSample == valid) return &m_Formats[i];
     }
-    return FALSE;
+    return NULL;
+}
+
+#pragma code_seg("PAGE")
+BOOLEAN CPnMiniportWaveRT::IsFormatSupported(_In_ PKSDATAFORMAT Format)
+{
+    PAGED_CODE();
+    return MatchFormat(Format) != NULL;
 }
 
 /* ---- miniport ---------------------------------------------------------------- */
@@ -294,6 +305,7 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRT::GetDeviceDescription(_Out_ PDEVICE_DE
 STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRT::GetModes(_In_ ULONG Pin, _Out_writes_opt_(*NumSignalProcessingModes) GUID *SignalProcessingModes, _Inout_ ULONG *NumSignalProcessingModes)
 {
     PAGED_CODE();
+    PN_VERB("GetModes pin %u capacity %u", Pin, *NumSignalProcessingModes);
     if (Pin != PN_WAVE_PIN_SYSTEM) { *NumSignalProcessingModes = 0; return STATUS_NOT_SUPPORTED; }
     if (SignalProcessingModes == NULL || *NumSignalProcessingModes < 1) { *NumSignalProcessingModes = 1; return SignalProcessingModes ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS; }
     SignalProcessingModes[0] = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
@@ -308,6 +320,7 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRT::DataRangeIntersection(_In_ ULONG PinI
 {
     PAGED_CODE();
     UNREFERENCED_PARAMETER(MatchingDataRange);
+    PN_VERB("intersection pin %u size %u output %u sub %08x", PinId, DataRange->FormatSize, OutputBufferLength, DataRange->SubFormat.Data1);
     *ResultantFormatLength = 0;
     if (PinId != PN_WAVE_PIN_SYSTEM) return STATUS_INVALID_PARAMETER;
     if (!IsEqualGUIDAligned(DataRange->MajorFormat, KSDATAFORMAT_TYPE_AUDIO) && !IsEqualGUIDAligned(DataRange->MajorFormat, KSDATAFORMAT_TYPE_WILDCARD)) return STATUS_NO_MATCH;
@@ -329,6 +342,7 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRT::DataRangeIntersection(_In_ ULONG PinI
     if (!pick) return STATUS_NO_MATCH;
 
     if (OutputBufferLength == 0) { *ResultantFormatLength = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE); return STATUS_BUFFER_OVERFLOW; }
+    if (!ResultantFormat) return STATUS_INVALID_PARAMETER;
     if (OutputBufferLength == sizeof(KSDATAFORMAT)) {
         RtlCopyMemory(ResultantFormat, &pick->DataFormat, sizeof(KSDATAFORMAT));
         ((PKSDATAFORMAT)ResultantFormat)->FormatSize = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE);
@@ -345,6 +359,7 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRT::DataRangeIntersection(_In_ ULONG PinI
 STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRT::NewStream(_Out_ PMINIPORTWAVERTSTREAM *Stream, _In_ PPORTWAVERTSTREAM PortStream, _In_ ULONG Pin, _In_ BOOLEAN Capture, _In_ PKSDATAFORMAT DataFormat)
 {
     PAGED_CODE();
+    PN_VERB("NewStream pin %u capture %u size %u", Pin, Capture, DataFormat ? DataFormat->FormatSize : 0);
     *Stream = NULL;
     if (Pin != PN_WAVE_PIN_SYSTEM || Capture) return STATUS_INVALID_PARAMETER;
     if (!IsFormatSupported(DataFormat)) {
@@ -357,6 +372,7 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRT::NewStream(_Out_ PMINIPORTWAVERTSTREAM
     if (!s) return STATUS_INSUFFICIENT_RESOURCES;
     s->AddRef();
     NTSTATUS status = s->Init(this, PortStream, Pin, DataFormat);
+    PN_VERB("stream Init returned 0x%08x", status);
     if (!NT_SUCCESS(status)) { s->Release(); return status; }
     m_Stream = s;
     *Stream = PMINIPORTWAVERTSTREAM(s);
@@ -365,7 +381,8 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRT::NewStream(_Out_ PMINIPORTWAVERTSTREAM
     return STATUS_SUCCESS;
 }
 
-VOID CPnMiniportWaveRT::StreamClosed(_In_ CPnMiniportWaveRTStream *Stream)
+#pragma code_seg()
+DECLSPEC_NOINLINE VOID CPnMiniportWaveRT::StreamClosed(_In_ CPnMiniportWaveRTStream *Stream)
 {
     KIRQL irql;
     KeAcquireSpinLock(&m_Lock, &irql);
@@ -381,10 +398,17 @@ NTSTATUS CPnMiniportWaveRT::PropertyProposedFormat(_In_ PPCPROPERTY_REQUEST Req)
     PAGED_CODE();
     if (Req->InstanceSize < sizeof(KSP_PIN) - RTL_SIZEOF_THROUGH_FIELD(KSP_PIN, Property)) return STATUS_INVALID_PARAMETER;
     PKSP_PIN kspPin = CONTAINING_RECORD(Req->Instance, KSP_PIN, PinId);
+    if (kspPin->PinId == PN_WAVE_PIN_BRIDGE) return STATUS_NOT_SUPPORTED;
     if (kspPin->PinId != PN_WAVE_PIN_SYSTEM) return STATUS_INVALID_PARAMETER;
     if (Req->Verb & KSPROPERTY_TYPE_BASICSUPPORT) return PnPropertyBasicSupport(Req, KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT, VT_ILLEGAL);
     if (Req->Verb & KSPROPERTY_TYPE_SET) {
-        if (Req->ValueSize < sizeof(KSDATAFORMAT)) return STATUS_INVALID_PARAMETER;
+        if (Req->ValueSize >= sizeof(KSDATAFORMAT)) {
+            PKSDATAFORMAT df = (PKSDATAFORMAT)Req->Value;
+            PN_VERB("propose pin %u size %u major %08x sub %08x spec %08x flags %x", kspPin->PinId, df->FormatSize, df->MajorFormat.Data1, df->SubFormat.Data1, df->Specifier.Data1, df->Flags);
+        }
+        if (Req->ValueSize == 0) { Req->ValueSize = sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE); return STATUS_BUFFER_OVERFLOW; }
+        if (Req->ValueSize < sizeof(KSDATAFORMAT) + sizeof(WAVEFORMATEX)) return STATUS_BUFFER_TOO_SMALL;
+        if (Req->ValueSize < ((PKSDATAFORMAT)Req->Value)->FormatSize) return STATUS_BUFFER_TOO_SMALL;
         return IsFormatSupported((PKSDATAFORMAT)Req->Value) ? STATUS_SUCCESS : STATUS_NO_MATCH;
     }
     return STATUS_INVALID_DEVICE_REQUEST;
@@ -422,6 +446,7 @@ NTSTATUS CPnMiniportWaveRT::PropertyProposedFormat2(_In_ PPCPROPERTY_REQUEST Req
 NTSTATUS CPnMiniportWaveRT::PropertyHandlerWaveFilter(_In_ PPCPROPERTY_REQUEST Req)
 {
     PAGED_CODE();
+    PN_VERB("wave property %u verb %08x instance %u value %u", Req->PropertyItem->Id, Req->Verb, Req->InstanceSize, Req->ValueSize);
     CPnMiniportWaveRT *w = reinterpret_cast<CPnMiniportWaveRT *>(Req->MajorTarget);
     if (!w) return STATUS_INVALID_PARAMETER;
     if (IsEqualGUIDAligned(*Req->PropertyItem->Set, KSPROPSETID_Pin)) {
@@ -499,6 +524,7 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::NonDelegatingQueryInterface(_In
     return STATUS_INVALID_PARAMETER;
 }
 
+#pragma code_seg()
 EXT_CALLBACK PnWaveTimerCallback;
 VOID PnWaveTimerCallback(_In_ PEX_TIMER Timer, _In_opt_ PVOID Context)
 {
@@ -511,25 +537,25 @@ VOID PnWaveTimerCallback(_In_ PEX_TIMER Timer, _In_opt_ PVOID Context)
 NTSTATUS CPnMiniportWaveRTStream::Init(_In_ CPnMiniportWaveRT *Miniport, _In_ PPORTWAVERTSTREAM PortStream, _In_ ULONG Pin, _In_ PKSDATAFORMAT DataFormat)
 {
     PAGED_CODE();
-    PWAVEFORMATEX w = GetWaveFormatEx(DataFormat);
-    if (!w) return STATUS_INVALID_PARAMETER;
+    const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *match = Miniport->MatchFormat(DataFormat);
+    if (!match) return STATUS_INVALID_PARAMETER;
     m_Miniport = Miniport;
     m_Miniport->AddRef();
     m_PortStream = PortStream;
     m_Pin = Pin;
     m_Device = Miniport->Device();
-    RtlZeroMemory(&m_Format, sizeof(m_Format));
-    if (w->wFormatTag == WAVE_FORMAT_EXTENSIBLE) RtlCopyMemory(&m_Format, w, sizeof(WAVEFORMATEXTENSIBLE));
-    else { m_Format.Format = *w; m_Format.Samples.wValidBitsPerSample = w->wBitsPerSample; m_Format.SubFormat = KSDATAFORMAT_SUBTYPE_PCM; }
+    /* our own table entry: block align and byte rate are known to be consistent and non-zero */
+    m_Format = match->WaveFormatExt;
     m_RateNumerator = m_Format.Format.nAvgBytesPerSec;
     KeQueryPerformanceCounter(&m_QpcFrequency);
     m_Timer = ExAllocateTimer(PnWaveTimerCallback, this, EX_TIMER_HIGH_RESOLUTION);
     if (!m_Timer) return STATUS_INSUFFICIENT_RESOURCES;
     BOOLEAN isFloat = IsEqualGUIDAligned(m_Format.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) ? TRUE : FALSE;
-    DeviceAudioStreamOpened(m_Device, m_Format.Format.nSamplesPerSec, m_Format.Format.nChannels, m_Format.Format.wBitsPerSample,
+    NTSTATUS status = DeviceAudioStreamOpened(m_Device, m_Format.Format.nSamplesPerSec, m_Format.Format.nChannels, m_Format.Format.wBitsPerSample,
                             m_Format.Samples.wValidBitsPerSample ? m_Format.Samples.wValidBitsPerSample : m_Format.Format.wBitsPerSample, isFloat);
+    if (!NT_SUCCESS(status)) return status;
     m_Registered = TRUE;
-    PN_INFO("wave stream opened: %u Hz %u ch %u/%u bit", m_Format.Format.nSamplesPerSec, m_Format.Format.nChannels,
+    PN_VERB("wave stream opened: %u Hz %u ch %u/%u bit", m_Format.Format.nSamplesPerSec, m_Format.Format.nChannels,
             m_Format.Samples.wValidBitsPerSample, m_Format.Format.wBitsPerSample);
     return STATUS_SUCCESS;
 }
@@ -541,25 +567,41 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::AllocateBufferWithNotification(
                                                                                 _Out_ ULONG *ActualSize, _Out_ ULONG *OffsetFromFirstPage, _Out_ MEMORY_CACHING_TYPE *CacheType)
 {
     PAGED_CODE();
+    if (!m_Format.Format.nBlockAlign || !m_RateNumerator) return STATUS_INVALID_DEVICE_STATE;
+    if (m_Mdl) return STATUS_INVALID_DEVICE_STATE;   /* one buffer per stream */
     if (RequestedSize == 0 || RequestedSize < m_Format.Format.nBlockAlign) return STATUS_UNSUCCESSFUL;
     if (NotificationCount == 0 || (RequestedSize % NotificationCount) != 0) return STATUS_INVALID_PARAMETER;
     RequestedSize -= RequestedSize % m_Format.Format.nBlockAlign;
+    if (RequestedSize / NotificationCount == 0) return STATUS_INVALID_PARAMETER;   /* Tick divides by the packet size */
     PHYSICAL_ADDRESS high; high.QuadPart = MAXULONG;
     PMDL mdl = m_PortStream->AllocatePagesForMdl(high, RequestedSize);
     if (!mdl) return STATUS_UNSUCCESSFUL;
-    m_Buffer = (PUCHAR)m_PortStream->MapAllocatedPages(mdl, MmCached);
-    if (!m_Buffer) { m_PortStream->FreePagesFromMdl(mdl); return STATUS_INSUFFICIENT_RESOURCES; }
-    m_Mdl = mdl;
-    m_BufferSize = RequestedSize;
-    m_Notifications = NotificationCount;
+    PUCHAR buffer = (PUCHAR)m_PortStream->MapAllocatedPages(mdl, MmCached);
+    if (!buffer) { m_PortStream->FreePagesFromMdl(mdl); return STATUS_INSUFFICIENT_RESOURCES; }
+    PublishBuffer(mdl, buffer, RequestedSize, NotificationCount);
     ULONGLONG bufferHns = (ULONGLONG)RequestedSize * PN_HNS_PER_SEC / m_RateNumerator;
     m_NotifyIntervalHns = (ULONG)(bufferHns / NotificationCount);
     *AudioBufferMdl = mdl;
     *ActualSize = RequestedSize;
     *OffsetFromFirstPage = 0;
     *CacheType = MmCached;
-    PN_INFO("wave buffer %u bytes, %u notifications (%u.%u ms each)", RequestedSize, NotificationCount, m_NotifyIntervalHns / 10000, (m_NotifyIntervalHns / 1000) % 10);
+    PN_VERB("wave buffer %u bytes, %u notifications (%u.%u ms each)", RequestedSize, NotificationCount, m_NotifyIntervalHns / 10000, (m_NotifyIntervalHns / 1000) % 10);
     return STATUS_SUCCESS;
+}
+
+/* The timer callback reads the buffer fields under m_Lock, so they are published and
+ * withdrawn under it too; a tick that is already copying finishes before the unmap. */
+#pragma code_seg()
+DECLSPEC_NOINLINE VOID CPnMiniportWaveRTStream::PublishBuffer(_In_opt_ PMDL Mdl, _In_opt_ PUCHAR Buffer, _In_ ULONG Size, _In_ ULONG Notifications)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&m_Lock, &irql);
+    m_Mdl = Mdl;
+    m_Buffer = Buffer;
+    m_BufferSize = Size;
+    m_Notifications = Notifications;
+    m_PlayPosition = 0;
+    KeReleaseSpinLock(&m_Lock, irql);
 }
 
 #pragma code_seg("PAGE")
@@ -567,13 +609,12 @@ STDMETHODIMP_(VOID) CPnMiniportWaveRTStream::FreeBufferWithNotification(_In_ PMD
 {
     PAGED_CODE();
     UNREFERENCED_PARAMETER(Size);
+    PUCHAR buffer = m_Buffer;
+    PublishBuffer(NULL, NULL, 0, 0);
     if (Mdl) {
-        if (m_Buffer) { m_PortStream->UnmapAllocatedPages(m_Buffer, Mdl); m_Buffer = NULL; }
+        if (buffer) m_PortStream->UnmapAllocatedPages(buffer, Mdl);
         m_PortStream->FreePagesFromMdl(Mdl);
     }
-    m_Mdl = NULL;
-    m_BufferSize = 0;
-    m_Notifications = 0;
 }
 
 #pragma code_seg("PAGE")
@@ -582,7 +623,7 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::AllocateAudioBuffer(_In_ ULONG 
 {
     PAGED_CODE();
     NTSTATUS status = AllocateBufferWithNotification(1, RequestedSize - (RequestedSize % PN_MAX(m_Format.Format.nBlockAlign, 1u)), AudioBufferMdl, ActualSize, OffsetFromFirstPage, CacheType);
-    m_Notifications = 0;   /* no event-driven mode */
+    if (NT_SUCCESS(status)) PublishBuffer(m_Mdl, m_Buffer, m_BufferSize, 0);   /* no event-driven mode */
     return status;
 }
 
@@ -593,10 +634,9 @@ STDMETHODIMP_(VOID) CPnMiniportWaveRTStream::FreeAudioBuffer(_In_opt_ PMDL Mdl, 
     FreeBufferWithNotification(Mdl, Size);
 }
 
-#pragma code_seg("PAGE")
+#pragma code_seg()
 STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::RegisterNotificationEvent(_In_ PKEVENT NotificationEvent)
 {
-    PAGED_CODE();
     PN_NOTIFY_ENTRY *e = (PN_NOTIFY_ENTRY *)PnAllocNp(sizeof(*e), PNA2DP_TAG_AUDIO);
     if (!e) return STATUS_INSUFFICIENT_RESOURCES;
     e->Event = NotificationEvent;
@@ -610,10 +650,9 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::RegisterNotificationEvent(_In_ 
     return STATUS_SUCCESS;
 }
 
-#pragma code_seg("PAGE")
+#pragma code_seg()
 STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::UnregisterNotificationEvent(_In_ PKEVENT NotificationEvent)
 {
-    PAGED_CODE();
     KIRQL irql;
     KeAcquireSpinLock(&m_Lock, &irql);
     for (PLIST_ENTRY l = m_NotifyList.Flink; l != &m_NotifyList; l = l->Flink) {
@@ -633,11 +672,11 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::GetPositionRegister(_Out_ KSRTA
 STDMETHODIMP_(VOID) CPnMiniportWaveRTStream::GetHWLatency(_Out_ KSRTAUDIO_HWLATENCY *hwLatency)
 {
     PAGED_CODE();
-    ULONG us = m_Device ? PumpEstimatedLatencyUs(&m_Device->Pump) + m_Device->Avdtp.SinkDelayTenthsMs * 100 : 0;
-    if (us == 0) us = 100000;   /* typical Bluetooth path before measurements exist */
-    hwLatency->FifoSize = (ULONG)((ULONGLONG)m_RateNumerator * 20 / 1000);   /* ~20 ms of PCM in flight */
-    hwLatency->ChipsetDelay = us * 10;                                      /* 100 ns units */
-    hwLatency->CodecDelay = 0;
+    /* This software WaveRT endpoint has no DMA FIFO or chipset latency. Windows
+     * requires their combined lead to fit inside its cyclic buffer. Reporting
+     * the Bluetooth queue here made every 20 ms format probe fail. Downstream
+     * transport latency is tracked by the pump and presentation position. */
+    RtlZeroMemory(hwLatency, sizeof(*hwLatency));
 }
 
 #pragma code_seg("PAGE")
@@ -651,29 +690,40 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::SetState(_In_ KSSTATE State)
     KIRQL irql;
     switch (State) {
     case KSSTATE_STOP:
-        if (m_Timer) ExCancelTimer(m_Timer, NULL);
         KeAcquireSpinLock(&m_Lock, &irql);
+        m_State = State;   /* a tick that is already queued sees this and does nothing */
         m_LinearPosition = 0; m_PlayPosition = 0; m_PacketCounter = 0; m_LastOsWritePacket = ULONG_MAX; m_CurrentWritePosition = 0; m_Eos = FALSE;
         m_ByteRemainderHns = 0; m_NotifyAccumHns = 0;
         KeReleaseSpinLock(&m_Lock, irql);
+        if (m_Timer) ExCancelTimer(m_Timer, NULL);
         if (m_Device) DeviceAudioStateChanged(m_Device, PnAudioStop);
         break;
     case KSSTATE_ACQUIRE:
+        KeAcquireSpinLock(&m_Lock, &irql);
+        m_State = State;
+        KeReleaseSpinLock(&m_Lock, irql);
         break;
-    case KSSTATE_PAUSE:
-        if (m_State == KSSTATE_RUN && m_Timer) ExCancelTimer(m_Timer, NULL);
+    case KSSTATE_PAUSE: {
+        KeAcquireSpinLock(&m_Lock, &irql);
+        BOOLEAN wasRunning = (m_State == KSSTATE_RUN);
+        m_State = State;
+        KeReleaseSpinLock(&m_Lock, irql);
+        if (wasRunning && m_Timer) ExCancelTimer(m_Timer, NULL);
         if (m_Device) DeviceAudioStateChanged(m_Device, PnAudioPause);
         break;
+    }
     case KSSTATE_RUN:
         KeAcquireSpinLock(&m_Lock, &irql);
         m_StartTimeHns = m_LastTickHns = PnNowHns();
         m_ByteRemainderHns = 0;
+        m_State = State;
         KeReleaseSpinLock(&m_Lock, irql);
         if (m_Device) DeviceAudioStateChanged(m_Device, PnAudioRun);
         if (m_Timer) ExSetTimer(m_Timer, -PN_HNS_PER_MS, PN_HNS_PER_MS, NULL);
         break;
+    default:
+        return STATUS_INVALID_PARAMETER;
     }
-    m_State = State;
     return STATUS_SUCCESS;
 }
 
@@ -685,12 +735,20 @@ VOID CPnMiniportWaveRTStream::Tick()
     KeAcquireSpinLock(&m_Lock, &irql);
     if (m_State != KSSTATE_RUN || !m_Buffer || !m_BufferSize) { KeReleaseSpinLock(&m_Lock, irql); return; }
     LONGLONG now = PnNowHns();
+    if (m_Device && now > m_LastTickHns) {
+        ULONGLONG tickHns = (ULONGLONG)(now - m_LastTickHns);
+        ULONG tickUs = (ULONG)PN_MIN(tickHns / 10, (ULONGLONG)MAXULONG);
+        m_Device->Pump.Stats.WaveMaxTickUs = PN_MAX(m_Device->Pump.Stats.WaveMaxTickUs, tickUs);
+        if (m_NotifyIntervalHns && tickHns > m_NotifyIntervalHns) m_Device->Pump.Stats.WaveLateTicks++;
+    }
     LONGLONG elapsed = now - m_LastTickHns + (LONGLONG)m_ByteRemainderHns;
     m_LastTickHns = now;
-    /* bytes = elapsed * rate / 1e7, carry the remainder in time units */
-    ULONGLONG bytes = (ULONGLONG)elapsed * m_RateNumerator / PN_HNS_PER_SEC;
-    m_ByteRemainderHns = (ULONGLONG)elapsed - (bytes * PN_HNS_PER_SEC / m_RateNumerator);
-    bytes -= bytes % m_Format.Format.nBlockAlign;
+    if (elapsed < 0) elapsed = 0;
+    /* whole frames due since the last tick; the time of the partial frame is carried */
+    ULONGLONG rate = m_Format.Format.nSamplesPerSec;
+    ULONGLONG frames = (ULONGLONG)elapsed * rate / PN_HNS_PER_SEC;
+    m_ByteRemainderHns = (ULONGLONG)elapsed - (frames * PN_HNS_PER_SEC / rate);
+    ULONGLONG bytes = frames * m_Format.Format.nBlockAlign;
     if (m_Eos) {
         /* do not run past the last written position */
         ULONG avail = (ULONG)((m_CurrentWritePosition + m_BufferSize - (ULONG)m_PlayPosition) % m_BufferSize);
@@ -730,10 +788,10 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::GetPosition(_Out_ PKSAUDIO_POSI
 
 STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::SetWritePacket(_In_ ULONG PacketNumber, _In_ DWORD Flags, _In_ ULONG EosPacketLength)
 {
-    if (m_Notifications == 0 || m_BufferSize == 0) return STATUS_NOT_SUPPORTED;
-    if (m_Eos) return STATUS_INVALID_DEVICE_STATE;
     KIRQL irql;
     KeAcquireSpinLock(&m_Lock, &irql);
+    if (m_Notifications == 0 || m_BufferSize < m_Notifications) { KeReleaseSpinLock(&m_Lock, irql); return STATUS_NOT_SUPPORTED; }
+    if (m_Eos) { KeReleaseSpinLock(&m_Lock, irql); return STATUS_INVALID_DEVICE_STATE; }
     ULONG packetSize = m_BufferSize / m_Notifications;
     ULONG expected = (ULONG)m_PacketCounter + (m_State == KSSTATE_RUN ? 1 : 0);
     LONG delta = (LONG)(PacketNumber - expected);

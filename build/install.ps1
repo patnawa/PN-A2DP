@@ -16,6 +16,7 @@ param(
     [string]$Package = (Join-Path $PSScriptRoot '..\out\Release\package'),
     [string]$Device = '',
     [switch]$Uninstall,
+    [switch]$AllowTestDriver,
     [switch]$NoService
 )
 $ErrorActionPreference = 'Stop'
@@ -23,7 +24,8 @@ $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw "run this script from an elevated PowerShell" }
 
 $sinkClass = 'BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}'
-$devices = Get-PnpDevice -PresentOnly:$false | Where-Object { $_.InstanceId -like "$sinkClass*" }
+# plain Get-PnpDevice returns present and non-present nodes; -PresentOnly:$false returns only non-present ones
+$devices = Get-PnpDevice | Where-Object { $_.InstanceId -like "$sinkClass*" }
 if ($Device) { $devices = $devices | Where-Object { $_.InstanceId -eq $Device } }
 if (-not $devices) { throw "no A2DP sink device nodes found; pair a Bluetooth headset first" }
 
@@ -39,6 +41,18 @@ if ($Uninstall) {
 
 $inf = Join-Path $Package 'pna2dp.inf'
 if (-not (Test-Path $inf)) { throw "driver package not found: $inf" }
+
+# The portable installer exposes the same read-only verifier used by the wizard.
+# Check before staging, replacing files or touching a device. Development use
+# requires an explicit opt-in and an already prepared test machine.
+$verifier = Join-Path (Split-Path ([IO.Path]::GetFullPath($Package))) 'pna2dp-setup.exe'
+if (!(Test-Path -LiteralPath $verifier)) { throw 'Build the installer first (-Target setup), or use a complete portable distribution.' }
+$verifyReport = Join-Path ([IO.Path]::GetTempPath()) ('pna2dp-install-preflight-' + [guid]::NewGuid() + '.txt')
+$verifyArgs = @('--verify-package', ('"' + [IO.Path]::GetFullPath($Package) + '"'), '--report', ('"' + $verifyReport + '"'))
+if ($AllowTestDriver) { $verifyArgs += '--allow-test-driver' }
+$verifyProcess = Start-Process -FilePath $verifier -ArgumentList $verifyArgs -WindowStyle Hidden -PassThru
+if (!$verifyProcess.WaitForExit(60000)) { $verifyProcess.Kill(); throw 'Package verification timed out.' }
+if ($verifyProcess.ExitCode -ne 0) { throw "Driver verification failed. $(Get-Content -LiteralPath $verifyReport -Raw)" }
 
 # stage in the driver store
 $result = pnputil /add-driver $inf
@@ -59,12 +73,14 @@ foreach ($d in $devices) {
 }
 
 if (-not $NoService) {
-    $host = Join-Path $Package '..\pna2dp-codechost.exe'
-    if (Test-Path $host) {
+    $hostExe = Join-Path $Package '..\pna2dp-codechost.exe'   # ($host is a read-only automatic variable)
+    if (Test-Path $hostExe) {
         $dst = "$env:ProgramFiles\PN-A2DP"
         New-Item -ItemType Directory -Force $dst | Out-Null
-        Copy-Item $host $dst -Force
+        Copy-Item $hostExe $dst -Force
         Get-ChildItem (Join-Path $Package '..') -Filter 'pna2dp-codec-*.dll' | Copy-Item -Destination $dst -Force
+        Get-ChildItem (Join-Path $Package '..') -Filter 'freeaptx.dll' | Copy-Item -Destination $dst -Force
+        Get-ChildItem (Join-Path $Package '..') -Filter 'pna2dp-panel.exe' | Copy-Item -Destination $dst -Force
         Get-ChildItem (Join-Path $Package '..') -Filter 'pna2dpctl.exe' | Copy-Item -Destination $dst -Force
         & "$dst\pna2dp-codechost.exe" --uninstall 2>$null | Out-Null
         & "$dst\pna2dp-codechost.exe" --install

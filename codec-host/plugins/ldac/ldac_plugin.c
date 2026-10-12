@@ -60,7 +60,10 @@ static int LdacChannelMode(uint32_t mode)
 
 static PnCodecEncoder *LdacOpen(const PNA2DP_STREAM_PARAMS *p)
 {
-    if (p->Codec != PNA2DP_CODEC_LDAC) return NULL;
+    if (p->Codec != PNA2DP_CODEC_LDAC || (p->Channels != 1 && p->Channels != 2) ||
+        (p->ChannelMode != PNA2DP_CHMODE_MONO && p->ChannelMode != PNA2DP_CHMODE_DUAL && p->ChannelMode != PNA2DP_CHMODE_STEREO) ||
+        p->Channels != (p->ChannelMode == PNA2DP_CHMODE_MONO ? 1u : 2u) ||
+        p->MediaMtu > LDAC_MAX_PACKET || p->MediaMtu < 666) return NULL;
     PnCodecEncoder *e = (PnCodecEncoder *)calloc(1, sizeof(*e));
     if (!e) return NULL;
     e->h = ldacBT_get_handle();
@@ -69,7 +72,8 @@ static PnCodecEncoder *LdacOpen(const PNA2DP_STREAM_PARAMS *p)
     case PNA2DP_FMT_S16: e->fmt = LDACBT_SMPL_FMT_S16; e->bytes_per_sample = 2; break;
     case PNA2DP_FMT_S24: e->fmt = LDACBT_SMPL_FMT_S24; e->bytes_per_sample = 3; break;
     case PNA2DP_FMT_F32: e->fmt = LDACBT_SMPL_FMT_F32; e->bytes_per_sample = 4; break;
-    default:             e->fmt = LDACBT_SMPL_FMT_S32; e->bytes_per_sample = 4; break;
+    case PNA2DP_FMT_S32: e->fmt = LDACBT_SMPL_FMT_S32; e->bytes_per_sample = 4; break;
+    default: ldacBT_free_handle(e->h); free(e); return NULL;
     }
     e->rate = p->SampleRate;
     e->channels = p->Channels ? p->Channels : 2;
@@ -90,21 +94,22 @@ static PnCodecEncoder *LdacOpen(const PNA2DP_STREAM_PARAMS *p)
     return e;
 }
 
-static void QueuePacket(PnCodecEncoder *e, const uint8_t *data, uint32_t len, uint32_t frames)
+static int QueuePacket(PnCodecEncoder *e, const uint8_t *data, uint32_t len, uint32_t frames)
 {
-    if (e->pending_count >= LDAC_MAX_PENDING || len > LDAC_MAX_PACKET) return;   /* drop: should never happen */
+    if (e->pending_count >= LDAC_MAX_PENDING || len > e->mtu || !frames || frames > 15) return -1;
     ldac_packet *q = &e->pending[(e->pending_head + e->pending_count) % LDAC_MAX_PENDING];
     memcpy(q->data, data, len);
     q->len = len;
     q->frames = frames;
     e->pending_count++;
+    return 0;
 }
 
 static int PopPacket(PnCodecEncoder *e, PnCodecOutput *out)
 {
     if (!e->pending_count) return 0;
     ldac_packet *q = &e->pending[e->pending_head];
-    if (q->len > out->capacity) return 0;
+    if (q->len > out->capacity) return -1;
     memcpy(out->buffer, q->data, q->len);
     out->written = q->len;
     out->frame_count = q->frames;
@@ -115,17 +120,19 @@ static int PopPacket(PnCodecEncoder *e, PnCodecOutput *out)
     return 1;
 }
 
-static void EncodeFrame(PnCodecEncoder *e, const uint8_t *frame)
+static int EncodeFrame(PnCodecEncoder *e, const uint8_t *frame)
 {
     uint8_t packet[LDAC_MAX_PACKET];
     int pcm_used = 0, stream_wrote = 0, frame_num = 0;
-    if (ldacBT_encode(e->h, (void *)frame, &pcm_used, packet, &stream_wrote, &frame_num) != 0) return;
-    if (stream_wrote > 0) QueuePacket(e, packet, (uint32_t)stream_wrote, (uint32_t)frame_num);
+    if (ldacBT_encode(e->h, (void *)frame, &pcm_used, packet, &stream_wrote, &frame_num) != 0 ||
+        pcm_used != (int)e->frame_bytes || stream_wrote < 0) return -1;
+    return stream_wrote ? QueuePacket(e, packet, (uint32_t)stream_wrote, (uint32_t)frame_num) : 0;
 }
 
 static int LdacEncode(PnCodecEncoder *e, const uint8_t *pcm, uint32_t pcm_bytes, uint32_t pcm_frames, PnCodecOutput *out)
 {
-    (void)pcm_frames;
+    uint32_t stride = e->channels * e->bytes_per_sample;
+    if (pcm_bytes % stride || pcm_bytes / stride != pcm_frames) return -1;
     uint32_t pos = 0;
     out->written = 0;
     out->frame_count = 0;
@@ -138,17 +145,20 @@ static int LdacEncode(PnCodecEncoder *e, const uint8_t *pcm, uint32_t pcm_bytes,
         memcpy(e->leftover + e->leftover_bytes, pcm, take);
         e->leftover_bytes += take;
         pos += take;
-        if (e->leftover_bytes == e->frame_bytes) { EncodeFrame(e, e->leftover); e->leftover_bytes = 0; }
+        if (e->leftover_bytes == e->frame_bytes) {
+            if (EncodeFrame(e, e->leftover) != 0) return -1;
+            e->leftover_bytes = 0;
+        }
     }
     while (pos + e->frame_bytes <= pcm_bytes) {
-        EncodeFrame(e, pcm + pos);
+        if (EncodeFrame(e, pcm + pos) != 0) return -1;
         pos += e->frame_bytes;
     }
     if (pos < pcm_bytes) {
         uint32_t rest = pcm_bytes - pos;
         if (rest <= sizeof(e->leftover)) { memcpy(e->leftover, pcm + pos, rest); e->leftover_bytes = rest; }
     }
-    PopPacket(e, out);   /* zero-length output is legal: the driver sends nothing */
+    if (PopPacket(e, out) < 0) return -1;   /* zero-length output is legal: the driver sends nothing */
     out->actual_bitrate_bps = (uint32_t)ldacBT_get_bitrate(e->h) * 1000u;
     return 0;
 }
@@ -159,8 +169,9 @@ static int LdacReconfigure(PnCodecEncoder *e, uint32_t quality, uint32_t bitrate
     if (quality == PNA2DP_LDAC_EQMID_ABR) { e->abr_enabled = 1; return 0; }
     e->abr_enabled = 0;
     if (quality <= 2 && (int)quality != e->eqmid) {
-        e->eqmid = (int)quality;
-        return ldacBT_set_eqmid(e->h, e->eqmid);
+        int result = ldacBT_set_eqmid(e->h, (int)quality);
+        if (result == 0) e->eqmid = (int)quality;
+        return result;
     }
     return 0;
 }

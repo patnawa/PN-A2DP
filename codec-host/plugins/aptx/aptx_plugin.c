@@ -29,6 +29,7 @@ static PnCodecEncoder *AptxOpen(const PNA2DP_STREAM_PARAMS *p)
 {
     if (p->Codec != PNA2DP_CODEC_APTX && p->Codec != PNA2DP_CODEC_APTX_HD && p->Codec != PNA2DP_CODEC_APTX_LL) return NULL;
     if (p->PcmFormat != PNA2DP_FMT_S24 || p->Channels != 2) return NULL;   /* libfreeaptx: 24-bit stereo, 3 bytes per sample little endian */
+    if (p->MediaMtu < (p->Codec == PNA2DP_CODEC_APTX_HD ? 12u : 8u)) return NULL;
     PnCodecEncoder *e = (PnCodecEncoder *)calloc(1, sizeof(*e));
     if (!e) return NULL;
     e->hd = (p->Codec == PNA2DP_CODEC_APTX_HD);
@@ -45,11 +46,11 @@ static int AptxEncode(PnCodecEncoder *e, const uint8_t *pcm, uint32_t pcm_bytes,
     size_t written = 0;
     uint32_t blocks = pcm_frames / 4;
     uint32_t max_blocks = e->mtu / e->block_bytes;
-    if (blocks > max_blocks) blocks = max_blocks;
-    if (blocks * e->block_bytes > out->capacity) blocks = out->capacity / e->block_bytes;
+    if (pcm_frames % 4 || blocks > max_blocks || blocks > out->capacity / e->block_bytes ||
+        pcm_bytes / 6 != pcm_frames || pcm_bytes % 6) return -1;
     size_t in_bytes = (size_t)blocks * 4 * e->channels * 3;
-    if (in_bytes > pcm_bytes) in_bytes = pcm_bytes - (pcm_bytes % (4 * 3 * e->channels));
     size_t consumed = aptx_encode(e->ctx, pcm, in_bytes, out->buffer, out->capacity, &written);
+    if (consumed != in_bytes) return -1; // the driver cannot re-feed a partially consumed block
     out->written = (uint32_t)written;
     out->frame_count = (uint32_t)(written / e->block_bytes);
     out->pcm_frames_consumed = (uint32_t)(consumed / (3 * e->channels));

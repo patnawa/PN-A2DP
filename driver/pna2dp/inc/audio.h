@@ -29,6 +29,12 @@ enum {
 #define PN_VOLUME_MAX_DB16      0
 #define PN_VOLUME_STEP_DB16     0x8000
 
+/* Windows Bluetooth service's KS absolute-volume bridge (property/event ID 1).
+ * Also implemented by the inbox btha2dp driver. Remote gain becomes active only
+ * after the service reports a receiver volume through SET. */
+DEFINE_GUID(PN_KSPROPSETID_BluetoothVolume, 0x401e566b, 0xb47e, 0x4e34, 0xb0, 0xfc, 0x94, 0x82, 0x6e, 0x9e, 0x2a, 0x1a);
+#define PN_REMOTE_VOLUME_MIN_DB16 (-63 * 65536 - 32768)
+
 /* ------------------------------------------------------------------------- */
 /* Adapter common object                                                      */
 /* ------------------------------------------------------------------------- */
@@ -39,7 +45,7 @@ DECLARE_INTERFACE_(IPnAdapterCommon, IUnknown)
     STDMETHOD_(NTSTATUS, Init)(THIS_ _In_ PDEVICE_OBJECT DeviceObject, _In_ PDRIVER_OBJECT DriverObject) PURE;
     STDMETHOD_(PDEVICE_OBJECT, GetDeviceObject)(THIS) PURE;
     STDMETHOD_(PPNA2DP_DEVICE, GetDevice)(THIS) PURE;
-    STDMETHOD_(NTSTATUS, InstallFilters)(THIS_ _In_ PIRP Irp) PURE;
+    STDMETHOD_(NTSTATUS, InstallFilters)(THIS_ _In_ PIRP Irp, _In_ PRESOURCELIST Resources) PURE;
     STDMETHOD_(VOID, RemoveFilters)(THIS) PURE;
     STDMETHOD_(LONG, GetVolume)(THIS_ _In_ ULONG Channel) PURE;
     STDMETHOD_(VOID, SetVolume)(THIS_ _In_ ULONG Channel, _In_ LONG Db16) PURE;
@@ -60,11 +66,12 @@ class CPnAdapterCommon : public IPnAdapterCommon, public IAdapterPowerManagement
     PUNKNOWN            m_WavePort;
     PUNKNOWN            m_TopoPort;
     CPnMiniportWaveRT  *m_Wave;
+    CPnMiniportTopology *m_Topology;
     LONG                m_Volume[2];
     BOOL                m_Mute[2];
     DEVICE_POWER_STATE  m_PowerState;
 
-    NTSTATUS InstallSubdevice(_In_ PIRP Irp, _In_ PCWSTR Name, _In_ REFGUID PortClassId,
+    NTSTATUS InstallSubdevice(_In_ PIRP Irp, _In_ PRESOURCELIST Resources, _In_ PCWSTR Name, _In_ REFGUID PortClassId,
                               _In_ PUNKNOWN Miniport, _Out_ PUNKNOWN *OutPort);
     NTSTATUS UnregisterSubdevice(_In_opt_ PUNKNOWN Port);
 
@@ -76,7 +83,7 @@ public:
     STDMETHODIMP_(NTSTATUS) Init(_In_ PDEVICE_OBJECT DeviceObject, _In_ PDRIVER_OBJECT DriverObject);
     STDMETHODIMP_(PDEVICE_OBJECT) GetDeviceObject();
     STDMETHODIMP_(PPNA2DP_DEVICE) GetDevice();
-    STDMETHODIMP_(NTSTATUS) InstallFilters(_In_ PIRP Irp);
+    STDMETHODIMP_(NTSTATUS) InstallFilters(_In_ PIRP Irp, _In_ PRESOURCELIST Resources);
     STDMETHODIMP_(VOID) RemoveFilters();
     STDMETHODIMP_(LONG) GetVolume(_In_ ULONG Channel);
     STDMETHODIMP_(VOID) SetVolume(_In_ ULONG Channel, _In_ LONG Db16);
@@ -89,6 +96,9 @@ public:
 
     WDFDEVICE GetWdfDevice() { return m_WdfDevice; }
     PDEVICE_OBJECT GetPdo() { return m_Pdo; }
+    VOID SetTopologyMiniport(_In_opt_ CPnMiniportTopology *Topology) { m_Topology = Topology; }
+    VOID SetRemoteVolume(_In_ LONG Db16);
+    VOID DisableRemoteVolume();
 };
 
 NTSTATUS NewPnAdapterCommon(_Out_ PUNKNOWN *Unknown, _In_ REFCLSID, _In_opt_ PUNKNOWN UnknownOuter, _In_ POOL_FLAGS PoolFlags);
@@ -123,6 +133,9 @@ class CPnMiniportWaveRT : public IMiniportWaveRT, public IMiniportAudioSignalPro
     BOOLEAN  IsFormatSupported(_In_ PKSDATAFORMAT Format);
 
 public:
+    const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *MatchFormat(_In_ PKSDATAFORMAT Format);
+
+public:
     DECLARE_STD_UNKNOWN();
     CPnMiniportWaveRT(_In_opt_ PUNKNOWN UnknownOuter);
     ~CPnMiniportWaveRT();
@@ -138,7 +151,6 @@ public:
     PPNA2DP_DEVICE Device() { return m_Device; }
     PPNADAPTERCOMMON Adapter() { return m_Adapter; }
     VOID GeneratePinCapsChange();
-    VOID RebuildFormats();
 };
 
 NTSTATUS NewPnMiniportWaveRT(_Out_ PUNKNOWN *Unknown, _In_ PPNADAPTERCOMMON Adapter, _In_ POOL_FLAGS PoolFlags);
@@ -188,6 +200,7 @@ class CPnMiniportWaveRTStream : public IMiniportWaveRTStreamNotification,
     LARGE_INTEGER           m_QpcFrequency;
 
     VOID Tick();
+    VOID PublishBuffer(_In_opt_ PMDL Mdl, _In_opt_ PUCHAR Buffer, _In_ ULONG Size, _In_ ULONG Notifications);
 
 public:
     DECLARE_STD_UNKNOWN();
@@ -210,6 +223,9 @@ class CPnMiniportTopology : public IMiniportTopology, public CUnknown
     PPNADAPTERCOMMON    m_Adapter;
     PPORTTOPOLOGY       m_Port;
     PPORTEVENTS         m_PortEvents;
+    LONG                m_RemoteListeners;
+    PCFILTER_DESCRIPTOR m_Filter;
+    PCPIN_DESCRIPTOR    m_Pins[2];
 
 public:
     DECLARE_STD_UNKNOWN();
@@ -220,10 +236,13 @@ public:
 
     static NTSTATUS PropertyHandlerTopoNode(_In_ PPCPROPERTY_REQUEST Req);
     static NTSTATUS PropertyHandlerTopoFilter(_In_ PPCPROPERTY_REQUEST Req);
+    static NTSTATUS EventHandlerControlChange(_In_ PPCEVENT_REQUEST Req);
+    NTSTATUS HandleRemoteVolume(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS HandleVolume(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS HandleMute(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS HandleJack(_In_ PPCPROPERTY_REQUEST Req);
     VOID GenerateVolumeEvent();
+    VOID GenerateRemoteVolumeEvent();
 };
 
 NTSTATUS NewPnMiniportTopology(_Out_ PUNKNOWN *Unknown, _In_ PPNADAPTERCOMMON Adapter, _In_ POOL_FLAGS PoolFlags);

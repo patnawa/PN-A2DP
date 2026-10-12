@@ -2,11 +2,16 @@
  * rtp.cpp - RTP header writer/parser for A2DP media packets.
  * SPDX-License-Identifier: MIT
  */
-#include "pna2dp.h"
+#include "codec_core.h"
 
 VOID RtpInit(_Out_ PRTP_STATE R, _In_ UCHAR PayloadType)
 {
-    LARGE_INTEGER t = KeQueryPerformanceCounter(NULL);
+    LARGE_INTEGER t;
+#ifdef _KERNEL_MODE
+    t = KeQueryPerformanceCounter(NULL);
+#else
+    QueryPerformanceCounter(&t);
+#endif
     RtlZeroMemory(R, sizeof(*R));
     R->PayloadType = PayloadType;
     R->Sequence = (USHORT)(t.LowPart & 0xFFFF);
@@ -36,6 +41,7 @@ VOID RtpWriteHeader(_Inout_ PRTP_STATE R, _Out_writes_bytes_(RTP_HEADER_SIZE) PU
 BOOLEAN RtpParseHeader(_In_reads_bytes_(Len) const UCHAR *In, _In_ ULONG Len, _Out_ PUSHORT Seq, _Out_ PULONG Timestamp,
                        _Out_ PULONG HeaderLen)
 {
+    *Seq = 0; *Timestamp = 0; *HeaderLen = 0;
     if (Len < RTP_HEADER_SIZE) return FALSE;
     if ((In[0] >> 6) != RTP_VERSION) return FALSE;
     ULONG cc = In[0] & 0x0F;
@@ -43,7 +49,7 @@ BOOLEAN RtpParseHeader(_In_reads_bytes_(Len) const UCHAR *In, _In_ ULONG Len, _O
     ULONG hdr = RTP_HEADER_SIZE + cc * 4;
     if (Len < hdr) return FALSE;
     if (ext) {
-        if (Len < hdr + 4) return FALSE;
+        if (Len - hdr < 4) return FALSE;
         ULONG extWords = ((ULONG)In[hdr + 2] << 8) | In[hdr + 3];
         hdr += 4 + extWords * 4;
         if (Len < hdr) return FALSE;

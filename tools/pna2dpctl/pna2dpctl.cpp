@@ -29,6 +29,10 @@
 #include <string>
 #include <vector>
 #include "pna2dp_public.h"
+#include "../common/pnctl.h"
+#include "../common/pnspatial.h"
+#include "../common/pnaudio.h"
+#include "../common/pndrv.h"
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
@@ -97,6 +101,7 @@ static void PrintStatus(HANDLE h)
     PNA2DP_STATUS s = {};
     if (!Ioctl(h, IOCTL_PNA2DP_GET_STATUS, NULL, 0, &s, sizeof(s))) return;
     printf("device      : %ls (%012llX)\n", s.RemoteName, s.RemoteAddress);
+    printf("volume mode : %s\n", (s.Flags & PNA2DP_STATUS_FLAG_REMOTE_VOLUME) ? "receiver absolute volume" : "software fallback");
     printf("state       : %s%s%s%s%s\n", StateName(s.State), (s.Flags & PNA2DP_STATUS_FLAG_SCO_ACTIVE) ? " [SCO active]" : "",
            (s.Flags & PNA2DP_STATUS_FLAG_AUDIO_ACTIVE) ? " [audio running]" : "", (s.Flags & PNA2DP_STATUS_FLAG_REMOTE_INITIATED) ? " [remote initiated]" : "",
            (s.Flags & PNA2DP_STATUS_FLAG_HOST_MISSING) ? " [codec host missing]" : "");
@@ -143,6 +148,7 @@ static void PrintConfig(const PNA2DP_CONFIG &c)
            (c.Flags & PNA2DP_CFG_EXPOSE_ALL_RATES) ? " all-rates" : "", (c.Flags & PNA2DP_CFG_SOFTWARE_VOLUME) ? " sw-volume" : "",
            (c.Flags & PNA2DP_CFG_DELAY_REPORTING) ? " delay-reporting" : "", (c.Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) ? " prefer-dual" : "",
            (c.Flags & PNA2DP_CFG_HOST_CODECS_ONLY) ? " host-only" : "");
+    printf("auto quality   : %s\n", (c.Flags & PNA2DP_CFG_AUTO_QUALITY) ? "enabled" : "disabled");
     printf("latency        : target %u ms, max %u ms, ABR floor %u kbps\n", c.TargetLatencyMs, c.MaxLatencyMs, c.AbrFloorBps / 1000);
     printf("SBC            : bitpool %u..%u%s, rates %s, modes 0x%02x, blocks 0x%02x, subbands 0x%02x, alloc 0x%02x\n", c.Sbc.MinBitpool, c.Sbc.MaxBitpool,
            c.Sbc.AllowBitpoolOverride ? " (override allowed)" : "", c.Sbc.RateMask ? "custom" : "any", c.Sbc.ChannelModeMask, c.Sbc.BlockMask, c.Sbc.SubbandMask, c.Sbc.AllocMask);
@@ -157,6 +163,7 @@ static void PrintStats(HANDLE h)
     PNA2DP_STATS s = {};
     if (!Ioctl(h, IOCTL_PNA2DP_GET_STATS, NULL, 0, &s, sizeof(s))) return;
     printf("pcm frames consumed : %llu\n", s.PcmFramesConsumed);
+    printf("transport waits     : %u   WaveRT late ticks %u, max %u us\n", s.TransportWaits, s.WaveLateTicks, s.WaveMaxTickUs);
     printf("packets sent        : %llu (%llu bytes, %llu codec frames)\n", s.PacketsSent, s.BytesSent, s.EncodedFrames);
     printf("packets dropped     : %llu   write failures %llu   latency trims %llu\n", s.PacketsDropped, s.WriteFailures, s.Underruns);
     printf("tx queue            : %u now, %u max   completion avg %u us max %u us\n", s.QueueDepthPackets, s.QueueDepthMaxPackets, s.TxCompletionAvgUs, s.TxCompletionMaxUs);
@@ -233,19 +240,57 @@ static int DoSet(HANDLE h, int argc, char **argv, int start)
         else if (!_stricmp(k, "delayreport")) flag(PNA2DP_CFG_DELAY_REPORTING);
         else if (!_stricmp(k, "suspendonsco")) flag(PNA2DP_CFG_SUSPEND_ON_SCO);
         else if (!_stricmp(k, "hostonly")) flag(PNA2DP_CFG_HOST_CODECS_ONLY);
+        else if (!_stricmp(k, "autoquality")) flag(PNA2DP_CFG_AUTO_QUALITY);
+        else if (!_stricmp(k, "abrfloor")) c.AbrFloorBps = (ULONG)strtoul(v, NULL, 10);
         else if (!_stricmp(k, "applylive")) flag(PNA2DP_CFG_APPLY_LIVE);
         else { fprintf(stderr, "unknown key %s\n", k); return 1; }
     }
     if (!Ioctl(h, IOCTL_PNA2DP_SET_CONFIG, &c, sizeof(c), NULL, 0)) return 1;
+    if (!Ioctl(h, IOCTL_PNA2DP_GET_CONFIG, NULL, 0, &c, sizeof(c))) return 1;
     printf("configuration updated\n");
     PrintConfig(c);
     return 0;
 }
 
+static int WindowsCommand(int argc, char **argv)
+{
+    const char *action = argc >= 3 ? argv[2] : "list";
+    int index = 0;
+    if (argc > 3) {
+        if (argc != 5 || strcmp(argv[3], "-d")) { fprintf(stderr, "Usage: pna2dpctl windows [list|status|spatial] [-d N]\n"); return 1; }
+        char *end = nullptr; long value = strtol(argv[4], &end, 10);
+        if (!argv[4][0] || *end || value < 0 || value > INT_MAX) return 1;
+        index = (int)value;
+    }
+    if (strcmp(action, "list") && strcmp(action, "status") && strcmp(action, "spatial")) return 1;
+    auto nodes = pn::EnumerateA2dpSinkNodes();
+    if (!strcmp(action, "list")) {
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const auto &n = nodes[i];
+            auto audio = pn::QueryWindowsAudio(n.instanceId);
+            printf("[%zu] %ls (%012llX) | %s | %s\n", i, n.name.c_str(), n.address,
+                n.restartRequired ? "Driver change pending restart" : n.usesWindowsA2dp() ? "Windows mode" : n.usesPnA2dp() ? "PN-A2DP driver mode" : "Other driver",
+                audio.active ? "Output active" : "No active output");
+        }
+        if (nodes.empty()) puts("No paired Bluetooth A2DP devices");
+        return 0;
+    }
+    if (index >= (int)nodes.size()) { fprintf(stderr, "Bluetooth device index unavailable\n"); return 1; }
+    const auto &node = nodes[index];
+    printf("Device: %ls\nDriver: %ls %ls\nInstance: %ls\n", node.name.c_str(), node.driverProvider.c_str(), node.driverVersion.c_str(), node.instanceId.c_str());
+    if (!strcmp(action, "spatial")) {
+        auto info = pn::QuerySpatialAudio(node.instanceId);
+        printf("%ls", pn::SpatialReport(info).c_str()); return info.queried ? 0 : 1;
+    }
+    auto info = pn::QueryWindowsAudio(node.instanceId);
+    printf("%ls", pn::WindowsAudioReport(info).c_str()); return info.active ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
-    if (argc < 2) { printf("usage: pna2dpctl list|status|caps|config|set|watch|stats|reconnect [-d index] [key=value ...]\n"); return 1; }
+    if (argc < 2) { printf("usage: pna2dpctl windows [list|status|spatial] [-d N]\n       pna2dpctl list|status|spatial|quality|caps|config|auto|set|watch|stats|trace|reconnect [-d index] [key=value ...]\n"); return 1; }
     const char *cmd = argv[1];
+    if (!strcmp(cmd, "windows")) return WindowsCommand(argc, argv);
     int dev = 0, first = 2;
     if (argc > 3 && !strcmp(argv[2], "-d")) { dev = atoi(argv[3]); first = 4; }
 
@@ -260,14 +305,54 @@ int main(int argc, char **argv)
         }
         return 0;
     }
+    if (!strcmp(cmd, "spatial")) {
+        const auto paths = EnumerateDevices();
+        if (dev < 0 || dev >= (int)paths.size()) { fprintf(stderr, "PN-A2DP device index unavailable\n"); return 1; }
+        for (const auto &iface : pn::EnumerateControlInterfaces()) {
+            if (_wcsicmp(iface.path.c_str(), paths[dev].c_str())) continue;
+            auto info = pn::QuerySpatialAudio(iface.instanceId);
+            wprintf(L"%s", pn::SpatialReport(info).c_str());
+            return info.queried ? 0 : 1;
+        }
+        fprintf(stderr, "Could not resolve the selected device instance\n"); return 1;
+    }
     HANDLE h = OpenDevice(dev);
     if (h == INVALID_HANDLE_VALUE) return 1;
     int rc = 0;
     if (!strcmp(cmd, "status")) PrintStatus(h);
+    else if (!strcmp(cmd, "quality")) {
+        PNA2DP_QUALITY q = {};
+        if (!Ioctl(h, IOCTL_PNA2DP_GET_QUALITY, NULL, 0, &q, sizeof(q)) || q.Size != sizeof(q)) rc = 1;
+        else {
+            const auto paths = EnumerateDevices();
+            if (dev >= 0 && dev < (int)paths.size()) for (const auto &iface : pn::EnumerateControlInterfaces())
+                if (!_wcsicmp(iface.path.c_str(), paths[dev].c_str())) wprintf(L"Adapter: %s\r\n", pn::AdapterNameForDevice(iface.instanceId).c_str());
+            wprintf(L"%s", pn::QualityReport(q).c_str());
+        }
+    }
     else if (!strcmp(cmd, "caps")) PrintCaps(h);
     else if (!strcmp(cmd, "config")) { PNA2DP_CONFIG c = {}; if (Ioctl(h, IOCTL_PNA2DP_GET_CONFIG, NULL, 0, &c, sizeof(c))) PrintConfig(c); }
+    else if (!strcmp(cmd, "auto")) {
+        PNA2DP_CONFIG c = {};
+        if (!Ioctl(h, IOCTL_PNA2DP_GET_CONFIG, NULL, 0, &c, sizeof(c))) rc = 1;
+        else {
+            pn::UseAutomaticCodecs(c);
+            if (!Ioctl(h, IOCTL_PNA2DP_SET_CONFIG, &c, sizeof(c), NULL, 0)) rc = 1;
+            else { puts("Automatic codec selection enabled; only supported codecs and available encoders are used."); PrintConfig(c); }
+        }
+    }
     else if (!strcmp(cmd, "set")) rc = DoSet(h, argc, argv, first);
     else if (!strcmp(cmd, "stats")) PrintStats(h);
+    else if (!strcmp(cmd, "trace")) {
+        PNA2DP_TRACE trace = {};
+        DWORD bytes = 0;
+        if (!Ioctl(h, IOCTL_PNA2DP_GET_TRACE, NULL, 0, &trace, sizeof(trace), &bytes)) rc = 1;
+        else if (bytes != sizeof(trace) || trace.Size != sizeof(trace) || trace.Count > PNA2DP_TRACE_ENTRIES) rc = 1;
+        else for (ULONG i = 0; i < trace.Count; ++i) {
+            const auto &e = trace.Entries[i];
+            printf("%lu %llu ms L%lu %.*s\n", e.Sequence, e.TimeHns / 10000, e.Level, (int)PNA2DP_TRACE_TEXT_BYTES, e.Text);
+        }
+    }
     else if (!strcmp(cmd, "reconnect")) { if (Ioctl(h, IOCTL_PNA2DP_RECONNECT, NULL, 0, NULL, 0)) printf("reconnecting\n"); }
     else if (!strcmp(cmd, "watch")) {
         PrintStatus(h);

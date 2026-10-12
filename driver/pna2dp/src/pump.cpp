@@ -3,21 +3,37 @@
  * SPDX-License-Identifier: MIT
  */
 #include "pna2dp.h"
+#include "pcm.h"
+#include "audio_policy.h"
+
+/* ntifs.h declares it; this driver builds against wdm.h only */
+extern "C" NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(_In_ HANDLE Handle, _In_ BOOLEAN Alertable, _In_opt_ PLARGE_INTEGER Timeout);
 
 /* ------------------------------------------------------------------------- */
 /* PCM ring                                                                     */
 /* ------------------------------------------------------------------------- */
 
-static ULONG RingAvailable(_In_ PPN_PCM_RING R)
+/* Caller holds R->Lock. */
+static ULONG RingAvailableLocked(_In_ PPN_PCM_RING R)
 {
     return (ULONG)(R->WritePos - R->ReadPos);
+}
+
+static ULONG RingAvailable(_In_ PPN_PCM_RING R)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&R->Lock, &irql);
+    ULONG available = RingAvailableLocked(R);
+    KeReleaseSpinLock(&R->Lock, irql);
+    return available;
 }
 
 static ULONG RingRead(_Inout_ PPN_PCM_RING R, _Out_writes_bytes_(Len) PUCHAR Out, _In_ ULONG Len)
 {
     KIRQL irql;
     KeAcquireSpinLock(&R->Lock, &irql);
-    ULONG avail = RingAvailable(R);
+    if (!R->Buffer || !R->Capacity) { KeReleaseSpinLock(&R->Lock, irql); return 0; }
+    ULONG avail = RingAvailableLocked(R);
     if (Len > avail) Len = avail;
     ULONG off = (ULONG)(R->ReadPos % R->Capacity);
     ULONG first = PN_MIN(Len, R->Capacity - off);
@@ -34,11 +50,13 @@ VOID PumpWritePcm(_Inout_ PPN_PUMP P, _In_reads_bytes_(Length) const UCHAR *Data
     if (!R->Buffer || !Length) return;
     KIRQL irql;
     KeAcquireSpinLock(&R->Lock, &irql);
+    /* re-check under the lock: PumpReleaseInput may have run since the unlocked test */
+    if (!R->Buffer || !R->Capacity || !R->BytesPerFrame || R->Capacity <= R->BytesPerFrame) { KeReleaseSpinLock(&R->Lock, irql); return; }
     if (Length >= R->Capacity) {
         Data += Length - R->Capacity + R->BytesPerFrame;
         Length = R->Capacity - R->BytesPerFrame;
     }
-    ULONG avail = RingAvailable(R);
+    ULONG avail = RingAvailableLocked(R);
     if (avail + Length > R->Capacity) {
         /* overrun: drop the oldest PCM, keep frame alignment */
         ULONG drop = avail + Length - R->Capacity;
@@ -66,14 +84,24 @@ VOID PumpFlush(_Inout_ PPN_PUMP P)
 static ULONG RingLatencyUs(_In_ PPN_PUMP P)
 {
     PPN_PCM_RING R = &P->Ring;
-    if (!R->Buffer || !R->BytesPerFrame || !R->SampleRate) return 0;
-    ULONGLONG frames = RingAvailable(R) / R->BytesPerFrame;
-    return (ULONG)(frames * 1000000ull / R->SampleRate);
+    KIRQL irql;
+    KeAcquireSpinLock(&R->Lock, &irql);
+    ULONG latency = 0;
+    if (R->Buffer && R->BytesPerFrame && R->SampleRate) {
+        ULONGLONG frames = RingAvailableLocked(R) / R->BytesPerFrame;
+        latency = (ULONG)(frames * 1000000ull / R->SampleRate);
+    }
+    KeReleaseSpinLock(&R->Lock, irql);
+    return latency;
 }
 
 NTSTATUS PumpConfigureInput(_Inout_ PPN_PUMP P, _In_ ULONG SampleRate, _In_ ULONG Channels, _In_ ULONG ContainerBits, _In_ ULONG ValidBits, _In_ BOOLEAN IsFloat)
 {
     PAGED_CODE();
+    if (!SampleRate || SampleRate > 192000 || !Channels || Channels > 2 ||
+        (ContainerBits != 16 && ContainerBits != 24 && ContainerBits != 32) || !ValidBits || ValidBits > ContainerBits ||
+        (IsFloat && (ContainerBits != 32 || ValidBits != 32))) return STATUS_INVALID_PARAMETER;
+    PumpStopStream(P);   /* the thread must not be converting with the old format */
     PumpReleaseInput(P);
     PPN_PCM_RING R = &P->Ring;
     R->BytesPerFrame = Channels * (ContainerBits / 8);
@@ -84,6 +112,7 @@ NTSTATUS PumpConfigureInput(_Inout_ PPN_PUMP P, _In_ ULONG SampleRate, _In_ ULON
     R->IsFloat = IsFloat;
     ULONG cap = (ULONG)((ULONGLONG)SampleRate * PN_PUMP_RING_MS / 1000) * R->BytesPerFrame;
     cap = ((cap + 4095) / 4096) * 4096;
+    cap -= cap % R->BytesPerFrame;
     R->Buffer = (PUCHAR)PnAllocNp(cap, PNA2DP_TAG_PCM);
     if (!R->Buffer) return STATUS_INSUFFICIENT_RESOURCES;
     R->Capacity = cap;
@@ -116,50 +145,12 @@ static ULONG ConvertPcm(_In_ PPN_PUMP P, _In_reads_bytes_(InBytes) const UCHAR *
                         _In_ ULONG Target, _In_ ULONG TargetChannels)
 {
     PPN_PCM_RING R = &P->Ring;
-    ULONG inBps = R->BitsPerSample / 8;
-    ULONG frames = InBytes / R->BytesPerFrame;
-    ULONG outBps = (Target == PNA2DP_FMT_S16) ? 2 : (Target == PNA2DP_FMT_S24) ? 3 : 4;
-    if (frames * TargetChannels * outBps > OutCap) frames = OutCap / (TargetChannels * outBps);
-    LONG gain = (LONG)P->VolumeGainQ15;
-    BOOLEAN applyGain = P->SoftwareVolume && (gain != 32768 || P->Muted);
-    if (P->Muted && P->SoftwareVolume) gain = 0;
-
-    for (ULONG f = 0; f < frames; f++) {
-        for (ULONG c = 0; c < TargetChannels; c++) {
-            ULONG src = PN_MIN(c, R->Channels - 1);
-            const UCHAR *s = In + (f * R->Channels + src) * inBps;
-            LONG v32;   /* sample normalised to S32 */
-            if (R->IsFloat) {
-                float fv = *(const float *)s;
-                if (fv > 1.0f) fv = 1.0f; else if (fv < -1.0f) fv = -1.0f;
-                v32 = (LONG)(fv * 2147483647.0f);
-            } else if (inBps == 2) {
-                v32 = (LONG)(*(const SHORT *)s) << 16;
-            } else if (inBps == 3) {
-                v32 = (LONG)(((ULONG)s[0] << 8) | ((ULONG)s[1] << 16) | ((ULONG)s[2] << 24));
-            } else {
-                v32 = *(const LONG *)s;
-                if (R->ValidBits && R->ValidBits < 32) v32 = (LONG)((ULONG)v32 & ~((1u << (32 - R->ValidBits)) - 1));
-            }
-            if (applyGain) v32 = (LONG)(((LONGLONG)v32 * gain) >> 15);
-            UCHAR *d = Out + (f * TargetChannels + c) * outBps;
-            if (Target == PNA2DP_FMT_S16) {
-                /* round to 16 bits */
-                LONGLONG r = (LONGLONG)v32 + 0x8000; if (r > 0x7FFFFFFF) r = 0x7FFFFFFF;
-                *(SHORT *)d = (SHORT)(r >> 16);
-            } else if (Target == PNA2DP_FMT_S24) {
-                ULONG u = (ULONG)v32 >> 8;
-                d[0] = (UCHAR)u; d[1] = (UCHAR)(u >> 8); d[2] = (UCHAR)(u >> 16);
-            } else if (Target == PNA2DP_FMT_F32) {
-                *(float *)d = (float)v32 / 2147483648.0f;
-            } else {
-                *(LONG *)d = v32;
-            }
-        }
-    }
-    return frames * TargetChannels * outBps;
+    /* Digital mute is immediate. Gain is unity while Windows controls the
+     * receiver's absolute volume, or the local fallback gain otherwise. */
+    ULONG gain = P->Muted ? 0 : P->VolumeGainQ15;
+    return PnConvertPcm(In, InBytes, R->Channels, R->BitsPerSample, R->ValidBits, R->IsFloat,
+                        Out, OutCap, Target, TargetChannels, gain);
 }
-
 /* ------------------------------------------------------------------------- */
 /* Transport                                                                    */
 /* ------------------------------------------------------------------------- */
@@ -193,48 +184,69 @@ static NTSTATUS SendMediaPacket(_Inout_ PPN_PUMP P, _In_reads_bytes_(PayloadByte
 {
     PPN_L2CAP_CHANNEL ch = P->Media;
     if (!ch || !PnChannelIsConnected(ch)) return STATUS_CONNECTION_DISCONNECTED;
-
-    if (PnChannelWritesInFlight(ch) >= (LONG)P->MaxWritesInFlight) {
-        P->Stats.PacketsDropped++;
-        P->Abr.CongestionScore += 2;
-        P->Abr.LastCongestionHns = PnNowHns();
-        return STATUS_DEVICE_BUSY;
-    }
-    PPN_L2CAP_WRITE w = PnChannelAcquireWrite(ch);
-    if (!w) { P->Stats.PacketsDropped++; return STATUS_DEVICE_BUSY; }
-    ULONG n = 0;
-    if (P->UseRtpHeader) {
-        if (w->Capacity < RTP_HEADER_SIZE) { PnChannelReleaseWrite(ch, w); return STATUS_BUFFER_OVERFLOW; }
-        RtpWriteHeader(&P->Rtp, w->Buffer, PcmFrames, FALSE);
-        n = RTP_HEADER_SIZE;
-    }
-    if (P->UsePayloadHeader) {
-        w->Buffer[n++] = (UCHAR)(PayloadHeaderByte ? PayloadHeaderByte : (FrameCount & 0x0F));
-    }
-    if (n + PayloadBytes > w->Capacity || n + PayloadBytes > P->MediaMtu) {
-        PnChannelReleaseWrite(ch, w);
+    ULONG timestamp = P->Rtp.Timestamp;
+    ULONG header = (P->UseRtpHeader ? RTP_HEADER_SIZE : 0) + (P->UsePayloadHeader ? 1 : 0);
+    ULONG capacity = PN_MIN(P->MediaMtu, ch->WriteCapacity);
+    if (capacity <= header || !PayloadBytes || PayloadBytes > PN_PUMP_MAX_PACKET) return STATUS_INVALID_PARAMETER;
+    ULONG room = capacity - header;
+    ULONG count = (PayloadBytes + room - 1) / room;
+    if ((count > 1 && P->Cfg.Codec != PNA2DP_CODEC_AAC) || count > PN_L2CAP_MAX_WRITES) {
+        P->Rtp.Timestamp += PcmFrames;
         P->Stats.PacketsDropped++;
         return STATUS_BUFFER_OVERFLOW;
     }
-    RtlCopyMemory(w->Buffer + n, Payload, PayloadBytes);
-    w->Length = n + PayloadBytes;
-    NTSTATUS status = PnChannelSubmitWrite(ch, w);
-    if (NT_SUCCESS(status)) {
-        P->Stats.PacketsSent++;
-        P->Stats.BytesSent += w->Length;
-        P->Stats.EncodedFrames += FrameCount;
-        LONG inflight = PnChannelWritesInFlight(ch);
-        P->Stats.QueueDepthPackets = (ULONG)inflight;
-        if ((ULONG)inflight > P->Stats.QueueDepthMaxPackets) P->Stats.QueueDepthMaxPackets = (ULONG)inflight;
-    } else {
-        P->Stats.WriteFailures++;
+    if (!PnMediaQueueHasCapacity((ULONG)PnChannelWritesInFlight(ch), count, P->MaxWritesInFlight)) {
+        P->Rtp.Timestamp += PcmFrames;
+        P->Stats.PacketsDropped++;
+        InterlockedIncrement(&P->Abr.Pressure);
+        return STATUS_DEVICE_BUSY;
     }
+    // Reserve all writes before sending the first fragment. AAC LATM fragments share
+    // a timestamp; the final fragment has the RTP marker bit (RFC 3016 section 4.3).
+    PPN_L2CAP_WRITE writes[PN_L2CAP_MAX_WRITES] = {};
+    for (ULONG i = 0; i < count; ++i) {
+        writes[i] = PnChannelAcquireWrite(ch);
+        if (!writes[i]) {
+            for (ULONG j = 0; j < i; ++j) PnChannelReleaseWrite(ch, writes[j]);
+            P->Rtp.Timestamp += PcmFrames;
+            P->Stats.PacketsDropped++;
+            return STATUS_DEVICE_BUSY;
+        }
+    }
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG offset = 0;
+    for (ULONG i = 0; i < count; ++i) {
+        PPN_L2CAP_WRITE w = writes[i];
+        ULONG bytes = PN_MIN(room, PayloadBytes - offset);
+        BOOLEAN last = i + 1 == count;
+        if (P->UseRtpHeader) RtpWriteHeader(&P->Rtp, w->Buffer, last ? PcmFrames : 0,
+                                           P->Cfg.Codec == PNA2DP_CODEC_AAC && last);
+        if (P->UsePayloadHeader) w->Buffer[header - 1] = (UCHAR)(PayloadHeaderByte ? PayloadHeaderByte : (FrameCount & 0x0f));
+        RtlCopyMemory(w->Buffer + header, Payload + offset, bytes);
+        ULONG length = w->Length = header + bytes;
+        status = PnChannelSubmitWrite(ch, w);
+        // The completion may already have recycled w, so use the saved length.
+        if (NT_SUCCESS(status)) {
+            P->Stats.PacketsSent++;
+            P->Stats.BytesSent += length;
+        } else {
+            P->Stats.WriteFailures++;
+            InterlockedIncrement(&P->Abr.Failed);
+            for (ULONG j = i + 1; j < count; ++j) PnChannelReleaseWrite(ch, writes[j]);
+            break;
+        }
+        offset += bytes;
+    }
+    P->Rtp.Timestamp = timestamp + PcmFrames; // preserve media time even after a dropped fragment
+    if (NT_SUCCESS(status)) P->Stats.EncodedFrames += FrameCount;
+    ULONG inflight = (ULONG)PnChannelWritesInFlight(ch);
+    P->Stats.QueueDepthPackets = inflight;
+    P->Stats.QueueDepthMaxPackets = PN_MAX(P->Stats.QueueDepthMaxPackets, inflight);
     return status;
 }
 
 VOID PumpOnWriteDone(_Inout_ PPN_PUMP P, _In_ NTSTATUS Status, _In_ ULONG Bytes, _In_ LONGLONG SubmitTimeHns)
 {
-    UNREFERENCED_PARAMETER(Bytes);
     LONGLONG dt = PnNowHns() - SubmitTimeHns;
     ULONG us = (ULONG)(dt / 10);
     P->TxAvgUs = (P->TxAvgUs * 15 + us) / 16;
@@ -243,13 +255,15 @@ VOID PumpOnWriteDone(_Inout_ PPN_PUMP P, _In_ NTSTATUS Status, _In_ ULONG Bytes,
     P->Stats.TxCompletionMaxUs = P->TxMaxUs;
     if (!NT_SUCCESS(Status)) {
         P->Stats.WriteFailures++;
+        InterlockedIncrement(&P->Abr.Failed);
     }
-    /* Congestion heuristic: a completion that takes longer than ~2 packet durations means the
-     * controller's ACL buffers are backing up. */
-    ULONG packetUs = P->Cfg.SampleRate ? (P->CodecFramesPerPacket * P->PcmFramesPerCodecFrame * 1000000u / P->Cfg.SampleRate) : 20000;
+    InterlockedIncrement(&P->Abr.Completed);
+    /* Use the actual write size: LDAC packets and fragmented AAC do not have a
+     * constant number of PCM frames. Completion time is host transport latency,
+     * not RSSI or an over-the-air retry count. */
+    ULONG packetUs = P->Cfg.BitrateBps ? (ULONG)((ULONGLONG)Bytes * 8000000ull / P->Cfg.BitrateBps) : 20000;
     if (us > packetUs * 2 + 10000) {
-        P->Abr.CongestionScore += 1;
-        P->Abr.LastCongestionHns = PnNowHns();
+        InterlockedIncrement(&P->Abr.Slow);
     }
     if (P->StreamActive) KeSetEvent(&P->WakeEvent, IO_SOUND_INCREMENT, FALSE);
 }
@@ -258,61 +272,67 @@ VOID PumpOnWriteDone(_Inout_ PPN_PUMP P, _In_ NTSTATUS Status, _In_ ULONG Bytes,
 /* ABR                                                                          */
 /* ------------------------------------------------------------------------- */
 
+static ULONG AbrBitrateAtLevel(_In_ PPN_PUMP P, ULONG Level, _Out_opt_ A2DP_CODEC_CONFIG *Result)
+{
+    A2DP_CODEC_CONFIG base = P->Cfg;
+    base.LdacEqmid = (UCHAR)P->LdacBaseQuality;
+    return A2dpQualityAtLevel(&base, Level, P->Abr.FloorBps, Result);
+}
+
 static VOID AbrApplyLevel(_Inout_ PPN_PUMP P)
 {
-    ULONG level = P->Abr.Level;
-    switch (P->Cfg.Codec) {
-    case PNA2DP_CODEC_SBC: {
-        /* ladder: max bitpool down to min in steps of ~15% */
-        ULONG maxbp = P->Cfg.SbcMaxBitpool, minbp = PN_MAX(P->Cfg.SbcMinBitpool, 2u);
-        ULONG bp = maxbp;
-        for (ULONG i = 0; i < level; i++) bp = bp - PN_MAX(bp / 7, 2u);
-        if (bp < minbp) bp = minbp;
-        P->Cfg.SbcBitpool = (UCHAR)bp;
-        sbc_encoder_set_bitpool(&P->Sbc, (sbc_u8)bp);
+    AbrBitrateAtLevel(P, P->Abr.Level, &P->Cfg);
+    if (P->Cfg.Codec == PNA2DP_CODEC_SBC) {
+        sbc_encoder_set_bitpool(&P->Sbc, P->Cfg.SbcBitpool);
         P->CodecFrameBytes = P->Sbc.frame_length;
-        break;
     }
-    case PNA2DP_CODEC_LDAC:
-        P->Cfg.LdacEqmid = (UCHAR)PN_MIN(level, 2u);
-        break;
-    case PNA2DP_CODEC_AAC: {
-        static const ULONG ladder[] = { 0, 256000, 192000, 128000, 96000 };
-        ULONG b = P->Cfg.MaxBitrateBps;
-        if (level && level < PN_ARRAYSIZE(ladder)) b = PN_MIN(b, ladder[level]);
-        P->Cfg.BitrateBps = b;
-        break;
-    }
-    default:
-        break;
-    }
-    P->Stats.AbrLevel = level;
-    P->Cfg.BitrateBps = A2dpNominalBitrate(&P->Cfg);
-    PN_INFO("ABR level %u -> %u bps", level, P->Cfg.BitrateBps);
+    P->Stats.AbrLevel = P->Abr.Level;
+    PN_INFO("ABR level %u -> %u bps", P->Abr.Level, P->Cfg.BitrateBps);
 }
 
 static VOID AbrTick(_Inout_ PPN_PUMP P)
 {
-    if (!P->Abr.Enabled) return;
     LONGLONG now = PnNowHns();
-    /* leak */
-    if (P->Abr.CongestionScore) P->Abr.CongestionScore--;
-    if (P->Abr.CongestionScore > 6 && P->Abr.Level < P->Abr.MaxLevel && now - P->Abr.LastChangeHns > 2 * PN_HNS_PER_SEC) {
+    ULONG elapsed = (ULONG)PN_MIN((now - P->Abr.LastObservationHns) / PN_HNS_PER_MS, 60000ll);
+    P->Abr.LastObservationHns = now;
+    ULONG completed = (ULONG)InterlockedExchange(&P->Abr.Completed, 0);
+    ULONG slow = (ULONG)InterlockedExchange(&P->Abr.Slow, 0);
+    ULONG failed = (ULONG)InterlockedExchange(&P->Abr.Failed, 0);
+    ULONG pressure = (ULONG)InterlockedExchange(&P->Abr.Pressure, 0);
+    ULONG backlog = P->Abr.BacklogPeakUs;
+    P->Abr.BacklogPeakUs = 0;
+    BOOLEAN bad = failed || pressure || backlog > P->TargetLatencyMs * 1000 ||
+        (slow >= 2 && (ULONGLONG)slow * 10 >= completed);
+    int change = PnQualityObserve(&P->Abr.Window, elapsed, completed != 0, bad,
+        P->Abr.Enabled, P->Abr.Level, P->Abr.MaxLevel);
+    if (change > 0) {
         P->Abr.Level++;
         P->Abr.Downgrades++;
         P->Stats.AbrDowngrades++;
-        P->Abr.CongestionScore = 0;
-        P->Abr.LastChangeHns = now;
         AbrApplyLevel(P);
         DeviceNotifyEvent(P->Device, PNA2DP_EVENT_STATE_CHANGED);
-    } else if (P->Abr.Level > 0 && now - P->Abr.LastCongestionHns > 15 * PN_HNS_PER_SEC && now - P->Abr.LastChangeHns > 15 * PN_HNS_PER_SEC) {
+    } else if (change < 0) {
         P->Abr.Level--;
         P->Abr.Upgrades++;
         P->Stats.AbrUpgrades++;
-        P->Abr.LastChangeHns = now;
         AbrApplyLevel(P);
         DeviceNotifyEvent(P->Device, PNA2DP_EVENT_STATE_CHANGED);
     }
+    PNA2DP_QUALITY q = {};
+    q.Size = sizeof(q);
+    q.Flags = P->Abr.Enabled ? PNA2DP_QUALITY_ABR : 0;
+    q.Health = bad ? PNA2DP_QUALITY_CONGESTED : !completed ? PNA2DP_QUALITY_IDLE :
+        P->Abr.Level ? PNA2DP_QUALITY_RECOVERING : P->Abr.Window.GoodMs >= 3000 ? PNA2DP_QUALITY_STABLE : PNA2DP_QUALITY_SAMPLING;
+    q.Codec = P->Cfg.Codec; q.BitrateBps = P->Cfg.BitrateBps;
+    q.CeilingBps = AbrBitrateAtLevel(P, 0, NULL); q.FloorBps = AbrBitrateAtLevel(P, P->Abr.MaxLevel, NULL);
+    q.Level = P->Abr.Level; q.MaxLevel = P->Abr.MaxLevel;
+    q.HealthyMs = P->Abr.Window.GoodMs; q.CongestedMs = P->Abr.Window.BadMs;
+    q.CompletedPackets = completed; q.SlowPackets = slow; q.FailedPackets = failed;
+    q.BacklogPeakUs = backlog; q.ObservationMs = elapsed;
+    KIRQL irql;
+    KeAcquireSpinLock(&P->Lock, &irql);
+    P->Quality = q;
+    KeReleaseSpinLock(&P->Lock, irql);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -322,6 +342,14 @@ static VOID AbrTick(_Inout_ PPN_PUMP P)
 /* Kernel SBC: pull PCM, encode N frames, send one packet. Returns TRUE if a packet was sent. */
 static BOOLEAN PumpStepSbc(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In_ ULONG PcmCap, _Inout_ PUCHAR PktBuf, _In_ ULONG PktCap)
 {
+    /* Retain PCM during a temporary controller stall. Consuming and encoding it
+     * before discovering a full write queue creates avoidable holes in music.
+     * The existing latency guard still bounds a prolonged stall. */
+    if (!P->Media || !PnChannelIsConnected(P->Media)) return FALSE;
+    if (!PnMediaQueueHasCapacity((ULONG)PnChannelWritesInFlight(P->Media), 1, P->MaxWritesInFlight)) {
+        P->Stats.TransportWaits++;
+        return FALSE;
+    }
     ULONG framesPerPacket = P->CodecFramesPerPacket;
     ULONG pcmFrames = framesPerPacket * P->PcmFramesPerCodecFrame;
     ULONG needBytes = pcmFrames * P->Ring.BytesPerFrame;
@@ -332,17 +360,34 @@ static BOOLEAN PumpStepSbc(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In_ ULONG
     if (got < needBytes) return FALSE;
     P->Stats.PcmFramesConsumed += pcmFrames;
 
-    ULONG convBytes = ConvertPcm(P, PcmBuf, got, P->ConvBuffer, P->ConvCapacity, PNA2DP_FMT_S16, P->Sbc.channels);
-    UNREFERENCED_PARAMETER(convBytes);
+    ULONG channels = P->Sbc.channels;
+    ULONG pcmPerFrame = P->PcmFramesPerCodecFrame;
+    ULONG convBytes = ConvertPcm(P, PcmBuf, got, P->ConvBuffer, P->ConvCapacity, PNA2DP_FMT_S16, channels);
+    if (convBytes < pcmFrames * channels * sizeof(SHORT)) return FALSE;
     const SHORT *s16 = (const SHORT *)P->ConvBuffer;
     ULONG n = 0, count = 0;
     for (ULONG f = 0; f < framesPerPacket; f++) {
-        ULONG len = sbc_encode_frame(&P->Sbc, s16 + f * P->PcmFramesPerCodecFrame * P->Sbc.channels, PktBuf + n, PktCap - n);
+        ULONG len = sbc_encode_frame(&P->Sbc, s16 + f * pcmPerFrame * channels, PktBuf + n, PktCap - n);
         if (!len) break;
         n += len;
         count++;
     }
     if (!count) return FALSE;
+    if (P->SampleState == 1 && n <= sizeof(P->Sample.Sbc) && convBytes <= sizeof(P->Sample.Pcm)) {
+        KIRQL irql;
+        KeAcquireSpinLock(&P->Lock, &irql);
+        if (P->SampleState == 1) {
+            RtlZeroMemory(&P->Sample, sizeof(P->Sample));
+            P->Sample.Size = sizeof(P->Sample);
+            P->Sample.SampleRate = P->Cfg.SampleRate; P->Sample.Channels = channels;
+            P->Sample.GainQ15 = P->VolumeGainQ15; P->Sample.Muted = P->Muted;
+            P->Sample.PcmBytes = count * pcmPerFrame * channels * sizeof(SHORT); P->Sample.SbcBytes = n;
+            RtlCopyMemory(P->Sample.Pcm, s16, P->Sample.PcmBytes);
+            RtlCopyMemory(P->Sample.Sbc, PktBuf, n);
+            P->SampleState = 2;
+        }
+        KeReleaseSpinLock(&P->Lock, irql);
+    }
     SendMediaPacket(P, PktBuf, n, count, count * P->PcmFramesPerCodecFrame, count & 0x0F);
     return TRUE;
 }
@@ -351,6 +396,7 @@ static BOOLEAN PumpStepSbc(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In_ ULONG
 static BOOLEAN PumpStepHostSubmit(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In_ ULONG PcmCap)
 {
     if (P->HostOutstanding >= PN_PUMP_HOST_WINDOW) return FALSE;
+    if (P->HostResultCount >= PN_PUMP_HOST_WINDOW) return FALSE;
     ULONG pcmFrames = P->CodecFramesPerPacket * P->PcmFramesPerCodecFrame;
     ULONG needBytes = pcmFrames * P->Ring.BytesPerFrame;
     if (needBytes > PcmCap) return FALSE;
@@ -376,14 +422,16 @@ static BOOLEAN PumpStepHostSubmit(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In
     hdr.Params.CodecInfoLength = P->Cfg.IesLength;
     RtlCopyMemory(hdr.Params.CodecInfo, P->Cfg.Ies, P->Cfg.IesLength);
     hdr.PcmFrames = pcmFrames;
+    /* count it before the host can see it: its result may arrive before Dispatch returns */
+    InterlockedIncrement(&P->HostOutstanding);
+    P->HostLastSubmitHns = PnNowHns();
     NTSTATUS status = CodecHostDispatchWork(&P->Device->Host, &hdr, P->ConvBuffer, convBytes);
     if (!NT_SUCCESS(status)) {
+        if (InterlockedDecrement(&P->HostOutstanding) < 0) InterlockedExchange(&P->HostOutstanding, 0);
         P->HostTimeouts++;
         P->Stats.HostTimeouts++;
         return FALSE;
     }
-    InterlockedIncrement(&P->HostOutstanding);
-    P->HostLastSubmitHns = PnNowHns();
     return TRUE;
 }
 
@@ -393,7 +441,24 @@ static BOOLEAN PumpStepHostDrain(_Inout_ PPN_PUMP P)
     KIRQL irql;
     PPN_ENCODED_BLOCK b = NULL;
     KeAcquireSpinLock(&P->HostLock, &irql);
-    if (!IsListEmpty(&P->HostResults)) b = CONTAINING_RECORD(RemoveHeadList(&P->HostResults), PN_ENCODED_BLOCK, Link);
+    if (!IsListEmpty(&P->HostResults)) {
+        PPN_ENCODED_BLOCK first = CONTAINING_RECORD(P->HostResults.Flink, PN_ENCODED_BLOCK, Link);
+        ULONG header = (P->UseRtpHeader ? RTP_HEADER_SIZE : 0) + (P->UsePayloadHeader ? 1 : 0);
+        ULONG capacity = P->Media ? PN_MIN(P->MediaMtu, P->Media->WriteCapacity) : 0;
+        ULONG room = capacity > header ? capacity - header : 0;
+        ULONG count = room ? (first->PayloadBytes + room - 1) / room : 0;
+        /* Malformed/oversize output must reach SendMediaPacket's rejection path,
+         * rather than waiting forever for an impossible number of write slots. */
+        if (first->PayloadBytes && count && count <= P->MaxWritesInFlight &&
+            (!P->Media || !PnChannelIsConnected(P->Media) ||
+            !PnMediaQueueHasCapacity((ULONG)PnChannelWritesInFlight(P->Media), count, P->MaxWritesInFlight))) {
+            KeReleaseSpinLock(&P->HostLock, irql);
+            P->Stats.TransportWaits++;
+            return FALSE;
+        }
+        b = CONTAINING_RECORD(RemoveHeadList(&P->HostResults), PN_ENCODED_BLOCK, Link);
+        P->HostResultCount--;
+    }
     KeReleaseSpinLock(&P->HostLock, irql);
     if (!b) return FALSE;
     if (b->PayloadBytes) {
@@ -405,8 +470,14 @@ static BOOLEAN PumpStepHostDrain(_Inout_ PPN_PUMP P)
 
 NTSTATUS PumpHostResult(_Inout_ PPN_PUMP P, _In_ const PNA2DP_CODEC_RESULT *R, _In_reads_bytes_(R->PayloadBytes) const UCHAR *Payload)
 {
-    if (R->StreamGeneration != (ULONG)P->Generation) return STATUS_SUCCESS;   /* stale */
+    if (!P->StreamActive || P->Owner != PnEncoderHost || R->StreamGeneration != (ULONG)P->Generation) return STATUS_SUCCESS;   /* stale */
+    if (R->Status != 0) {
+        P->Stats.HostTimeouts++;
+        CodecHostReportFailure(&P->Device->Host);
+        return STATUS_SUCCESS;
+    }
     if (R->PayloadBytes > PN_PUMP_MAX_PACKET) return STATUS_BUFFER_OVERFLOW;
+    if (P->HostResultCount >= 2 * PN_PUMP_HOST_WINDOW) return STATUS_DEVICE_BUSY;
     PPN_ENCODED_BLOCK b = (PPN_ENCODED_BLOCK)PnAllocNp(sizeof(*b), PNA2DP_TAG_CODEC);
     if (!b) return STATUS_INSUFFICIENT_RESOURCES;
     b->Sequence = R->Sequence;
@@ -417,14 +488,22 @@ NTSTATUS PumpHostResult(_Inout_ PPN_PUMP P, _In_ const PNA2DP_CODEC_RESULT *R, _
     b->ActualBitrate = R->ActualBitrateBps;
     if (R->PayloadBytes) RtlCopyMemory(b->Payload, Payload, R->PayloadBytes);
     KIRQL irql;
+    BOOLEAN queued = FALSE;
     KeAcquireSpinLock(&P->HostLock, &irql);
-    InsertTailList(&P->HostResults, &b->Link);
+    /* PumpStopStream bumps Generation before it drains under this lock */
+    if (P->StreamActive && R->StreamGeneration == (ULONG)P->Generation && P->HostResultCount < 2 * PN_PUMP_HOST_WINDOW) {
+        InsertTailList(&P->HostResults, &b->Link);
+        P->HostResultCount++;
+        queued = TRUE;
+    }
     KeReleaseSpinLock(&P->HostLock, irql);
-    InterlockedDecrement(&P->HostOutstanding);
+    if (!queued) { PnFree(b, PNA2DP_TAG_CODEC); return STATUS_SUCCESS; }
+    if (InterlockedDecrement(&P->HostOutstanding) < 0) InterlockedExchange(&P->HostOutstanding, 0);
     LONGLONG rt = PnNowHns() - P->HostLastSubmitHns;
     P->HostRoundTripAvgUs = (P->HostRoundTripAvgUs * 7 + (ULONG)(rt / 10)) / 8;
     P->Stats.HostRoundTripAvgUs = P->HostRoundTripAvgUs;
-    if (R->ActualBitrateBps) P->Cfg.BitrateBps = R->ActualBitrateBps;
+    /* Results may have been encoded before an ABR change. Never feed their old
+     * bitrate back into the desired configuration: it would undo AAC reductions. */
     KeSetEvent(&P->WakeEvent, IO_SOUND_INCREMENT, FALSE);
     return STATUS_SUCCESS;
 }
@@ -453,18 +532,37 @@ static VOID PumpThread(_In_ PVOID Context)
     KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY + 2);   /* 18: above normal, below audio engine's 24 */
 
     while (P->Running) {
+        /* 4 ms tick while streaming; otherwise sleep until PumpStartStream/Uninitialize */
         timeout.QuadPart = -PN_HNS_PER_MS * 4;
-        KeWaitForSingleObject(&P->WakeEvent, Executive, KernelMode, FALSE, &timeout);
+        KeWaitForSingleObject(&P->WakeEvent, Executive, KernelMode, FALSE, P->StreamActive ? &timeout : NULL);
         if (!P->Running) break;
-        if (!P->StreamActive || !pcmBuf || !pktBuf) continue;
+        /* Busy from here: PumpStopStream clears StreamActive and then waits for Idle, so it
+         * never changes the stream state while a step is in progress. */
+        KeClearEvent(&P->Idle);
+        KeMemoryBarrier();
+        if (!P->StreamActive || !pcmBuf || !pktBuf) { KeSetEvent(&P->Idle, 0, FALSE); continue; }
+
+        LONG bp = InterlockedExchange(&P->PendingBitpool, 0);
+        if (bp && P->Cfg.Codec == PNA2DP_CODEC_SBC) {
+            P->Cfg.SbcMaxBitpool = (UCHAR)PN_MIN(PN_MAX((ULONG)bp, (ULONG)P->Cfg.SbcMinBitpool), P->SbcBitpoolCeiling);
+            P->Abr.MaxLevel = 24;
+            while (P->Abr.MaxLevel && AbrBitrateAtLevel(P, P->Abr.MaxLevel, NULL) == AbrBitrateAtLevel(P, P->Abr.MaxLevel - 1, NULL)) P->Abr.MaxLevel--;
+            P->Abr.Level = PN_MIN(P->Abr.Level, P->Abr.MaxLevel);
+            AbrApplyLevel(P); // keep the user's ceiling across subsequent ABR changes
+        }
+        if (InterlockedExchange(&P->PendingAbrReset, 0) && P->Abr.Level) {
+            P->Abr.Level = 0;
+            AbrApplyLevel(P);
+        }
 
         /* latency guard: drop PCM beyond MaxLatencyMs so we never lag behind */
         ULONG latUs = RingLatencyUs(P);
+        P->Abr.BacklogPeakUs = PN_MAX(P->Abr.BacklogPeakUs, latUs);
         if (latUs > P->MaxLatencyMs * 1000) {
             ULONG keepBytes = (ULONG)((ULONGLONG)P->Ring.SampleRate * P->TargetLatencyMs / 1000) * P->Ring.BytesPerFrame;
             KIRQL irql;
             KeAcquireSpinLock(&P->Ring.Lock, &irql);
-            ULONG avail = RingAvailable(&P->Ring);
+            ULONG avail = RingAvailableLocked(&P->Ring);
             if (avail > keepBytes) {
                 ULONG drop = avail - keepBytes;
                 drop = (drop / P->Ring.BytesPerFrame) * P->Ring.BytesPerFrame;
@@ -473,8 +571,7 @@ static VOID PumpThread(_In_ PVOID Context)
             }
             KeReleaseSpinLock(&P->Ring.Lock, irql);
             P->Stats.Underruns++;   /* reported as latency-trim events */
-            P->Abr.CongestionScore += 3;
-            P->Abr.LastCongestionHns = PnNowHns();
+            InterlockedIncrement(&P->Abr.Pressure);
         }
 
         ULONG guard = 0;
@@ -488,18 +585,20 @@ static VOID PumpThread(_In_ PVOID Context)
                 P->Stats.HostTimeouts++;
                 P->HostLastSubmitHns = PnNowHns();
                 InterlockedExchange(&P->HostOutstanding, 0);
-                if (P->HostTimeouts > 25) {
+                if (P->HostTimeouts >= 3) {
                     PN_WARN("codec host unresponsive; requesting fallback");
                     P->HostTimeouts = 0;
-                    DeviceNotifyEvent(P->Device, PNA2DP_EVENT_HOST_CHANGED);
+                    CodecHostReportFailure(&P->Device->Host);
                 }
             }
         }
         LONGLONG now = PnNowHns();
         if (now - lastAbr > PN_HNS_PER_MS * 250) { lastAbr = now; AbrTick(P); }
+        KeSetEvent(&P->Idle, 0, FALSE);
     }
     PnFree(pcmBuf, PNA2DP_TAG_PCM);
     PnFree(pktBuf, PNA2DP_TAG_PCM);
+    KeSetEvent(&P->Idle, 0, FALSE);
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -511,12 +610,13 @@ NTSTATUS PumpInitialize(_Out_ PPN_PUMP P, _In_ PPNA2DP_DEVICE Device)
 {
     PAGED_CODE();
     RtlZeroMemory(P, sizeof(*P));
-    P->Device = Device;
     KeInitializeSpinLock(&P->Lock);
     KeInitializeSpinLock(&P->Ring.Lock);
     KeInitializeSpinLock(&P->HostLock);
     InitializeListHead(&P->HostResults);
     KeInitializeEvent(&P->WakeEvent, SynchronizationEvent, FALSE);
+    KeInitializeEvent(&P->Idle, NotificationEvent, TRUE);
+    P->Device = Device;   /* marks the pump initialized for PumpUninitialize */
     P->VolumeGainQ15 = 32768;
     P->TargetLatencyMs = PN_PUMP_DEFAULT_TARGET_MS;
     P->MaxLatencyMs = PN_PUMP_DEFAULT_MAX_MS;
@@ -528,14 +628,38 @@ NTSTATUS PumpInitialize(_Out_ PPN_PUMP P, _In_ PPNA2DP_DEVICE Device)
     OBJECT_ATTRIBUTES oa;
     InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
     NTSTATUS status = PsCreateSystemThread(&P->ThreadHandle, THREAD_ALL_ACCESS, &oa, NULL, NULL, PumpThread, P);
-    if (!NT_SUCCESS(status)) { P->Running = 0; return status; }
-    ObReferenceObjectByHandle(P->ThreadHandle, THREAD_ALL_ACCESS, NULL, KernelMode, (PVOID *)&P->Thread, NULL);
+    if (!NT_SUCCESS(status)) { P->Running = 0; P->ThreadHandle = NULL; return status; }
+    status = ObReferenceObjectByHandle(P->ThreadHandle, THREAD_ALL_ACCESS, *PsThreadType, KernelMode, (PVOID *)&P->Thread, NULL);
+    if (!NT_SUCCESS(status)) {
+        /* cannot wait on the object later: stop the thread now through its handle */
+        P->Thread = NULL;
+        P->Running = 0;
+        KeSetEvent(&P->WakeEvent, 0, FALSE);
+        ZwWaitForSingleObject(P->ThreadHandle, FALSE, NULL);
+        ZwClose(P->ThreadHandle);
+        P->ThreadHandle = NULL;
+        return status;
+    }
     return STATUS_SUCCESS;
+}
+
+static VOID PumpDrainHostResults(_Inout_ PPN_PUMP P)
+{
+    KIRQL irql;
+    LIST_ENTRY drained;
+    InitializeListHead(&drained);
+    KeAcquireSpinLock(&P->HostLock, &irql);
+    while (!IsListEmpty(&P->HostResults)) InsertTailList(&drained, RemoveHeadList(&P->HostResults));
+    P->HostResultCount = 0;
+    KeReleaseSpinLock(&P->HostLock, irql);
+    while (!IsListEmpty(&drained)) PnFree(CONTAINING_RECORD(RemoveHeadList(&drained), PN_ENCODED_BLOCK, Link), PNA2DP_TAG_CODEC);
+    InterlockedExchange(&P->HostOutstanding, 0);
 }
 
 VOID PumpUninitialize(_Inout_ PPN_PUMP P)
 {
     PAGED_CODE();
+    if (!P->Device) return;
     PumpStopStream(P);
     if (P->Running) {
         P->Running = 0;
@@ -547,6 +671,7 @@ VOID PumpUninitialize(_Inout_ PPN_PUMP P)
         }
         if (P->ThreadHandle) { ZwClose(P->ThreadHandle); P->ThreadHandle = NULL; }
     }
+    PumpDrainHostResults(P);
     PumpReleaseInput(P);
     PnFree(P->ConvBuffer, PNA2DP_TAG_PCM);
     P->ConvBuffer = NULL;
@@ -557,22 +682,31 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
 {
     PAGED_CODE();
     PumpStopStream(P);
-    if (!P->Ring.Buffer) return STATUS_INVALID_DEVICE_STATE;
+    if (!P->Running || !P->ConvBuffer || !P->Ring.Buffer || !P->Ring.BytesPerFrame) return STATUS_INVALID_DEVICE_STATE;
+    if (!Cfg->SampleRate || !Cfg->Channels || !Media) return STATUS_INVALID_PARAMETER;
+    // No sample-rate converter exists in this path. Never play 48 kHz PCM at 44.1 kHz.
+    if (Cfg->SampleRate != P->Ring.SampleRate) return STATUS_NOT_SUPPORTED;
 
     P->Cfg = *Cfg;
     P->Media = Media;
-    P->MediaMtu = PN_MAX(MediaMtu, 128u);
+    if (MediaMtu < 48) return STATUS_INVALID_PARAMETER;
+    P->MediaMtu = PN_MIN(MediaMtu, PN_PUMP_MAX_PACKET);
     P->Owner = Owner;
     P->TargetLatencyMs = User->TargetLatencyMs;
     P->MaxLatencyMs = User->MaxLatencyMs;
-    P->SoftwareVolume = (User->Flags & PNA2DP_CFG_SOFTWARE_VOLUME) != 0;
     P->UseRtpHeader = CodecUsesRtp(Cfg->Codec);
     P->UsePayloadHeader = CodecUsesPayloadHeader(Cfg->Codec);
-    P->Abr.Enabled = (User->Flags & PNA2DP_CFG_ABR_ENABLE) != 0;
+    P->Abr.Enabled = (User->Flags & PNA2DP_CFG_ABR_ENABLE) != 0 &&
+        (Cfg->Codec != PNA2DP_CODEC_LDAC || User->Ldac.AbrEnable != 0);
     P->Abr.Level = 0;
-    P->Abr.CongestionScore = 0;
-    P->Abr.LastChangeHns = PnNowHns();
-    P->Abr.LastCongestionHns = 0;
+    RtlZeroMemory(&P->Abr.Window, sizeof(P->Abr.Window));
+    InterlockedExchange(&P->Abr.Completed, 0);
+    InterlockedExchange(&P->Abr.Slow, 0);
+    InterlockedExchange(&P->Abr.Failed, 0);
+    InterlockedExchange(&P->Abr.Pressure, 0);
+    P->Abr.BacklogPeakUs = 0;
+    P->Abr.FloorBps = User->AbrFloorBps;
+    P->Abr.LastObservationHns = PnNowHns();
     InterlockedIncrement(&P->Generation);
     InterlockedExchange(&P->HostOutstanding, 0);
     P->HostNextSequence = 1;
@@ -594,14 +728,16 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
         sp.bitpool = Cfg->SbcBitpool ? Cfg->SbcBitpool : Cfg->SbcMaxBitpool;
         /* keep one frame within the MTU */
         sbc_u8 maxbp = sbc_max_bitpool_for(&sp, 0, payloadRoom);
+        if (maxbp < Cfg->SbcMinBitpool) return STATUS_NOT_SUPPORTED;
         if (sp.bitpool > maxbp) sp.bitpool = maxbp;
         if (sbc_encoder_init(&P->Sbc, &sp) != 0) return STATUS_INVALID_PARAMETER;
         P->Cfg.SbcBitpool = sp.bitpool;
         P->Cfg.SbcMaxBitpool = PN_MIN(P->Cfg.SbcMaxBitpool, maxbp);
+        P->SbcBitpoolCeiling = P->Cfg.SbcMaxBitpool;
         P->PcmFramesPerCodecFrame = P->Sbc.pcm_per_frame;
         P->CodecFrameBytes = P->Sbc.frame_length;
         P->EncoderPcmFormat = PNA2DP_FMT_S16;
-        P->Abr.MaxLevel = 6;
+        P->Abr.MaxLevel = 24;
         /* frames per packet: fill the MTU but stay under ~target/3 ms per packet and 15 frames */
         ULONG fitMtu = payloadRoom / PN_MAX(P->CodecFrameBytes, 1u);
         ULONG frameUs = P->PcmFramesPerCodecFrame * 1000000u / Cfg->SampleRate;
@@ -614,7 +750,7 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
         P->PcmFramesPerCodecFrame = 1024;
         P->CodecFramesPerPacket = 1;
         P->EncoderPcmFormat = PNA2DP_FMT_S16;
-        P->Abr.MaxLevel = 3;
+        P->Abr.MaxLevel = 4;
         break;
     case PNA2DP_CODEC_APTX:
     case PNA2DP_CODEC_APTX_LL:
@@ -633,7 +769,8 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
         P->PcmFramesPerCodecFrame = (Cfg->SampleRate >= 88200) ? 256 : 128;
         P->CodecFramesPerPacket = 2;   /* blocks of 2 LDAC frames: the plugin packs per MTU and never queues more than one packet per call */
         P->EncoderPcmFormat = Cfg->PcmFormat ? Cfg->PcmFormat : PNA2DP_FMT_S32;
-        P->Abr.MaxLevel = 2;
+        P->LdacBaseQuality = PnLdacAbrQuality(Cfg->LdacEqmid, 0);
+        P->Abr.MaxLevel = 2 - P->LdacBaseQuality;
         break;
     case PNA2DP_CODEC_OPUS:
         P->PcmFramesPerCodecFrame = 480;    /* 10 ms at 48 k */
@@ -645,6 +782,9 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
         return STATUS_NOT_SUPPORTED;
     }
     P->Cfg.BitrateBps = A2dpNominalBitrate(&P->Cfg);
+    /* Do not count reductions which produce the same bitrate (floor reached or
+     * a receiver ceiling below the next AAC rung). Compact the bottom plateau. */
+    while (P->Abr.MaxLevel && AbrBitrateAtLevel(P, P->Abr.MaxLevel, NULL) == AbrBitrateAtLevel(P, P->Abr.MaxLevel - 1, NULL)) P->Abr.MaxLevel--;
     if (P->Owner == PnEncoderHost) {
         /* OPEN request to the host */
         PNA2DP_CODEC_WORK hdr;
@@ -670,6 +810,7 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
     }
     PN_INFO("pump start: %s %u Hz ch %u bitrate %u, %u frames/packet, mtu %u, owner %u", A2dpCodecName(Cfg->Codec), Cfg->SampleRate,
             Cfg->Channels, P->Cfg.BitrateBps, P->CodecFramesPerPacket, P->MediaMtu, P->Owner);
+    AbrTick(P); // publish this stream's codec/range before callers observe it
     InterlockedExchange(&P->StreamActive, 1);
     KeSetEvent(&P->WakeEvent, 0, FALSE);
     return STATUS_SUCCESS;
@@ -678,11 +819,17 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
 VOID PumpStopStream(_Inout_ PPN_PUMP P)
 {
     PAGED_CODE();
-    if (InterlockedExchange(&P->StreamActive, 0) == 0) return;
-    /* let the thread observe the flag */
-    LARGE_INTEGER wait;
-    wait.QuadPart = -PN_HNS_PER_MS * 10;
-    KeDelayExecutionThread(KernelMode, FALSE, &wait);
+    if (InterlockedExchange(&P->StreamActive, 0) == 0) {
+        if (P->Device) PumpDrainHostResults(P);   /* results that raced an earlier stop */
+        return;
+    }
+    /* Wait until the thread has left its step batch; after this nothing reads the encoder,
+     * the ring or the media channel until the next PumpStartStream. */
+    KeSetEvent(&P->WakeEvent, 0, FALSE);
+    if (P->Thread && KeGetCurrentThread() != P->Thread) KeWaitForSingleObject(&P->Idle, Executive, KernelMode, FALSE, NULL);
+    InterlockedIncrement(&P->Generation);
+    InterlockedExchange(&P->PendingBitpool, 0);
+    InterlockedExchange(&P->PendingAbrReset, 0);
     if (P->Owner == PnEncoderHost) {
         PNA2DP_CODEC_WORK hdr;
         RtlZeroMemory(&hdr, sizeof(hdr));
@@ -690,14 +837,12 @@ VOID PumpStopStream(_Inout_ PPN_PUMP P)
         hdr.StreamGeneration = (ULONG)P->Generation;
         CodecHostDispatchWork(&P->Device->Host, &hdr, NULL, 0);
     }
-    KIRQL irql;
-    KeAcquireSpinLock(&P->HostLock, &irql);
-    while (!IsListEmpty(&P->HostResults)) {
-        PPN_ENCODED_BLOCK b = CONTAINING_RECORD(RemoveHeadList(&P->HostResults), PN_ENCODED_BLOCK, Link);
-        PnFree(b, PNA2DP_TAG_CODEC);
-    }
-    KeReleaseSpinLock(&P->HostLock, irql);
-    InterlockedExchange(&P->HostOutstanding, 0);
+    PumpDrainHostResults(P);
+    KIRQL sampleIrql;
+    KeAcquireSpinLock(&P->Lock, &sampleIrql);
+    P->SampleState = 0;
+    RtlZeroMemory(&P->Sample, sizeof(P->Sample));
+    KeReleaseSpinLock(&P->Lock, sampleIrql);
     P->Media = NULL;
     P->Owner = PnEncoderNone;
     PumpFlush(P);
@@ -709,36 +854,27 @@ VOID PumpSetVolume(_Inout_ PPN_PUMP P, _In_ LONG VolumeDb16, _In_ BOOLEAN Muted)
 {
     P->VolumeDb16 = VolumeDb16;
     P->Muted = Muted;
-    /* linear gain = 10^(dB/20), computed with integer math: 2^(dB * log2(10)/20) = 2^(dB * 0.16610) */
-    LONG db = VolumeDb16 >> 16;   /* whole dB (negative) */
-    if (db >= 0) { P->VolumeGainQ15 = 32768; return; }
-    if (db <= -96) { P->VolumeGainQ15 = 0; return; }
-    /* table for 0..-95 dB in Q15 */
-    static const USHORT table[96] = {
-        32768,29205,26029,23198,20675,18427,16423,14637,13045,11627,10362, 9235, 8231, 7336, 6538, 5827,
-         5193, 4628, 4125, 3677, 3277, 2920, 2603, 2320, 2068, 1843, 1642, 1464, 1305, 1163, 1036,  924,
-          823,  734,  654,  583,  519,  463,  413,  368,  328,  292,  260,  232,  207,  184,  164,  146,
-          131,  116,  104,   92,   82,   73,   65,   58,   52,   46,   41,   37,   33,   29,   26,   23,
-           21,   18,   16,   15,   13,   12,   10,    9,    8,    7,    7,    6,    5,    5,    4,    4,
-            3,    3,    3,    2,    2,    2,    2,    1,    1,    1,    1,    1,    1,    1,    1,    0 };
-    P->VolumeGainQ15 = table[-db];
+    P->VolumeGainQ15 = PnVolumeGainQ15(VolumeDb16);
 }
 
+/* The encoder belongs to the pump thread while streaming: hand the change over. */
 VOID PumpSetSbcBitpool(_Inout_ PPN_PUMP P, _In_ UCHAR Bitpool)
 {
-    if (P->Cfg.Codec != PNA2DP_CODEC_SBC || !P->StreamActive) return;
-    if (Bitpool < P->Cfg.SbcMinBitpool) Bitpool = P->Cfg.SbcMinBitpool;
-    if (Bitpool > P->Cfg.SbcMaxBitpool) Bitpool = P->Cfg.SbcMaxBitpool;
-    P->Cfg.SbcBitpool = Bitpool;
-    sbc_encoder_set_bitpool(&P->Sbc, (sbc_u8)Bitpool);
-    P->CodecFrameBytes = P->Sbc.frame_length;
-    P->Cfg.BitrateBps = A2dpNominalBitrate(&P->Cfg);
+    if (P->Cfg.Codec != PNA2DP_CODEC_SBC || !P->StreamActive || !Bitpool) return;
+    InterlockedExchange(&P->PendingBitpool, Bitpool);
+    KeSetEvent(&P->WakeEvent, 0, FALSE);
 }
 
 VOID PumpSetAbr(_Inout_ PPN_PUMP P, _In_ BOOLEAN Enable)
 {
     P->Abr.Enabled = Enable;
-    if (!Enable && P->Abr.Level) { P->Abr.Level = 0; AbrApplyLevel(P); }
+    if (Enable || !P->Abr.Level) return;
+    if (P->StreamActive) {
+        InterlockedExchange(&P->PendingAbrReset, 1);
+        KeSetEvent(&P->WakeEvent, 0, FALSE);
+    } else {
+        P->Abr.Level = 0;   /* PumpStartStream sets up the encoder from scratch */
+    }
 }
 
 VOID PumpGetStats(_In_ PPN_PUMP P, _Out_ PPNA2DP_STATS Stats)
@@ -749,10 +885,41 @@ VOID PumpGetStats(_In_ PPN_PUMP P, _Out_ PPNA2DP_STATS Stats)
     Stats->AbrLevel = P->Abr.Level;
 }
 
+VOID PumpGetQuality(_In_ PPN_PUMP P, _Out_ PNA2DP_QUALITY *Quality)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&P->Lock, &irql);
+    *Quality = P->Quality;
+    if (!P->StreamActive) {
+        Quality->Health = PNA2DP_QUALITY_IDLE;
+        Quality->HealthyMs = Quality->CongestedMs = 0;
+        Quality->CompletedPackets = Quality->SlowPackets = Quality->FailedPackets = 0;
+        Quality->BacklogPeakUs = Quality->ObservationMs = 0;
+        Quality->BitrateBps = 0;
+    }
+    Quality->Size = sizeof(*Quality);
+    KeReleaseSpinLock(&P->Lock, irql);
+}
+
 VOID PumpResetStats(_Inout_ PPN_PUMP P)
 {
     RtlZeroMemory(&P->Stats, sizeof(P->Stats));
     P->TxMaxUs = 0;
+}
+
+NTSTATUS PumpSbcSample(_Inout_ PPN_PUMP P, _In_ ULONG Action, _Out_opt_ PNA2DP_SBC_SAMPLE *Sample)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&P->Lock, &irql);
+    NTSTATUS status = STATUS_SUCCESS;
+    if (Action > 2 || (!Action && !Sample)) status = STATUS_INVALID_PARAMETER;
+    else if (Action == 2) { RtlZeroMemory(&P->Sample, sizeof(P->Sample)); P->SampleState = 0; }
+    else if (Action == 1 && (!P->StreamActive || P->Owner != PnEncoderKernelSbc)) status = STATUS_INVALID_DEVICE_STATE;
+    else if (Action == 1) { RtlZeroMemory(&P->Sample, sizeof(P->Sample)); P->SampleState = 1; }
+    else if (P->SampleState != 2) status = STATUS_DEVICE_NOT_READY;
+    else { *Sample = P->Sample; RtlZeroMemory(&P->Sample, sizeof(P->Sample)); P->SampleState = 0; }
+    KeReleaseSpinLock(&P->Lock, irql);
+    return status;
 }
 
 ULONG PumpCurrentBitrate(_In_ PPN_PUMP P) { return P->StreamActive ? P->Cfg.BitrateBps : 0; }

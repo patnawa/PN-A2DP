@@ -50,6 +50,7 @@ typedef struct PNA2DP_DEVICE {
     BOOLEAN             AudioStreamOpen;
     LONG                VolumeDb16;
     BOOLEAN             Muted;
+    BOOLEAN             RemoteVolumeActive; /* Windows AVRCP service confirmed receiver volume */
 
     /* work items */
     PIO_WORKITEM        ConnectWorkItem;
@@ -64,6 +65,15 @@ typedef struct PNA2DP_DEVICE {
     KDPC                ReconnectDpc;
     ULONG               ReconnectAttempts;
     LONG                Removing;
+    BOOLEAN             Stopped;           /* DeviceStop done */
+    BOOLEAN             TornDown;          /* DeviceTeardown done */
+
+    /* Lifetime: one reference for the adapter plus one per open control handle. The
+     * memory outlives DeviceStop/DeviceTeardown so audio streams and control handles that
+     * are still open after a surprise removal only ever see a quiesced device. */
+    LONG                RefCount;
+    EX_RUNDOWN_REF      WorkRundown;       /* queued/running device work items */
+    EX_RUNDOWN_REF      ControlRundown;    /* control IOCTLs in progress */
 
     /* event waiters (IOCTL_PNA2DP_WAIT_EVENT) */
     PN_EVENT_WAITER     Waiters;
@@ -79,16 +89,24 @@ typedef struct PNA2DP_DEVICE {
 
 #define PNA2DP_DEVICE_SIGNATURE  0x32416E50u  /* 'PnA2' */
 
-/* Lifecycle (PASSIVE) */
+/* Lifecycle (PASSIVE)
+ *   DeviceCreate     allocate, refcount 1 (the adapter's reference)
+ *   DeviceStart      bring up link/pump/AVDTP; on failure the caller still runs Stop/Teardown
+ *   DeviceStop       quiesce: no more work, timers, IOCTLs or Bluetooth callbacks (idempotent)
+ *   DeviceTeardown   free the subsystems; the structure stays valid (idempotent)
+ *   DeviceRelease    drop a reference; the last one frees the memory */
+VOID     DeviceListInitialize(void);                     /* DriverEntry */
 NTSTATUS DeviceCreate(_In_ PDEVICE_OBJECT Fdo, _In_ PDEVICE_OBJECT Pdo, _In_ PDRIVER_OBJECT DriverObject,
                       _In_ CPnAdapterCommon *Adapter, _Out_ PPNA2DP_DEVICE *Device);
 NTSTATUS DeviceStart(_Inout_ PPNA2DP_DEVICE D);
 VOID     DeviceStop(_Inout_ PPNA2DP_DEVICE D);
-VOID     DeviceDestroy(_Inout_ PPNA2DP_DEVICE D);
-PPNA2DP_DEVICE DeviceFromFdo(_In_ PDEVICE_OBJECT Fdo);
+VOID     DeviceTeardown(_Inout_ PPNA2DP_DEVICE D);
+VOID     DeviceReference(_Inout_ PPNA2DP_DEVICE D);
+VOID     DeviceRelease(_In_ PPNA2DP_DEVICE D);
+PPNA2DP_DEVICE DeviceReferenceFromFdo(_In_ PDEVICE_OBJECT Fdo);   /* referenced; NULL if not started */
 
 /* Audio endpoint -> device */
-VOID     DeviceAudioStreamOpened(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG Rate, _In_ ULONG Channels,
+NTSTATUS DeviceAudioStreamOpened(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG Rate, _In_ ULONG Channels,
                                  _In_ ULONG ContainerBits, _In_ ULONG ValidBits, _In_ BOOLEAN IsFloat);
 VOID     DeviceAudioStreamClosed(_Inout_ PPNA2DP_DEVICE D);
 VOID     DeviceAudioStateChanged(_Inout_ PPNA2DP_DEVICE D, _In_ PN_AUDIO_REQUEST Request);   /* DISPATCH ok */

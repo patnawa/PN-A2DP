@@ -13,26 +13,36 @@
 /* Generic BRB submission                                                      */
 /* ------------------------------------------------------------------------- */
 
-static NTSTATUS PnFormatRequestWithBrb(_In_ WDFIOTARGET Target, _In_ WDFREQUEST Request, _In_ PBRB Brb, _In_ size_t BrbSize)
+/* Each long-lived request owns one preallocated memory object that is re-pointed at the BRB
+ * for every send. Creating a new object per send would leak one framework object per
+ * packet, because children of a request live until the request is deleted. */
+static NTSTATUS PnFormatRequestWithBrb(_In_ WDFIOTARGET Target, _In_ WDFREQUEST Request, _Inout_ WDFMEMORY *BrbMemory,
+                                       _In_ PBRB Brb, _In_ size_t BrbSize)
 {
-    WDF_OBJECT_ATTRIBUTES attr;
-    WDFMEMORY mem = NULL;
-    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
-    attr.ParentObject = Request;
-    NTSTATUS status = WdfMemoryCreatePreallocated(&attr, Brb, BrbSize, &mem);
-    if (!NT_SUCCESS(status)) return status;
+    if (!BrbSize) return STATUS_INVALID_PARAMETER;
+    NTSTATUS status;
+    if (*BrbMemory == NULL) {
+        WDF_OBJECT_ATTRIBUTES attr;
+        WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+        attr.ParentObject = Request;
+        status = WdfMemoryCreatePreallocated(&attr, Brb, BrbSize, BrbMemory);
+        if (!NT_SUCCESS(status)) { *BrbMemory = NULL; return status; }
+    } else {
+        status = WdfMemoryAssignBuffer(*BrbMemory, Brb, BrbSize);
+        if (!NT_SUCCESS(status)) return status;
+    }
     return WdfIoTargetFormatRequestForInternalIoctlOthers(Target, Request, IOCTL_INTERNAL_BTH_SUBMIT_BRB,
-                                                         mem, NULL, NULL, NULL, NULL, NULL);
+                                                         *BrbMemory, NULL, NULL, NULL, NULL, NULL);
 }
 
-static NTSTATUS PnSendBrbAsync(_In_ WDFIOTARGET Target, _In_ WDFREQUEST Request, _In_ PBRB Brb, _In_ size_t BrbSize,
-                               _In_ PFN_WDF_REQUEST_COMPLETION_ROUTINE Completion, _In_opt_ WDFCONTEXT Context)
+static NTSTATUS PnSendBrbAsync(_In_ WDFIOTARGET Target, _In_ WDFREQUEST Request, _Inout_ WDFMEMORY *BrbMemory, _In_ PBRB Brb,
+                               _In_ size_t BrbSize, _In_ PFN_WDF_REQUEST_COMPLETION_ROUTINE Completion, _In_opt_ WDFCONTEXT Context)
 {
     WDF_REQUEST_REUSE_PARAMS reuse;
     WDF_REQUEST_REUSE_PARAMS_INIT(&reuse, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_NOT_SUPPORTED);
     NTSTATUS status = WdfRequestReuse(Request, &reuse);
     if (!NT_SUCCESS(status)) return status;
-    status = PnFormatRequestWithBrb(Target, Request, Brb, BrbSize);
+    status = PnFormatRequestWithBrb(Target, Request, BrbMemory, Brb, BrbSize);
     if (!NT_SUCCESS(status)) return status;
     WdfRequestSetCompletionRoutine(Request, Completion, Context);
     if (!WdfRequestSend(Request, Target, NULL)) {
@@ -48,7 +58,7 @@ NTSTATUS PnLinkSendBrbSync(_In_ PPN_BTH_LINK Link, _In_ PBRB Brb, _In_ ULONG Brb
     PAGED_CODE();
     WDF_REQUEST_REUSE_PARAMS reuse;
     WDF_MEMORY_DESCRIPTOR desc;
-    ExAcquireFastMutex(&Link->SyncRequestMutex);
+    PnMutexAcquire(&Link->SyncRequestMutex);
     WDF_REQUEST_REUSE_PARAMS_INIT(&reuse, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_NOT_SUPPORTED);
     NTSTATUS status = WdfRequestReuse(Link->SyncRequest, &reuse);
     if (NT_SUCCESS(status)) {
@@ -56,13 +66,31 @@ NTSTATUS PnLinkSendBrbSync(_In_ PPN_BTH_LINK Link, _In_ PBRB Brb, _In_ ULONG Brb
         status = WdfIoTargetSendInternalIoctlOthersSynchronously(Link->IoTarget, Link->SyncRequest,
                                                                  IOCTL_INTERNAL_BTH_SUBMIT_BRB, &desc, NULL, NULL, NULL, NULL);
     }
-    ExReleaseFastMutex(&Link->SyncRequestMutex);
+    PnMutexRelease(&Link->SyncRequestMutex);
     return status;
 }
 
 /* ------------------------------------------------------------------------- */
 /* Query the profile driver DDI with a PnP IRP (we are not a WDF FDO)          */
 /* ------------------------------------------------------------------------- */
+
+NTSTATUS PnLinkEnsureActive(_Inout_ PPN_BTH_LINK Link)
+{
+    PAGED_CODE();
+    struct _BRB_ACL_GET_MODE mode;
+    Link->Ddi.BthInitializeBrb((PBRB)&mode, BRB_ACL_GET_MODE);
+    mode.BtAddress = Link->RemoteAddress;
+    NTSTATUS status = PnLinkSendBrbSync(Link, (PBRB)&mode, sizeof(mode));
+    if (!NT_SUCCESS(status)) { PN_WARN("ACL mode query failed 0x%08x", status); return status; }
+    if (mode.AclMode == ACL_MODE_ACTIVE) return STATUS_SUCCESS;
+
+    struct _BRB_ACL_ENTER_ACTIVE_MODE active;
+    Link->Ddi.BthInitializeBrb((PBRB)&active, BRB_ACL_ENTER_ACTIVE_MODE);
+    active.BtAddress = Link->RemoteAddress;
+    status = PnLinkSendBrbSync(Link, (PBRB)&active, sizeof(active));
+    PN_INFO("ACL mode %u -> active: 0x%08x", (ULONG)mode.AclMode, status);
+    return status;
+}
 
 static NTSTATUS PnQueryInterface(_In_ PDEVICE_OBJECT Target, _In_ const GUID *InterfaceType, _In_ USHORT Size,
                                  _In_ USHORT Version, _Out_ PINTERFACE Interface)
@@ -162,6 +190,9 @@ VOID PnLinkUninitialize(_Inout_ PPN_BTH_LINK Link)
         WdfObjectDelete(Link->SyncRequest);
         Link->SyncRequest = NULL;
     }
+    if (Link->DdiValid && Link->Ddi.Interface.InterfaceDereference) {
+        Link->Ddi.Interface.InterfaceDereference(Link->Ddi.Interface.Context);   /* taken by IRP_MN_QUERY_INTERFACE */
+    }
     Link->DdiValid = FALSE;
 }
 
@@ -178,6 +209,13 @@ NTSTATUS PnLinkQueryRemoteInfo(_Inout_ PPN_BTH_LINK Link)
     Link->RemoteAddress = info.address;
     Link->RemoteCod = info.classOfDevice;
     RtlStringCbCopyA(Link->RemoteName, sizeof(Link->RemoteName), info.name);
+    size_t nameBytes = 0;
+    RtlStringCbLengthA(Link->RemoteName, sizeof(Link->RemoteName), &nameBytes);
+    ULONG written = 0;
+    NTSTATUS nameStatus = RtlUTF8ToUnicodeN(Link->RemoteNameW, sizeof(Link->RemoteNameW) - sizeof(WCHAR),
+                                           &written, Link->RemoteName, (ULONG)nameBytes);
+    if (NT_SUCCESS(nameStatus) && written) Link->RemoteNameW[written / sizeof(WCHAR)] = 0;
+    else RtlStringCchCopyW(Link->RemoteNameW, PN_ARRAYSIZE(Link->RemoteNameW), L"Bluetooth Audio");
     return STATUS_SUCCESS;
 }
 
@@ -185,43 +223,76 @@ NTSTATUS PnLinkQueryRemoteInfo(_Inout_ PPN_BTH_LINK Link)
 /* SDP: read the remote AudioSink / AudioSource record                          */
 /* ------------------------------------------------------------------------- */
 
-static NTSTATUS PnSdpParseRecord(_In_ PPN_BTH_LINK Link, _In_ PBTH_SDP_STREAM_RESPONSE Rec)
+/* SDP data element header (Bluetooth Core, Vol 3, Part B, 3.3). The response comes from
+ * the remote device, so every length is checked against the bytes that remain. */
+#define PN_SDP_TYPE_UINT      1
+#define PN_SDP_TYPE_UUID      3
+#define PN_SDP_TYPE_SEQUENCE  6
+
+static BOOLEAN PnSdpElement(_In_reads_bytes_(Len) const UCHAR *P, _In_ ULONG Len, _Out_ PUCHAR Type,
+                            _Out_ const UCHAR **Data, _Out_ PULONG DataLen, _Out_ PULONG Total)
 {
-    PAGED_CODE();
-    BTHDDI_SDP_PARSE_INTERFACE parse;
-    RtlZeroMemory(&parse, sizeof(parse));
-    NTSTATUS status = PnQueryInterface(Link->Pdo, &GUID_BTHDDI_SDP_PARSE_INTERFACE, sizeof(parse),
-                                       BTHDDI_SDP_PARSE_INTERFACE_VERSION_FOR_QI, (PINTERFACE)&parse);
-    if (!NT_SUCCESS(status)) return status;
+    *Type = 0; *Data = NULL; *DataLen = 0; *Total = 0;
+    if (Len < 1) return FALSE;
+    UCHAR type = (UCHAR)(P[0] >> 3), si = (UCHAR)(P[0] & 7);
+    ULONG hdr = 1, dl;
+    if (type == 0) dl = 0;
+    else if (si <= 4) dl = 1u << si;
+    else if (si == 5) { if (Len < 2) return FALSE; dl = P[1]; hdr = 2; }
+    else if (si == 6) { if (Len < 3) return FALSE; dl = ((ULONG)P[1] << 8) | P[2]; hdr = 3; }
+    else { if (Len < 5) return FALSE; dl = ((ULONG)P[1] << 24) | ((ULONG)P[2] << 16) | ((ULONG)P[3] << 8) | P[4]; hdr = 5; }
+    if (dl > Len - hdr) return FALSE;
+    *Type = type; *Data = P + hdr; *DataLen = dl; *Total = hdr + dl;
+    return TRUE;
+}
 
-    PUCHAR next = NULL;
-    ULONG nextSize = 0;
-    parse.SdpGetNextElement(&Rec->response[0], Rec->responseSize, NULL, &next, &nextSize);
-    if (nextSize == 0) return STATUS_DEVICE_DATA_ERROR;
+static BOOLEAN PnSdpUint16(_In_ UCHAR Type, _In_reads_bytes_(Len) const UCHAR *D, _In_ ULONG Len, _Out_ PUSHORT Value)
+{
+    *Value = 0;
+    if ((Type != PN_SDP_TYPE_UINT && Type != PN_SDP_TYPE_UUID) || Len != 2) return FALSE;
+    *Value = (USHORT)(((USHORT)D[0] << 8) | D[1]);
+    return TRUE;
+}
 
-    PSDP_TREE_ROOT_NODE tree = NULL;
-    status = parse.SdpConvertStreamToTree(next, nextSize, &tree, PNA2DP_TAG_SDP);
-    if (!NT_SUCCESS(status)) return status;
-
-    /* Profile descriptor list: seq( seq( uuid16 0x110D, uint16 version ) ) */
-    PSDP_NODE node = NULL;
-    if (NT_SUCCESS(parse.SdpFindAttributeInTree(tree, SDP_ATTRIB_PROFILE_DESCRIPTOR_LIST, &node)) && node &&
-        node->hdr.Type == SDP_TYPE_SEQUENCE && node->u.sequence.Link.Flink) {
-        PSDP_NODE inner = CONTAINING_RECORD(node->u.sequence.Link.Flink, SDP_NODE, hdr.Link);
-        if (inner->hdr.Type == SDP_TYPE_SEQUENCE && inner->u.sequence.Link.Flink) {
-            PSDP_NODE uuid = CONTAINING_RECORD(inner->u.sequence.Link.Flink, SDP_NODE, hdr.Link);
-            if (uuid->hdr.Link.Flink) {
-                PSDP_NODE ver = CONTAINING_RECORD(uuid->hdr.Link.Flink, SDP_NODE, hdr.Link);
-                if (ver->hdr.SpecificType == SDP_ST_UINT16) Link->RemoteAvdtpVersion = ver->u.uint16;
+/* Profile descriptor list: seq( seq( uuid16 0x110D, uint16 version ) ... ) */
+static VOID PnSdpParseProfileList(_In_ PPN_BTH_LINK Link, _In_reads_bytes_(Len) const UCHAR *P, _In_ ULONG Len)
+{
+    while (Len) {
+        UCHAR t; const UCHAR *d; ULONG dl, tot;
+        if (!PnSdpElement(P, Len, &t, &d, &dl, &tot)) return;
+        if (t == PN_SDP_TYPE_SEQUENCE) {
+            UCHAR t1, t2; const UCHAR *d1, *d2; ULONG l1, l2, n1, n2;
+            USHORT uuid, ver;
+            if (PnSdpElement(d, dl, &t1, &d1, &l1, &n1) && PnSdpUint16(t1, d1, l1, &uuid) && uuid == A2DP_UUID_ADVANCED_AUDIO &&
+                PnSdpElement(d + n1, dl - n1, &t2, &d2, &l2, &n2) && PnSdpUint16(t2, d2, l2, &ver)) {
+                Link->RemoteAvdtpVersion = ver;
+                return;
             }
         }
+        P += tot; Len -= tot;
     }
-    /* SupportedFeatures 0x0311 */
-    node = NULL;
-    if (NT_SUCCESS(parse.SdpFindAttributeInTree(tree, 0x0311, &node)) && node && node->hdr.SpecificType == SDP_ST_UINT16) {
-        Link->RemoteSupportedFeatures = node->u.uint16;
+}
+
+static NTSTATUS PnSdpParseRecord(_In_ PPN_BTH_LINK Link, _In_reads_bytes_(Len) const UCHAR *P, _In_ ULONG Len)
+{
+    PAGED_CODE();
+    UCHAR t; const UCHAR *d; ULONG dl, tot;
+    /* AttributeLists: seq( seq(attribute list of record 1) ... ); accept a bare list too */
+    if (!PnSdpElement(P, Len, &t, &d, &dl, &tot) || t != PN_SDP_TYPE_SEQUENCE) return STATUS_DEVICE_DATA_ERROR;
+    {
+        UCHAR t1; const UCHAR *d1; ULONG l1, n1;
+        if (PnSdpElement(d, dl, &t1, &d1, &l1, &n1) && t1 == PN_SDP_TYPE_SEQUENCE) { d = d1; dl = l1; }
     }
-    parse.SdpFreeTree(tree);
+    /* attribute list: uint16 id, value, uint16 id, value, ... */
+    while (dl) {
+        UCHAR ti, tv; const UCHAR *di, *dv; ULONG li, lv, ni, nv;
+        USHORT id;
+        if (!PnSdpElement(d, dl, &ti, &di, &li, &ni) || !PnSdpUint16(ti, di, li, &id)) break;
+        if (!PnSdpElement(d + ni, dl - ni, &tv, &dv, &lv, &nv)) break;
+        if (id == SDP_ATTRIB_PROFILE_DESCRIPTOR_LIST && tv == PN_SDP_TYPE_SEQUENCE) PnSdpParseProfileList(Link, dv, lv);
+        else if (id == 0x0311) PnSdpUint16(tv, dv, lv, &Link->RemoteSupportedFeatures);   /* SupportedFeatures */
+        d += ni + nv; dl -= ni + nv;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -278,7 +349,8 @@ NTSTATUS PnLinkQueryRemoteSdp(_Inout_ PPN_BTH_LINK Link, _In_ USHORT ServiceUuid
                 status = WdfIoTargetSendIoctlSynchronously(Link->IoTarget, request, IOCTL_BTH_SDP_SERVICE_ATTRIBUTE_SEARCH,
                                                            &in, &out, NULL, NULL);
                 if (NT_SUCCESS(status)) {
-                    status = PnSdpParseRecord(Link, rec);
+                    ULONG cap = size - (ULONG)FIELD_OFFSET(BTH_SDP_STREAM_RESPONSE, response);
+                    status = PnSdpParseRecord(Link, rec->response, PN_MIN(rec->responseSize, cap));
                 }
                 PnFree(rec, PNA2DP_TAG_SDP);
             } else {
@@ -310,6 +382,8 @@ NTSTATUS PnLinkQueryRemoteSdp(_Inout_ PPN_BTH_LINK Link, _In_ USHORT ServiceUuid
 static VOID PnLinkServerIndication(_In_ PVOID Context, _In_ INDICATION_CODE Indication, _In_ PINDICATION_PARAMETERS Params)
 {
     PPN_BTH_LINK link = (PPN_BTH_LINK)Context;
+    PFN_PN_LINK_INCOMING onIncoming = link->OnIncoming;
+    if (!onIncoming) return;   /* unregistering: BthPort times the connect out */
     switch (Indication) {
     case IndicationRemoteConnect:
         if (Params->BtAddress != link->RemoteAddress) {
@@ -318,7 +392,7 @@ static VOID PnLinkServerIndication(_In_ PVOID Context, _In_ INDICATION_CODE Indi
             PnLinkRejectIncoming(link, Params);
             return;
         }
-        if (link->OnIncoming) link->OnIncoming(link->CallbackContext, Params);
+        onIncoming(link->CallbackContext, Params);
         break;
     default:
         break;
@@ -363,18 +437,23 @@ NTSTATUS PnLinkRegisterServer(_Inout_ PPN_BTH_LINK Link, _In_ PFN_PN_LINK_INCOMI
     return STATUS_SUCCESS;
 }
 
-VOID PnLinkUnregisterServer(_Inout_ PPN_BTH_LINK Link)
+BOOLEAN PnLinkUnregisterServer(_Inout_ PPN_BTH_LINK Link)
 {
     PAGED_CODE();
-    if (!Link->DdiValid) return;
+    BOOLEAN stuck = FALSE;
+    if (!Link->DdiValid) return FALSE;
+    Link->OnIncoming = NULL;   /* indications that still arrive become no-ops */
     if (Link->ServerHandle) {
-        struct _BRB_L2CA_UNREGISTER_SERVER brb;
+        struct _BRB_L2CA_UNREGISTER_SERVER brb = {};
         Link->Ddi.BthInitializeBrb((PBRB)&brb, BRB_L2CA_UNREGISTER_SERVER);
         brb.BtAddress = Link->RemoteAddress;
-        brb.Psm = 0;
+        brb.Psm = Link->RegBrb.PSM;
         brb.ServerHandle = Link->ServerHandle;
         NTSTATUS status = PnLinkSendBrbSync(Link, (PBRB)&brb, sizeof(brb));
-        if (!NT_SUCCESS(status)) PN_WARN("BRB_L2CA_UNREGISTER_SERVER failed 0x%08x", status);
+        if (!NT_SUCCESS(status)) {
+            PN_ERR("BRB_L2CA_UNREGISTER_SERVER failed 0x%08x; the server callback context stays allocated", status);
+            stuck = TRUE;
+        }
         Link->ServerHandle = NULL;
     }
     if (Link->Psm) {
@@ -383,13 +462,13 @@ VOID PnLinkUnregisterServer(_Inout_ PPN_BTH_LINK Link)
         PnLinkSendBrbSync(Link, (PBRB)&Link->PsmBrb, sizeof(Link->PsmBrb));
         Link->Psm = 0;
     }
-    Link->OnIncoming = NULL;
+    return stuck;
 }
 
 /* Reject with a one-shot BRB that frees itself on completion. */
 typedef struct _PN_REJECT_CTX {
-    PPN_BTH_LINK Link;
-    PBRB         Brb;
+    PFNBTH_FREE_BRB FreeBrb;
+    PBRB            Brb;
 } PN_REJECT_CTX, *PPN_REJECT_CTX;
 WDF_DECLARE_CONTEXT_TYPE(PN_REJECT_CTX);
 
@@ -400,7 +479,7 @@ static VOID PnRejectCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target,
     UNREFERENCED_PARAMETER(Params);
     UNREFERENCED_PARAMETER(Context);
     PPN_REJECT_CTX ctx = WdfObjectGet_PN_REJECT_CTX(Request);
-    if (ctx && ctx->Brb && ctx->Link) ctx->Link->Ddi.BthFreeBrb(ctx->Brb);
+    if (ctx && ctx->Brb && ctx->FreeBrb) ctx->FreeBrb(ctx->Brb);
     WdfObjectDelete(Request);
 }
 
@@ -416,7 +495,7 @@ NTSTATUS PnLinkRejectIncoming(_In_ PPN_BTH_LINK Link, _In_ PINDICATION_PARAMETER
         Link->Ddi.BthAllocateBrb(BRB_L2CA_OPEN_ENHANCED_CHANNEL_RESPONSE, PNA2DP_TAG_BRB);
     if (!brb) { WdfObjectDelete(request); return STATUS_INSUFFICIENT_RESOURCES; }
     PPN_REJECT_CTX ctx = WdfObjectGet_PN_REJECT_CTX(request);
-    ctx->Link = Link;
+    ctx->FreeBrb = Link->Ddi.BthFreeBrb;
     ctx->Brb = (PBRB)brb;
     brb->BtAddress = Params->BtAddress;
     brb->Psm = Params->Parameters.Connect.Request.PSM;
@@ -424,7 +503,8 @@ NTSTATUS PnLinkRejectIncoming(_In_ PPN_BTH_LINK Link, _In_ PINDICATION_PARAMETER
     brb->Response = CONNECT_RSP_RESULT_NO_RESOURCES;
     brb->ChannelFlags = CF_ROLE_EITHER;
     brb->ReferenceObject = Link->Fdo;
-    status = PnSendBrbAsync(Link->IoTarget, request, (PBRB)brb, sizeof(*brb), PnRejectCompletion, Link);
+    WDFMEMORY mem = NULL;   /* child of the one-shot request */
+    status = PnSendBrbAsync(Link->IoTarget, request, &mem, (PBRB)brb, sizeof(*brb), PnRejectCompletion, Link);
     if (!NT_SUCCESS(status)) {
         Link->Ddi.BthFreeBrb((PBRB)brb);
         WdfObjectDelete(request);
@@ -464,16 +544,48 @@ static NTSTATUS PnLinkRadioNotification(_In_ PVOID NotificationStructure, _Inout
             }
         }
     } else if (IsEqualGUID(n->Event, GUID_TARGET_DEVICE_REMOVE_COMPLETE) || IsEqualGUID(n->Event, GUID_TARGET_DEVICE_QUERY_REMOVE)) {
-        /* Radio going away: drop our file object reference so the removal can proceed. */
+        /* Radio going away: drop our file object reference so the removal can proceed. The
+         * registration itself is removed by DeviceStop; IoUnregisterPlugPlayNotificationEx
+         * waits for running callbacks and must not be called from this one. */
         PN_WARN("radio removal notification");
-        PnLinkUnregisterRadioEvents(link);
+        PFILE_OBJECT file = (PFILE_OBJECT)InterlockedExchangePointer((PVOID *)&link->RadioFileObject, NULL);
+        if (file) ObDereferenceObject(file);
+        link->RadioDeviceObject = NULL;
     }
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS PnQueryLocalRadio(PPN_BTH_LINK Link, PUNICODE_STRING Name, BTH_LOCAL_RADIO_INFO *Info)
+{
+    WDFIOTARGET target = NULL;
+    NTSTATUS status = WdfIoTargetCreate(Link->WdfDevice, WDF_NO_OBJECT_ATTRIBUTES, &target);
+    if (!NT_SUCCESS(status)) return status;
+    WDF_IO_TARGET_OPEN_PARAMS open;
+    WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(&open, Name, GENERIC_READ);
+    open.ShareAccess = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    status = WdfIoTargetOpen(target, &open);
+    if (NT_SUCCESS(status)) {
+        RtlZeroMemory(Info, sizeof(*Info));
+        WDF_MEMORY_DESCRIPTOR output;
+        WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&output, Info, sizeof(*Info));
+        WDF_REQUEST_SEND_OPTIONS options;
+        WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+        WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&options, WDF_REL_TIMEOUT_IN_SEC(2));
+        ULONG_PTR returned = 0;
+        status = WdfIoTargetSendIoctlSynchronously(target, NULL, IOCTL_BTH_GET_LOCAL_INFO,
+            NULL, &output, &options, &returned);
+        if (NT_SUCCESS(status) && returned < sizeof(*Info)) status = STATUS_INFO_LENGTH_MISMATCH;
+        WdfIoTargetClose(target);
+    }
+    WdfObjectDelete(target);
+    return status;
 }
 
 NTSTATUS PnLinkRegisterRadioEvents(_Inout_ PPN_BTH_LINK Link, _In_ PFN_PN_LINK_SCO OnSco, _In_ PFN_PN_LINK_ACL OnAcl, _In_ PVOID Context)
 {
     PAGED_CODE();
+    Link->RadioInfoValid = FALSE;
+    Link->RadioQueryStatus = STATUS_DEVICE_NOT_CONNECTED;
     PWSTR list = NULL;
     NTSTATUS status = IoGetDeviceInterfaces(&GUID_BTHPORT_DEVICE_INTERFACE, NULL, 0, &list);
     if (!NT_SUCCESS(status) || !list) {
@@ -484,11 +596,24 @@ NTSTATUS PnLinkRegisterRadioEvents(_Inout_ PPN_BTH_LINK Link, _In_ PFN_PN_LINK_S
         ExFreePool(list);
         return STATUS_DEVICE_NOT_CONNECTED;
     }
-    UNICODE_STRING name;
-    RtlInitUnicodeString(&name, list);
     PFILE_OBJECT file = NULL;
     PDEVICE_OBJECT dev = NULL;
-    status = IoGetDeviceObjectPointer(&name, FILE_READ_DATA, &file, &dev);
+    status = STATUS_DEVICE_NOT_CONNECTED;
+    for (PWSTR item = list; *item; item += wcslen(item) + 1) {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, item);
+        BTH_LOCAL_RADIO_INFO radio;
+        NTSTATUS query = PnQueryLocalRadio(Link, &name, &radio);
+        if (!NT_SUCCESS(query)) { Link->RadioQueryStatus = query; continue; }
+        if (!Link->LocalAddress || radio.localInfo.address != Link->LocalAddress) continue;
+        Link->RadioInfo = radio;
+        Link->RadioInfoValid = TRUE;
+        Link->RadioQueryStatus = STATUS_SUCCESS;
+        status = IoGetDeviceObjectPointer(&name, FILE_READ_DATA, &file, &dev);
+        PN_INFO("local radio %012llX: HCI %u LMP %u features %016llX", Link->LocalAddress,
+            radio.hciVersion, radio.radioInfo.lmpVersion, radio.radioInfo.lmpSupportedFeatures);
+        break;
+    }
     ExFreePool(list);
     if (!NT_SUCCESS(status)) {
         PN_WARN("IoGetDeviceObjectPointer(radio) failed 0x%08x", status);
@@ -540,52 +665,76 @@ static VOID PnReaderCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target,
     PPN_L2CAP_READER r = (PPN_L2CAP_READER)Context;
     PPN_L2CAP_CHANNEL ch = r->Channel;
     NTSTATUS status = Params->IoStatus.Status;
+    InterlockedExchange(&r->Outstanding, 0);
     if (NT_SUCCESS(status)) {
-        if (ch->OnReceive && r->Brb.BufferSize) {
+        if (!r->Stopping && r->Generation == ch->Generation && ch->OnReceive && r->Brb.BufferSize <= r->BufferSize && r->Brb.BufferSize) {
             ch->OnReceive(ch->CallbackContext, ch, r->Buffer, r->Brb.BufferSize);
         }
         KeInsertQueueDpc(&r->ResubmitDpc, r, NULL);
     } else {
         if (status != STATUS_CANCELLED) {
             PN_WARN("L2CAP read failed 0x%08x on %s channel", status, ch->IsMedia ? "media" : "signalling");
-            if (ch->OnClosed) ch->OnClosed(ch->CallbackContext, ch, status);
+            if (ch->OnClosed) ch->OnClosed(ch->CallbackContext, ch, status, r->Generation);
         }
         KeSetEvent(&r->StoppedEvent, 0, FALSE);
     }
 }
 
-static VOID PnReaderSubmit(_In_ PPN_L2CAP_READER R)
+static VOID PnReaderSubmitLocked(_In_ PPN_L2CAP_READER R)
 {
     PPN_L2CAP_CHANNEL ch = R->Channel;
     PPN_BTH_LINK link = ch->Link;
     WDF_REQUEST_REUSE_PARAMS reuse;
 
-    if (R->Stopping || ch->State != PnChannelConnected) {
+    /* the chain ends when stopped or when its connection is gone or was replaced */
+    if (R->Stopping || ch->State != PnChannelConnected || R->Generation != ch->Generation) {
         KeSetEvent(&R->StoppedEvent, 0, FALSE);
         return;
     }
     link->Ddi.BthReuseBrb((PBRB)&R->Brb, BRB_L2CA_ACL_TRANSFER);
     WDF_REQUEST_REUSE_PARAMS_INIT(&reuse, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_UNSUCCESSFUL);
-    WdfRequestReuse(R->Request, &reuse);
+    NTSTATUS status = WdfRequestReuse(R->Request, &reuse);
+    if (!NT_SUCCESS(status)) {
+        PN_WARN("reader request reuse failed 0x%08x", status);   /* never resend a request that is not ours */
+        KeSetEvent(&R->StoppedEvent, 0, FALSE);
+        return;
+    }
     R->Brb.BtAddress = ch->RemoteAddress;
     R->Brb.ChannelHandle = ch->Handle;
     R->Brb.TransferFlags = ACL_TRANSFER_DIRECTION_IN | ACL_SHORT_TRANSFER_OK;
     R->Brb.Buffer = R->Buffer;
     R->Brb.BufferMDL = NULL;
     R->Brb.BufferSize = R->BufferSize;
-    NTSTATUS status = PnFormatRequestWithBrb(link->IoTarget, R->Request, (PBRB)&R->Brb, sizeof(R->Brb));
+    status = PnFormatRequestWithBrb(link->IoTarget, R->Request, &R->BrbMemory, (PBRB)&R->Brb, sizeof(R->Brb));
     if (NT_SUCCESS(status)) {
         WdfRequestSetCompletionRoutine(R->Request, PnReaderCompletion, R);
         KeClearEvent(&R->StoppedEvent);
+        InterlockedExchange(&R->Outstanding, 1);
+        /* PnChannelStopReaders sets Stopping and then reads Outstanding: re-checking after
+         * publishing Outstanding means either this sees the stop or the stop cancels us */
+        if (R->Stopping || ch->State != PnChannelConnected || R->Generation != ch->Generation) {
+            InterlockedExchange(&R->Outstanding, 0);
+            KeSetEvent(&R->StoppedEvent, 0, FALSE);
+            return;
+        }
         if (!WdfRequestSend(R->Request, link->IoTarget, NULL)) {
+            InterlockedExchange(&R->Outstanding, 0);
             status = WdfRequestGetStatus(R->Request);
         } else {
             return;
         }
     }
     PN_WARN("reader submit failed 0x%08x", status);
-    if (ch->OnClosed) ch->OnClosed(ch->CallbackContext, ch, status);
+    if (ch->OnClosed) ch->OnClosed(ch->CallbackContext, ch, status, R->Generation);
     KeSetEvent(&R->StoppedEvent, 0, FALSE);
+}
+
+static VOID PnReaderSubmit(_In_ PPN_L2CAP_READER R)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&R->SendLock, &irql);
+    PnReaderSubmitLocked(R);
+    KeReleaseSpinLock(&R->SendLock, irql);
 }
 
 static VOID PnWriteCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
@@ -598,12 +747,14 @@ static VOID PnWriteCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, 
     ULONG bytes = w->Length;
     LONGLONG submitted = w->SubmitTimeHns;
     KIRQL irql;
+    if (ch->OnWriteDone) ch->OnWriteDone(ch->CallbackContext, ch, status, bytes, submitted);
+    /* PnChannelUninitialize waits for WritesInFlight == 0 before deleting the requests */
     KeAcquireSpinLock(&ch->Lock, &irql);
     RemoveEntryList(&w->Link);
     InsertTailList(&ch->FreeWrites, &w->Link);
+    InterlockedExchange(&w->Outstanding, 0);
     InterlockedDecrement(&ch->WritesInFlight);
     KeReleaseSpinLock(&ch->Lock, irql);
-    if (ch->OnWriteDone) ch->OnWriteDone(ch->CallbackContext, ch, status, bytes, submitted);
 }
 
 NTSTATUS PnChannelInitialize(_Out_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_BTH_LINK Link, _In_ BOOLEAN IsMedia, _In_ ULONG ReadBufferSize,
@@ -623,6 +774,7 @@ NTSTATUS PnChannelInitialize(_Out_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_BTH_LINK Link,
     Ch->CallbackContext = Context;
     Ch->WriteCapacity = WriteCapacity;
     KeInitializeSpinLock(&Ch->Lock);
+    ExInitializeFastMutex(&Ch->StartMutex);
     KeInitializeEvent(&Ch->DisconnectedEvent, NotificationEvent, TRUE);
     KeInitializeEvent(&Ch->ConnectedEvent, NotificationEvent, FALSE);
     InitializeListHead(&Ch->FreeWrites);
@@ -631,6 +783,10 @@ NTSTATUS PnChannelInitialize(_Out_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_BTH_LINK Link,
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
     attr.ParentObject = Link->WdfDevice;
     status = WdfRequestCreate(&attr, Link->IoTarget, &Ch->OpenCloseRequest);
+    if (!NT_SUCCESS(status)) return status;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = Link->WdfDevice;
+    status = WdfRequestCreate(&attr, Link->IoTarget, &Ch->CloseRequest);
     if (!NT_SUCCESS(status)) return status;
 
     for (ULONG i = 0; i < PN_L2CAP_READERS; i++) {
@@ -646,6 +802,7 @@ NTSTATUS PnChannelInitialize(_Out_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_BTH_LINK Link,
         status = WdfMemoryCreate(&attr, NonPagedPoolNx, PNA2DP_TAG_L2CAP, ReadBufferSize, &r->Memory, (PVOID *)&r->Buffer);
         if (!NT_SUCCESS(status)) return status;
         KeInitializeDpc(&r->ResubmitDpc, PnReaderResubmitDpc, NULL);
+        KeInitializeSpinLock(&r->SendLock);
         KeInitializeEvent(&r->StoppedEvent, NotificationEvent, TRUE);
         Ch->ReadersInitialized++;
     }
@@ -671,20 +828,29 @@ VOID PnChannelUninitialize(_Inout_ PPN_L2CAP_CHANNEL Ch)
     PAGED_CODE();
     if (!Ch->Link) return;
     PnChannelDisconnectSync(Ch);
+    PnChannelStopReaders(Ch);   /* cancel any read still pending from an earlier connection */
     for (ULONG i = 0; i < Ch->ReadersInitialized; i++) {
         KeWaitForSingleObject(&Ch->Readers[i].StoppedEvent, Executive, KernelMode, FALSE, NULL);
         if (Ch->Readers[i].Request) { WdfObjectDelete(Ch->Readers[i].Request); Ch->Readers[i].Request = NULL; }
     }
-    /* Outstanding writes complete with STATUS_CANCELLED/DISCONNECTED once the channel is closed. */
+    /* Outstanding writes complete once the channel is closed; cancel stragglers and wait,
+     * because deleting a request that is still owned by the target is a framework violation. */
     LARGE_INTEGER wait;
     wait.QuadPart = -PN_HNS_PER_MS * 20;
-    for (int spins = 0; spins < 100 && Ch->WritesInFlight > 0; spins++) {
+    for (ULONG round = 0; Ch->WritesInFlight > 0; round++) {
+        if (round % 50 == 0) {
+            for (ULONG i = 0; i < PN_L2CAP_MAX_WRITES; i++) {
+                if (Ch->Writes[i].Outstanding && Ch->Writes[i].Request) WdfRequestCancelSentRequest(Ch->Writes[i].Request);
+            }
+            if (round) PN_WARN("%s channel: %d writes still in flight", Ch->IsMedia ? "media" : "signalling", Ch->WritesInFlight);
+        }
         KeDelayExecutionThread(KernelMode, FALSE, &wait);
     }
     for (ULONG i = 0; i < PN_L2CAP_MAX_WRITES; i++) {
         if (Ch->Writes[i].Request) { WdfObjectDelete(Ch->Writes[i].Request); Ch->Writes[i].Request = NULL; }
     }
     if (Ch->OpenCloseRequest) { WdfObjectDelete(Ch->OpenCloseRequest); Ch->OpenCloseRequest = NULL; }
+    if (Ch->CloseRequest) { WdfObjectDelete(Ch->CloseRequest); Ch->CloseRequest = NULL; }
     Ch->Link = NULL;
 }
 
@@ -700,14 +866,23 @@ LONG PnChannelWritesInFlight(_In_ PPN_L2CAP_CHANNEL Ch)
 
 static VOID PnChannelIndication(_In_ PVOID Context, _In_ INDICATION_CODE Indication, _In_ PINDICATION_PARAMETERS_ENHANCED Params)
 {
-    UNREFERENCED_PARAMETER(Params);
     PPN_L2CAP_CHANNEL ch = (PPN_L2CAP_CHANNEL)Context;
     switch (Indication) {
-    case IndicationRemoteDisconnect:
-        PN_INFO("remote closed %s channel", ch->IsMedia ? "media" : "signalling");
-        PnChannelDisconnect(ch);           /* complete the teardown from our side */
-        if (ch->OnClosed) ch->OnClosed(ch->CallbackContext, ch, STATUS_CONNECTION_DISCONNECTED);
+    case IndicationRemoteDisconnect: {
+        /* The channel object is reused across connections: act only if the indication is
+         * for the connection that is current, and only on that generation. If we are
+         * already closing, the closer owns the state change and no down event is raised. */
+        KIRQL irql;
+        KeAcquireSpinLock(&ch->Lock, &irql);
+        BOOLEAN mine = Params && Params->ConnectionHandle &&
+                       ((ch->State == PnChannelConnected && Params->ConnectionHandle == ch->Handle) ||
+                        (ch->State == PnChannelConnecting && Params->ConnectionHandle == ch->OpenBrb.ChannelHandle));
+        ULONG gen = ch->Generation;
+        KeReleaseSpinLock(&ch->Lock, irql);
+        PN_INFO("remote closed %s channel%s", ch->IsMedia ? "media" : "signalling", mine ? "" : " (not the current connection)");
+        if (mine && PnChannelDisconnectGen(ch, gen) && ch->OnClosed) ch->OnClosed(ch->CallbackContext, ch, STATUS_CONNECTION_DISCONNECTED, gen);
         break;
+    }
     default:
         break;
     }
@@ -749,12 +924,14 @@ static VOID PnOpenCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, _
         ch->State = PnChannelConnected;
     } else {
         ch->State = PnChannelDisconnected;
-        KeSetEvent(&ch->DisconnectedEvent, 0, FALSE);
     }
     ch->OpenStatus = status;
+    /* signal under the lock, so a new connect/accept that sees the new state and clears the
+     * events cannot be overtaken by this completion's signals */
+    KeSetEvent(&ch->ConnectedEvent, 0, FALSE);
+    if (!NT_SUCCESS(status)) KeSetEvent(&ch->DisconnectedEvent, 0, FALSE);
     KeReleaseSpinLock(&ch->Lock, irql);
     PN_INFO("%s channel open: 0x%08x mtu out %u in %u", ch->IsMedia ? "media" : "signalling", status, ch->OutMtu, ch->InMtu);
-    KeSetEvent(&ch->ConnectedEvent, 0, FALSE);
     if (disconnectNow) {
         PnChannelDisconnect(ch);
     }
@@ -772,6 +949,9 @@ NTSTATUS PnChannelConnect(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ USHORT Psm, _In_ US
     }
     Ch->State = PnChannelConnecting;
     Ch->RemoteInitiated = FALSE;
+    Ch->OpenStatus = STATUS_PENDING;
+    Ch->Generation++;
+    Ch->ReadersStarted = FALSE;
     KeClearEvent(&Ch->ConnectedEvent);
     KeClearEvent(&Ch->DisconnectedEvent);
     KeReleaseSpinLock(&Ch->Lock, irql);
@@ -785,11 +965,13 @@ NTSTATUS PnChannelConnect(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ USHORT Psm, _In_ US
     brb->CallbackContext = Ch;
     brb->ReferenceObject = link->Fdo;
 
-    NTSTATUS status = PnSendBrbAsync(link->IoTarget, Ch->OpenCloseRequest, (PBRB)brb, sizeof(*brb), PnOpenCompletion, Ch);
+    NTSTATUS status = PnSendBrbAsync(link->IoTarget, Ch->OpenCloseRequest, &Ch->OpenCloseBrbMemory, (PBRB)brb, sizeof(*brb), PnOpenCompletion, Ch);
     if (!NT_SUCCESS(status)) {
         KeAcquireSpinLock(&Ch->Lock, &irql);
         Ch->State = PnChannelDisconnected;
+        Ch->OpenStatus = status;
         KeSetEvent(&Ch->DisconnectedEvent, 0, FALSE);
+        KeSetEvent(&Ch->ConnectedEvent, 0, FALSE);
         KeReleaseSpinLock(&Ch->Lock, irql);
         return status;
     }
@@ -815,6 +997,9 @@ NTSTATUS PnChannelAccept(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ PINDICATION_PARAMETE
     }
     Ch->State = PnChannelConnecting;
     Ch->RemoteInitiated = TRUE;
+    Ch->OpenStatus = STATUS_PENDING;
+    Ch->Generation++;
+    Ch->ReadersStarted = FALSE;
     KeClearEvent(&Ch->ConnectedEvent);
     KeClearEvent(&Ch->DisconnectedEvent);
     KeReleaseSpinLock(&Ch->Lock, irql);
@@ -830,11 +1015,13 @@ NTSTATUS PnChannelAccept(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ PINDICATION_PARAMETE
     brb->CallbackContext = Ch;
     brb->ReferenceObject = link->Fdo;
 
-    NTSTATUS status = PnSendBrbAsync(link->IoTarget, Ch->OpenCloseRequest, (PBRB)brb, sizeof(*brb), PnOpenCompletion, Ch);
+    NTSTATUS status = PnSendBrbAsync(link->IoTarget, Ch->OpenCloseRequest, &Ch->OpenCloseBrbMemory, (PBRB)brb, sizeof(*brb), PnOpenCompletion, Ch);
     if (!NT_SUCCESS(status)) {
         KeAcquireSpinLock(&Ch->Lock, &irql);
         Ch->State = PnChannelDisconnected;
+        Ch->OpenStatus = status;
         KeSetEvent(&Ch->DisconnectedEvent, 0, FALSE);
+        KeSetEvent(&Ch->ConnectedEvent, 0, FALSE);
         KeReleaseSpinLock(&Ch->Lock, irql);
     }
     return status;
@@ -843,73 +1030,144 @@ NTSTATUS PnChannelAccept(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ PINDICATION_PARAMETE
 static VOID PnCloseCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
                               _In_ WDFCONTEXT Context)
 {
-    UNREFERENCED_PARAMETER(Request); UNREFERENCED_PARAMETER(Target); UNREFERENCED_PARAMETER(Params);
+    UNREFERENCED_PARAMETER(Request); UNREFERENCED_PARAMETER(Target);
     PPN_L2CAP_CHANNEL ch = (PPN_L2CAP_CHANNEL)Context;
     KIRQL irql;
+    if (!NT_SUCCESS(Params->IoStatus.Status)) PN_WARN("%s channel close completed with 0x%08x", ch->IsMedia ? "media" : "signalling", Params->IoStatus.Status);
     KeAcquireSpinLock(&ch->Lock, &irql);
     ch->State = PnChannelDisconnected;
     ch->Handle = NULL;
-    KeReleaseSpinLock(&ch->Lock, irql);
     KeSetEvent(&ch->DisconnectedEvent, 0, FALSE);
+    KeReleaseSpinLock(&ch->Lock, irql);
 }
 
-BOOLEAN PnChannelDisconnect(_Inout_ PPN_L2CAP_CHANNEL Ch)
+static BOOLEAN PnChannelDisconnectEx(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ BOOLEAN CheckGen, _In_ ULONG Generation)
 {
     PPN_BTH_LINK link = Ch->Link;
     KIRQL irql;
-    PnChannelStopReaders(Ch);
+    if (!link) return FALSE;   /* never initialized */
     KeAcquireSpinLock(&Ch->Lock, &irql);
-    if (Ch->State == PnChannelConnecting) {
-        Ch->State = PnChannelDisconnecting;     /* close after the open completes */
-        KeClearEvent(&Ch->DisconnectedEvent);
-        KeReleaseSpinLock(&Ch->Lock, irql);
-        return TRUE;
-    }
-    if (Ch->State != PnChannelConnected) {
+    if ((CheckGen && Ch->Generation != Generation) || (Ch->State != PnChannelConnecting && Ch->State != PnChannelConnected)) {
         KeReleaseSpinLock(&Ch->Lock, irql);
         return FALSE;
     }
-    Ch->State = PnChannelDisconnecting;
+    BOOLEAN wasConnected = Ch->State == PnChannelConnected;
+    Ch->State = PnChannelDisconnecting;     /* while Connecting: the open completion closes it */
     KeClearEvent(&Ch->DisconnectedEvent);
     KeReleaseSpinLock(&Ch->Lock, irql);
 
-    struct _BRB_L2CA_CLOSE_CHANNEL *brb = (struct _BRB_L2CA_CLOSE_CHANNEL *)&Ch->OpenBrb;
-    link->Ddi.BthReuseBrb((PBRB)brb, BRB_L2CA_CLOSE_CHANNEL);
+    /* resubmits now see a channel that is not Connected and end their chains */
+    PnChannelStopReaders(Ch);
+    if (!wasConnected) return TRUE;
+
+    struct _BRB_L2CA_CLOSE_CHANNEL *brb = &Ch->CloseBrb;
+    link->Ddi.BthInitializeBrb((PBRB)brb, BRB_L2CA_CLOSE_CHANNEL);
     brb->BtAddress = Ch->RemoteAddress;
     brb->ChannelHandle = Ch->Handle;
-    NTSTATUS status = PnSendBrbAsync(link->IoTarget, Ch->OpenCloseRequest, (PBRB)brb, sizeof(*brb), PnCloseCompletion, Ch);
+    NTSTATUS status = PnSendBrbAsync(link->IoTarget, Ch->CloseRequest, &Ch->CloseBrbMemory, (PBRB)brb, sizeof(*brb), PnCloseCompletion, Ch);
     if (!NT_SUCCESS(status)) {
         /* Already gone; mark closed. */
         KeAcquireSpinLock(&Ch->Lock, &irql);
         Ch->State = PnChannelDisconnected;
         Ch->Handle = NULL;
-        KeReleaseSpinLock(&Ch->Lock, irql);
         KeSetEvent(&Ch->DisconnectedEvent, 0, FALSE);
+        KeReleaseSpinLock(&Ch->Lock, irql);
     }
     return TRUE;
 }
 
+BOOLEAN PnChannelDisconnect(_Inout_ PPN_L2CAP_CHANNEL Ch)
+{
+    return PnChannelDisconnectEx(Ch, FALSE, 0);
+}
+
+BOOLEAN PnChannelDisconnectGen(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ ULONG Generation)
+{
+    return PnChannelDisconnectEx(Ch, TRUE, Generation);
+}
+
+/* DeviceStop: an outgoing open to a speaker that is off can take the full page timeout, and
+ * its caller holds StateMutex. Cancelling it lets the caller return early. */
+VOID PnChannelCancelConnect(_Inout_ PPN_L2CAP_CHANNEL Ch)
+{
+    KIRQL irql;
+    BOOLEAN cancel = FALSE;
+    if (!Ch->Link || !Ch->OpenCloseRequest) return;
+    KeAcquireSpinLock(&Ch->Lock, &irql);
+    cancel = (Ch->State == PnChannelConnecting && !Ch->RemoteInitiated);
+    KeReleaseSpinLock(&Ch->Lock, irql);
+    if (cancel) WdfRequestCancelSentRequest(Ch->OpenCloseRequest);
+}
+
+/* Closes the current connection and waits until it is closed. An accept of a new connection
+ * clears DisconnectedEvent, so the wait is for this generation: it ends once the channel is
+ * closed or a newer connection has replaced it. */
 VOID PnChannelDisconnectSync(_Inout_ PPN_L2CAP_CHANNEL Ch)
 {
     PAGED_CODE();
-    PnChannelDisconnect(Ch);
-    KeWaitForSingleObject(&Ch->DisconnectedEvent, Executive, KernelMode, FALSE, NULL);
+    KIRQL irql;
+    if (!Ch->Link) return;
+    KeAcquireSpinLock(&Ch->Lock, &irql);
+    ULONG gen = Ch->Generation;
+    KeReleaseSpinLock(&Ch->Lock, irql);
+    PnChannelDisconnectGen(Ch, gen);
+    for (;;) {
+        LARGE_INTEGER t;
+        t.QuadPart = -PN_HNS_PER_MS * 100;
+        if (KeWaitForSingleObject(&Ch->DisconnectedEvent, Executive, KernelMode, FALSE, &t) == STATUS_SUCCESS) return;
+        KeAcquireSpinLock(&Ch->Lock, &irql);
+        BOOLEAN done = Ch->Generation != gen || Ch->State == PnChannelFree || Ch->State == PnChannelDisconnected;
+        KeReleaseSpinLock(&Ch->Lock, irql);
+        if (done) return;
+    }
 }
 
+/* PASSIVE. Starts the reader chains once per connection. A chain of the previous
+ * connection may still be ending (cancelled read, queued resubmit DPC): wait briefly for
+ * it, and skip a reader whose request is still owned by the stack rather than resend it. */
 NTSTATUS PnChannelStartReaders(_Inout_ PPN_L2CAP_CHANNEL Ch)
 {
-    for (ULONG i = 0; i < Ch->ReadersInitialized; i++) {
-        Ch->Readers[i].Stopping = 0;
-        PnReaderSubmit(&Ch->Readers[i]);
+    PAGED_CODE();
+    KIRQL irql;
+    ULONG gen;
+    if (!Ch->Link) return STATUS_INVALID_DEVICE_STATE;
+    /* Callers (event worker, AvdtpConnectSignalling, AvdtpOpen) can overlap for different
+     * generations; only one may be claiming readers at a time. Innermost mutex: nothing
+     * below takes another one (OnClosed only queues an event). */
+    PnMutexAcquire(&Ch->StartMutex);
+    KeAcquireSpinLock(&Ch->Lock, &irql);
+    BOOLEAN go = Ch->State == PnChannelConnected && !Ch->ReadersStarted;
+    if (go) Ch->ReadersStarted = TRUE;
+    gen = Ch->Generation;
+    KeReleaseSpinLock(&Ch->Lock, irql);
+    for (ULONG i = 0; go && i < Ch->ReadersInitialized; i++) {
+        PPN_L2CAP_READER r = &Ch->Readers[i];
+        LARGE_INTEGER t;
+        t.QuadPart = -PN_HNS_PER_MS * 500;
+        /* not signalled: a read or a resubmit DPC of the old chain is still pending */
+        NTSTATUS wait = KeWaitForSingleObject(&r->StoppedEvent, Executive, KernelMode, FALSE, &t);
+        KeAcquireSpinLock(&Ch->Lock, &irql);
+        BOOLEAN live = Ch->Generation == gen && Ch->State == PnChannelConnected;
+        BOOLEAN ok = live && wait == STATUS_SUCCESS && !r->Outstanding;
+        if (ok) { r->Generation = gen; r->Stopping = 0; }
+        KeReleaseSpinLock(&Ch->Lock, irql);
+        if (!live) break;   /* this connection is gone; a newer one starts its own readers */
+        if (!ok) { PN_WARN("%s reader %u still busy from the previous connection; skipped", Ch->IsMedia ? "media" : "signalling", i); continue; }
+        PnReaderSubmit(r);
     }
+    PnMutexRelease(&Ch->StartMutex);
     return STATUS_SUCCESS;
 }
 
 VOID PnChannelStopReaders(_Inout_ PPN_L2CAP_CHANNEL Ch)
 {
     for (ULONG i = 0; i < Ch->ReadersInitialized; i++) {
-        InterlockedExchange(&Ch->Readers[i].Stopping, 1);
-        if (Ch->Readers[i].Request) WdfRequestCancelSentRequest(Ch->Readers[i].Request);
+        PPN_L2CAP_READER r = &Ch->Readers[i];
+        KIRQL irql;
+        KeAcquireSpinLock(&r->SendLock, &irql);
+        InterlockedExchange(&r->Stopping, 1);
+        if (r->Outstanding && r->Request) WdfRequestCancelSentRequest(r->Request);
+        KeReleaseSpinLock(&r->SendLock, irql);
     }
 }
 
@@ -946,7 +1204,8 @@ NTSTATUS PnChannelSubmitWrite(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_L2CAP_WRITE
 
     link->Ddi.BthReuseBrb((PBRB)&W->Brb, BRB_L2CA_ACL_TRANSFER);
     WDF_REQUEST_REUSE_PARAMS_INIT(&reuse, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_UNSUCCESSFUL);
-    WdfRequestReuse(W->Request, &reuse);
+    NTSTATUS status = WdfRequestReuse(W->Request, &reuse);
+    if (!NT_SUCCESS(status)) { PnChannelReleaseWrite(Ch, W); return status; }
     W->Brb.BtAddress = Ch->RemoteAddress;
     W->Brb.ChannelHandle = Ch->Handle;
     W->Brb.TransferFlags = ACL_TRANSFER_DIRECTION_OUT;
@@ -954,11 +1213,13 @@ NTSTATUS PnChannelSubmitWrite(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_L2CAP_WRITE
     W->Brb.BufferMDL = NULL;
     W->Brb.BufferSize = W->Length;
     W->SubmitTimeHns = PnNowHns();
-    NTSTATUS status = PnFormatRequestWithBrb(link->IoTarget, W->Request, (PBRB)&W->Brb, sizeof(W->Brb));
+    status = PnFormatRequestWithBrb(link->IoTarget, W->Request, &W->BrbMemory, (PBRB)&W->Brb, sizeof(W->Brb));
     if (NT_SUCCESS(status)) {
         WdfRequestSetCompletionRoutine(W->Request, PnWriteCompletion, W);
         InterlockedIncrement(&Ch->WritesInFlight);
+        InterlockedExchange(&W->Outstanding, 1);
         if (!WdfRequestSend(W->Request, link->IoTarget, NULL)) {
+            InterlockedExchange(&W->Outstanding, 0);
             status = WdfRequestGetStatus(W->Request);
             InterlockedDecrement(&Ch->WritesInFlight);
         } else {

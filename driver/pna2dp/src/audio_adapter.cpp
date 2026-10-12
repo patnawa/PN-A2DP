@@ -22,6 +22,12 @@ CPnAdapterCommon::~CPnAdapterCommon()
 {
     PAGED_CODE();
     Cleanup();
+    /* The miniports and streams hold references on this object, so nothing that keeps a
+     * raw pointer to the device context is left when the destructor runs. */
+    if (m_Device) {
+        DeviceRelease(m_Device);
+        m_Device = NULL;
+    }
 }
 
 #pragma code_seg("PAGE")
@@ -30,9 +36,12 @@ STDMETHODIMP_(NTSTATUS) CPnAdapterCommon::NonDelegatingQueryInterface(_In_ REFII
     PAGED_CODE();
     if (IsEqualGUIDAligned(Interface, IID_IUnknown)) *Object = PVOID(PUNKNOWN((PPNADAPTERCOMMON)this));
     else if (IsEqualGUIDAligned(Interface, IID_IPnAdapterCommon)) *Object = PVOID((PPNADAPTERCOMMON)this);
-    else if (IsEqualGUIDAligned(Interface, IID_IAdapterPowerManagement3)) *Object = PVOID((PADAPTERPOWERMANAGEMENT3)this);
-    else if (IsEqualGUIDAligned(Interface, IID_IAdapterPowerManagement2)) *Object = PVOID((PADAPTERPOWERMANAGEMENT2)this);
-    else if (IsEqualGUIDAligned(Interface, IID_IAdapterPowerManagement)) *Object = PVOID((PADAPTERPOWERMANAGEMENT)this);
+    /* IAdapterPowerManagement, ...2 and ...3 all derive from IUnknown in portcls.h; this class
+     * only implements ...3, whose vtable starts with the v1 and v2 methods. A cast to the
+     * v1/v2 types would be a reinterpret_cast to the IPnAdapterCommon subobject. */
+    else if (IsEqualGUIDAligned(Interface, IID_IAdapterPowerManagement3) ||
+             IsEqualGUIDAligned(Interface, IID_IAdapterPowerManagement2) ||
+             IsEqualGUIDAligned(Interface, IID_IAdapterPowerManagement)) *Object = PVOID((PADAPTERPOWERMANAGEMENT3)this);
     else *Object = NULL;
     if (*Object) { PUNKNOWN(*Object)->AddRef(); return STATUS_SUCCESS; }
     return STATUS_INVALID_PARAMETER;
@@ -45,6 +54,7 @@ STDMETHODIMP_(NTSTATUS) CPnAdapterCommon::Init(_In_ PDEVICE_OBJECT DeviceObject,
     m_DeviceObject = DeviceObject;
     m_DriverObject = DriverObject;
     m_PowerState = PowerDeviceD0;
+    m_Topology = NULL;
     m_Volume[0] = m_Volume[1] = 0;
     m_Mute[0] = m_Mute[1] = FALSE;
     NTSTATUS status = PcGetPhysicalDeviceObject(DeviceObject, &m_Pdo);
@@ -66,9 +76,11 @@ STDMETHODIMP_(VOID) CPnAdapterCommon::Cleanup()
     PAGED_CODE();
     RemoveFilters();
     if (m_Device) {
+        /* Quiesce and free the Bluetooth/pump side now (this runs on surprise removal too,
+         * while audio streams may still be open). The device structure itself is kept until
+         * the destructor, because streams and control handles may still reference it. */
         DeviceStop(m_Device);
-        DeviceDestroy(m_Device);
-        m_Device = NULL;
+        DeviceTeardown(m_Device);
     }
     if (m_WdfDevice) {
         WdfObjectDelete(m_WdfDevice);
@@ -81,29 +93,72 @@ STDMETHODIMP_(PPNA2DP_DEVICE) CPnAdapterCommon::GetDevice() { return m_Device; }
 STDMETHODIMP_(VOID) CPnAdapterCommon::SetWaveMiniport(_In_opt_ CPnMiniportWaveRT *Wave) { m_Wave = Wave; }
 
 STDMETHODIMP_(LONG) CPnAdapterCommon::GetVolume(_In_ ULONG Channel) { return m_Volume[Channel & 1]; }
+/* The volume and mute nodes advertise a single (master) channel, so every channel index
+ * sets both entries. */
 STDMETHODIMP_(VOID) CPnAdapterCommon::SetVolume(_In_ ULONG Channel, _In_ LONG Db16)
 {
-    if (Channel == (ULONG)-1) { m_Volume[0] = m_Volume[1] = Db16; } else m_Volume[Channel & 1] = Db16;
-    if (m_Device) DeviceAudioVolumeChanged(m_Device, PN_MAX(m_Volume[0], m_Volume[1]), m_Mute[0] && m_Mute[1]);
+    UNREFERENCED_PARAMETER(Channel);
+    m_Volume[0] = m_Volume[1] = Db16;
+    if (m_Device) DeviceAudioVolumeChanged(m_Device, Db16, m_Mute[0] != FALSE);
+    if (m_Topology) { m_Topology->GenerateVolumeEvent(); m_Topology->GenerateRemoteVolumeEvent(); }
 }
 STDMETHODIMP_(BOOL) CPnAdapterCommon::GetMute(_In_ ULONG Channel) { return m_Mute[Channel & 1]; }
 STDMETHODIMP_(VOID) CPnAdapterCommon::SetMute(_In_ ULONG Channel, _In_ BOOL Mute)
 {
-    if (Channel == (ULONG)-1) { m_Mute[0] = m_Mute[1] = Mute; } else m_Mute[Channel & 1] = Mute;
-    if (m_Device) DeviceAudioVolumeChanged(m_Device, PN_MAX(m_Volume[0], m_Volume[1]), m_Mute[0] && m_Mute[1]);
+    UNREFERENCED_PARAMETER(Channel);
+    m_Mute[0] = m_Mute[1] = Mute;
+    if (m_Device) DeviceAudioVolumeChanged(m_Device, m_Volume[0], Mute != FALSE);
+    if (m_Topology) { m_Topology->GenerateVolumeEvent(); m_Topology->GenerateRemoteVolumeEvent(); }
+}
+
+VOID CPnAdapterCommon::SetRemoteVolume(_In_ LONG Db16)
+{
+    /* The receiver already applies this attenuation. Applying it again in the
+     * encoder would make playback too quiet. */
+    if (!m_Device) return;
+    BOOLEAN first = !m_Device->RemoteVolumeActive;
+    m_Device->RemoteVolumeActive = TRUE;
+    BOOL muted = Db16 <= PN_REMOTE_VOLUME_MIN_DB16;
+    if (!muted) m_Volume[0] = m_Volume[1] = Db16;
+    m_Mute[0] = m_Mute[1] = muted;
+    DeviceAudioVolumeChanged(m_Device, m_Volume[0], muted != FALSE);
+    if (m_Topology) m_Topology->GenerateVolumeEvent(); // no echo back to AVRCP
+    PN_INFO("remote volume %ld/65536 dB, mute %u%s", Db16, muted, first ? " (absolute volume active)" : "");
+}
+
+VOID CPnAdapterCommon::DisableRemoteVolume()
+{
+    if (!m_Device || !m_Device->RemoteVolumeActive) return;
+    m_Device->RemoteVolumeActive = FALSE;
+    DeviceAudioVolumeChanged(m_Device, m_Volume[0], m_Mute[0] != FALSE);
+    PN_INFO("absolute volume detached; software volume active");
 }
 
 /* ---- subdevice installation --------------------------------------------- */
 
 #pragma code_seg("PAGE")
-NTSTATUS CPnAdapterCommon::InstallSubdevice(_In_ PIRP Irp, _In_ PCWSTR Name, _In_ REFGUID PortClassId, _In_ PUNKNOWN Miniport, _Out_ PUNKNOWN *OutPort)
+NTSTATUS CPnAdapterCommon::InstallSubdevice(_In_ PIRP Irp, _In_ PRESOURCELIST Resources, _In_ PCWSTR Name, _In_ REFGUID PortClassId, _In_ PUNKNOWN Miniport, _Out_ PUNKNOWN *OutPort)
 {
     PAGED_CODE();
     PPORT port = NULL;
     *OutPort = NULL;
     NTSTATUS status = PcNewPort(&port, PortClassId);
     if (!NT_SUCCESS(status)) return status;
-    status = port->Init(m_DeviceObject, Irp, Miniport, PUNKNOWN((PPNADAPTERCOMMON)this), NULL);
+    /* Set the per-headset adapter name before EndpointBuilder sees this interface.
+     * The INF's static name cannot distinguish multiple Bluetooth receivers. */
+    UNICODE_STRING reference, link;
+    RtlInitUnicodeString(&reference, Name);
+    NTSTATUS nameStatus = IoRegisterDeviceInterface(m_Pdo, &KSCATEGORY_AUDIO, &reference, &link);
+    if (NT_SUCCESS(nameStatus)) {
+        size_t nameBytes = 0;
+        RtlStringCbLengthW(m_Device->Link.RemoteNameW, sizeof(m_Device->Link.RemoteNameW), &nameBytes);
+        nameStatus = IoSetDeviceInterfacePropertyData(&link, &DEVPKEY_DeviceInterface_FriendlyName,
+            LOCALE_NEUTRAL, PLUGPLAY_PROPERTY_PERSISTENT, DEVPROP_TYPE_STRING,
+            (ULONG)(nameBytes + sizeof(WCHAR)), m_Device->Link.RemoteNameW);
+        RtlFreeUnicodeString(&link);
+    }
+    if (!NT_SUCCESS(nameStatus)) PN_WARN("%ws interface name failed 0x%08x", Name, nameStatus);
+    status = port->Init(m_DeviceObject, Irp, Miniport, PUNKNOWN((PPNADAPTERCOMMON)this), Resources);
     if (NT_SUCCESS(status)) {
         status = PcRegisterSubdevice(m_DeviceObject, (PWSTR)Name, port);
     }
@@ -129,7 +184,7 @@ NTSTATUS CPnAdapterCommon::UnregisterSubdevice(_In_opt_ PUNKNOWN Port)
 }
 
 #pragma code_seg("PAGE")
-STDMETHODIMP_(NTSTATUS) CPnAdapterCommon::InstallFilters(_In_ PIRP Irp)
+STDMETHODIMP_(NTSTATUS) CPnAdapterCommon::InstallFilters(_In_ PIRP Irp, _In_ PRESOURCELIST Resources)
 {
     PAGED_CODE();
     NTSTATUS status;
@@ -137,13 +192,13 @@ STDMETHODIMP_(NTSTATUS) CPnAdapterCommon::InstallFilters(_In_ PIRP Irp)
 
     status = NewPnMiniportTopology(&topoMini, (PPNADAPTERCOMMON)this, POOL_FLAG_NON_PAGED);
     if (!NT_SUCCESS(status)) return status;
-    status = InstallSubdevice(Irp, PN_TOPO_NAME, CLSID_PortTopology, topoMini, &m_TopoPort);
+    status = InstallSubdevice(Irp, Resources, PN_TOPO_NAME, CLSID_PortTopology, topoMini, &m_TopoPort);
     topoMini->Release();
     if (!NT_SUCCESS(status)) { PN_ERR("topology subdevice failed 0x%08x", status); return status; }
 
     status = NewPnMiniportWaveRT(&waveMini, (PPNADAPTERCOMMON)this, POOL_FLAG_NON_PAGED);
     if (!NT_SUCCESS(status)) return status;
-    status = InstallSubdevice(Irp, PN_WAVE_NAME, CLSID_PortWaveRT, waveMini, &m_WavePort);
+    status = InstallSubdevice(Irp, Resources, PN_WAVE_NAME, CLSID_PortWaveRT, waveMini, &m_WavePort);
     waveMini->Release();
     if (!NT_SUCCESS(status)) { PN_ERR("wave subdevice failed 0x%08x", status); return status; }
 

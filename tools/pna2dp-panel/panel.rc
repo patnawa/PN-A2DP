@@ -1,0 +1,478 @@
+// panel.rc - PN-A2DP Control Panel dialogs. SPDX-License-Identifier: MIT
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+#include "version.h"
+
+#pragma code_page(65001)
+
+IDI_APP ICON "app.ico"
+IDR_MANIFEST RT_MANIFEST "panel.manifest"
+
+// ------------------------------------------------------------------------------------
+IDD_MAIN DIALOGEX 0, 0, 630, 348
+STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN
+CAPTION "PN-A2DP Control Panel"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "PN-A2DP", IDC_BRAND, 7, 6, 195, 20
+    LTEXT           "", IDC_BRAND_VERSION, 7, 24, 195, 12, SS_NOPREFIX
+    LTEXT           "Bluetooth audio, tuned for you", IDC_BRAND_SUB, 7, 36, 195, 14
+    LTEXT           "Select a device", IDC_OUTPUT_TITLE, 210, 6, 400, 24, SS_NOPREFIX
+    LTEXT           "", IDC_OUTPUT_SUMMARY, 210, 32, 400, 22, SS_NOPREFIX
+    LTEXT           "YOUR DEVICES", IDC_DEVICE_LABEL, 7, 46, 195, 12
+    CONTROL         "", IDC_DEVICES, WC_LISTVIEW, WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | LVS_NOCOLUMNHEADER, 7, 60, 195, 238
+    PUSHBUTTON      "Refresh", IDC_REFRESH, 7, 302, 56, 14
+    PUSHBUTTON      "About", IDC_ABOUT, 146, 302, 56, 14
+    CONTROL         "", IDC_TAB, WC_TABCONTROL, WS_TABSTOP | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED, 210, 58, 413, 240
+    CONTROL         "&Apply changes", IDC_APPLY, "Button", BS_OWNERDRAW | WS_TABSTOP, 342, 302, 48, 14
+    PUSHBUTTON      "Undo changes", IDC_REVERT, 394, 302, 48, 14
+    PUSHBUTTON      "Defaults", IDC_DEFAULTS, 446, 302, 48, 14
+    PUSHBUTTON      "Import...", IDC_IMPORT, 498, 302, 48, 14
+    PUSHBUTTON      "Export...", IDC_EXPORT, 550, 302, 48, 14
+    LTEXT           "All changes saved", IDC_SAVE_HINT, 210, 300, 150, 12
+    LTEXT           "", IDC_STATUSTEXT, 7, 322, 616, 20, SS_NOPREFIX
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_WINDOWS DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Windows mode", IDC_WIN_MODE, 4, 4, 392, 14, SS_NOPREFIX
+    LTEXT           "", IDC_WIN_ENDPOINT, 4, 24, 392, 14, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "", IDC_WIN_STATE, 4, 42, 392, 22, SS_NOPREFIX
+    LTEXT           "Windows mix:", -1, 4, 69, 72, 12
+    LTEXT           "", IDC_WIN_FORMAT, 82, 69, 314, 12, SS_NOPREFIX
+    LTEXT           "Default output:", -1, 4, 86, 72, 12
+    LTEXT           "", IDC_WIN_DEFAULT, 82, 86, 314, 12, SS_NOPREFIX
+    LTEXT           "Output volume", -1, 4, 111, 72, 12
+    CONTROL         "", IDC_WIN_VOLUME, TRACKBAR_CLASS, WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, 78, 106, 214, 23
+    LTEXT           "", IDC_WIN_LEVEL, 300, 111, 39, 12
+    CONTROL         "Mute", IDC_WIN_MUTE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 346, 111, 50, 12
+    LTEXT           "", IDC_WIN_ADAPTER, 4, 139, 392, 14, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "", IDC_WIN_DRIVER, 4, 157, 392, 14, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "", IDC_WIN_NOTE, 4, 179, 392, 52, SS_NOPREFIX
+    PUSHBUTTON      "Sound settings", IDC_WIN_SOUND, 4, 241, 94, 16
+    PUSHBUTTON      "Bluetooth settings", IDC_WIN_BLUETOOTH, 104, 241, 98, 16
+    PUSHBUTTON      "Refresh", IDC_WIN_REFRESH, 208, 241, 64, 16
+    PUSHBUTTON      "Details...", IDC_WIN_DETAILS, 278, 241, 68, 16
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_STATUS DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "Connection", -1, 4, 2, 196, 170
+    LTEXT           "Device:", -1, 10, 14, 58, 10
+    LTEXT           "", IDC_ST_DEVICE, 70, 14, 126, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "Address:", -1, 10, 25, 58, 10
+    LTEXT           "", IDC_ST_ADDRESS, 70, 25, 126, 10
+    LTEXT           "State:", -1, 10, 36, 58, 10
+    LTEXT           "", IDC_ST_STATE, 70, 36, 126, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "Codec:", -1, 10, 47, 58, 10
+    LTEXT           "", IDC_ST_CODEC, 70, 47, 126, 10
+    LTEXT           "Format:", -1, 10, 58, 58, 10
+    LTEXT           "", IDC_ST_FORMAT, 70, 58, 126, 10
+    LTEXT           "Encoder:", -1, 10, 69, 58, 10
+    LTEXT           "", IDC_ST_ENCODER, 70, 69, 126, 10
+    LTEXT           "Bitrate:", -1, 10, 80, 58, 10
+    LTEXT           "", IDC_ST_BITRATE, 70, 80, 126, 10
+    LTEXT           "Latency:", -1, 10, 91, 58, 10
+    LTEXT           "", IDC_ST_LATENCY, 70, 91, 126, 10
+    LTEXT           "Sink delay:", -1, 10, 102, 58, 10
+    LTEXT           "", IDC_ST_SINKDELAY, 70, 102, 126, 10
+    LTEXT           "Media MTU:", -1, 10, 113, 58, 10
+    LTEXT           "", IDC_ST_MTU, 70, 113, 126, 10
+    LTEXT           "AVDTP:", -1, 10, 124, 58, 10
+    LTEXT           "", IDC_ST_AVDTP, 70, 124, 126, 10
+    LTEXT           "Remote SEID:", -1, 10, 135, 58, 10
+    LTEXT           "", IDC_ST_SEID, 70, 135, 126, 10
+    LTEXT           "Flags:", -1, 10, 146, 58, 10
+    LTEXT           "", IDC_ST_FLAGS, 70, 146, 126, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "Last error:", -1, 10, 157, 58, 10
+    LTEXT           "", IDC_ST_LASTERR, 70, 157, 126, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+
+    GROUPBOX        "Transport statistics", -1, 206, 2, 190, 170
+    LTEXT           "PCM frames:", -1, 212, 14, 70, 10
+    LTEXT           "", IDC_ST_PCM, 284, 14, 108, 10
+    LTEXT           "Packets sent:", -1, 212, 25, 70, 10
+    LTEXT           "", IDC_ST_PACKETS, 284, 25, 108, 10
+    LTEXT           "Bytes sent:", -1, 212, 36, 70, 10
+    LTEXT           "", IDC_ST_BYTES, 284, 36, 108, 10
+    LTEXT           "Codec frames:", -1, 212, 47, 70, 10
+    LTEXT           "", IDC_ST_FRAMES, 284, 47, 108, 10
+    LTEXT           "Dropped:", -1, 212, 58, 70, 10
+    LTEXT           "", IDC_ST_DROPPED, 284, 58, 108, 10
+    LTEXT           "Write failures:", -1, 212, 69, 70, 10
+    LTEXT           "", IDC_ST_WRITEFAIL, 284, 69, 108, 10
+    LTEXT           "Latency trims:", -1, 212, 80, 70, 10
+    LTEXT           "", IDC_ST_TRIMS, 284, 80, 108, 10
+    LTEXT           "TX queue:", -1, 212, 91, 70, 10
+    LTEXT           "", IDC_ST_QUEUE, 284, 91, 108, 10
+    LTEXT           "TX completion:", -1, 212, 102, 70, 10
+    LTEXT           "", IDC_ST_TXTIME, 284, 102, 108, 10
+    LTEXT           "ABR:", -1, 212, 113, 70, 10
+    LTEXT           "", IDC_ST_ABR, 284, 113, 108, 10
+    LTEXT           "Host round trip:", -1, 212, 124, 70, 10
+    LTEXT           "", IDC_ST_HOSTRTT, 284, 124, 108, 10
+    LTEXT           "Host timeouts:", -1, 212, 135, 70, 10
+    LTEXT           "", IDC_ST_HOSTTO, 284, 135, 108, 10
+    PUSHBUTTON      "Reset statistics", IDC_ST_RESETSTATS, 212, 150, 80, 14
+    PUSHBUTTON      "Reconnect", IDC_ST_RECONNECT, 296, 150, 60, 14
+
+    GROUPBOX        "Driver and codec host", -1, 4, 176, 392, 54
+    LTEXT           "Driver:", -1, 10, 188, 70, 10
+    LTEXT           "", IDC_ST_DRIVERVER, 82, 188, 310, 10, SS_NOPREFIX
+    LTEXT           "Codec host service:", -1, 10, 200, 70, 10
+    LTEXT           "", IDC_ST_HOSTSVC, 82, 200, 310, 10, SS_NOPREFIX
+    LTEXT           "Encoders available:", -1, 10, 212, 70, 10
+    LTEXT           "", IDC_ST_ENCODERS, 82, 212, 310, 10, SS_NOPREFIX
+    LTEXT           "The status refreshes on every driver event and once a second while streaming.", -1, 4, 240, 392, 10
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_CODECS DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_CODEC_LIVE, 4, 2, 392, 20, SS_NOPREFIX
+    LTEXT           "Checks allow codecs in priority order. Receiver support, live state and saved preferences are shown separately.", -1, 4, 24, 392, 16
+    CONTROL         "", IDC_CODEC_LIST, WC_LISTVIEW, WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER, 4, 42, 392, 90
+    PUSHBUTTON      "Move up", IDC_CODEC_UP, 4, 136, 54, 16
+    PUSHBUTTON      "Move down", IDC_CODEC_DOWN, 62, 136, 62, 16
+    PUSHBUTTON      "Activate selected", IDC_CODEC_ACTIVATE, 128, 136, 126, 16
+    PUSHBUTTON      "Auto quality + codecs", IDC_CODEC_ENABLEALL, 258, 136, 138, 16
+    GROUPBOX        "Load a preset", -1, 4, 157, 392, 48
+    COMBOBOX        IDC_PRESET, 10, 169, 170, 100, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL
+    PUSHBUTTON      "Load preset", IDC_PRESET_APPLY, 186, 168, 64, 14
+    LTEXT           "", IDC_PRESET_DESC, 10, 185, 380, 18, SS_NOPREFIX
+    CONTROL         "Prefer codec host encoders (kernel SBC remains the safety fallback)", IDC_CODEC_HOSTONLY, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 4, 211, 392, 10
+    CONTROL         "Apply codec changes live (renegotiate the stream without disconnecting the receiver)", IDC_CODEC_APPLYLIVE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 4, 225, 392, 10
+    LTEXT           "", IDC_CODEC_NOTE, 4, 239, 392, 22
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_SBC DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "Bitpool", -1, 4, 2, 392, 76
+    LTEXT           "Maximum bitpool:", -1, 10, 16, 60, 10
+    CONTROL         "", IDC_SBC_MAX_SLIDER, TRACKBAR_CLASS, WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, 72, 13, 196, 15
+    EDITTEXT        IDC_SBC_MAX_EDIT, 272, 14, 30, 12, ES_NUMBER | ES_AUTOHSCROLL
+    CONTROL         "", IDC_SBC_MAX_SPIN, UPDOWN_CLASS, UDS_ALIGNRIGHT | UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS, 302, 14, 10, 12
+    CONTROL         "Headset maximum", IDC_SBC_MAX_SINK, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 318, 15, 76, 10
+    LTEXT           "Minimum bitpool:", -1, 10, 34, 60, 10
+    EDITTEXT        IDC_SBC_MIN_EDIT, 72, 32, 30, 12, ES_NUMBER | ES_AUTOHSCROLL
+    CONTROL         "", IDC_SBC_MIN_SPIN, UPDOWN_CLASS, UDS_ALIGNRIGHT | UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS, 102, 32, 10, 12
+    LTEXT           "(the ABR controller never goes below this)", -1, 118, 34, 200, 10
+    CONTROL         "Allow a bitpool above the headset's advertised maximum (SBC XQ; a headset may reject it)", IDC_SBC_OVERRIDE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 49, 380, 10
+    CONTROL         "Prefer dual channel over joint stereo (each channel gets its own bitpool, XQ style)", IDC_SBC_DUAL, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 62, 380, 10
+
+    GROUPBOX        "Sample rates", -1, 4, 82, 96, 76
+    CONTROL         "16 kHz", IDC_SBC_R16, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 106, 80, 10
+    CONTROL         "32 kHz", IDC_SBC_R32, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 118, 80, 10
+    CONTROL         "44.1 kHz", IDC_SBC_R44, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 130, 80, 10
+    CONTROL         "48 kHz", IDC_SBC_R48, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 142, 80, 10
+    GROUPBOX        "Channel modes", -1, 104, 82, 96, 76
+    CONTROL         "Mono", IDC_SBC_CMONO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 110, 106, 80, 10
+    CONTROL         "Dual channel", IDC_SBC_CDUAL, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 110, 118, 80, 10
+    CONTROL         "Stereo", IDC_SBC_CSTEREO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 110, 130, 80, 10
+    CONTROL         "Joint stereo", IDC_SBC_CJOINT, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 110, 142, 80, 10
+    GROUPBOX        "Blocks", -1, 204, 82, 60, 76
+    CONTROL         "4", IDC_SBC_B4, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 210, 106, 48, 10
+    CONTROL         "8", IDC_SBC_B8, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 210, 118, 48, 10
+    CONTROL         "12", IDC_SBC_B12, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 210, 130, 48, 10
+    CONTROL         "16", IDC_SBC_B16, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 210, 142, 48, 10
+    GROUPBOX        "Subbands", -1, 268, 82, 60, 52
+    CONTROL         "4", IDC_SBC_S4, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 274, 106, 48, 10
+    CONTROL         "8", IDC_SBC_S8, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 274, 118, 48, 10
+    GROUPBOX        "Allocation", -1, 332, 82, 64, 52
+    CONTROL         "Loudness", IDC_SBC_ALOUD, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 338, 106, 54, 10
+    CONTROL         "SNR", IDC_SBC_ASNR, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 338, 118, 54, 10
+    LTEXT           "", IDC_SBC_BITRATE, 4, 164, 392, 22, SS_NOPREFIX
+    LTEXT           "", IDC_SBC_NOTE, 4, 190, 392, 68, SS_NOPREFIX
+    CONTROL         "Auto", IDC_SBC_RAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 94, 80, 10
+    CONTROL         "Auto", IDC_SBC_CAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 110, 94, 80, 10
+    CONTROL         "Auto", IDC_SBC_BAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 210, 94, 48, 10
+    CONTROL         "Auto", IDC_SBC_SAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 274, 94, 48, 10
+    CONTROL         "Auto", IDC_SBC_AAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 338, 94, 54, 10
+
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_AAC DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "Bitrate", -1, 4, 2, 392, 52
+    LTEXT           "Target bitrate (kbps):", -1, 10, 16, 76, 10
+    EDITTEXT        IDC_AAC_BITRATE, 88, 14, 40, 12, ES_NUMBER | ES_AUTOHSCROLL
+    CONTROL         "Use the headset's maximum", IDC_AAC_SINKMAX, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 136, 15, 120, 10
+    LTEXT           "Peak bitrate (kbps, VBR ceiling):", -1, 10, 34, 110, 10
+    EDITTEXT        IDC_AAC_PEAK, 124, 32, 40, 12, ES_NUMBER | ES_AUTOHSCROLL | WS_DISABLED
+    CONTROL         "Variable bitrate", IDC_AAC_VBR, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 172, 33, 80, 10
+    LTEXT           "(reserved: not used by this driver version)", -1, 256, 34, 134, 10
+    GROUPBOX        "Encoder", -1, 4, 58, 392, 40
+    LTEXT           "Object type:", -1, 10, 72, 50, 10
+    COMBOBOX        IDC_AAC_OBJECT, 62, 70, 130, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+    CONTROL         "Afterburner (reserved: not used by this driver version)", IDC_AAC_AFTERBURNER, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 202, 71, 190, 10
+    GROUPBOX        "Sample rates", -1, 4, 102, 200, 58
+    CONTROL         "16 kHz", IDC_AAC_R16, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 126, 56, 10
+    CONTROL         "32 kHz", IDC_AAC_R32, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 70, 126, 56, 10
+    CONTROL         "44.1 kHz", IDC_AAC_R44, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 130, 126, 56, 10
+    CONTROL         "48 kHz", IDC_AAC_R48, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 140, 56, 10
+    CONTROL         "88.2 kHz", IDC_AAC_R88, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 70, 140, 56, 10
+    CONTROL         "96 kHz", IDC_AAC_R96, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 130, 140, 56, 10
+    GROUPBOX        "Channels", -1, 208, 102, 188, 58
+    CONTROL         "Mono", IDC_AAC_CMONO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 214, 126, 80, 10
+    CONTROL         "Stereo", IDC_AAC_CSTEREO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 214, 140, 80, 10
+    LTEXT           "", IDC_AAC_NOTE, 4, 168, 392, 90, SS_NOPREFIX
+    CONTROL         "Auto (compatible rates)", IDC_AAC_RAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 114, 180, 10
+    CONTROL         "Auto (compatible channels)", IDC_AAC_CAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 214, 114, 172, 10
+
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_APTX DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "aptX (352 / 384 kbps)", -1, 4, 2, 392, 50
+    LTEXT           "Sample rates:", -1, 10, 16, 50, 10
+    CONTROL         "16 kHz", 1500, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 62, 16, 40, 10
+    CONTROL         "32 kHz", 1501, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 104, 16, 40, 10
+    CONTROL         "44.1 kHz", 1502, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 146, 16, 44, 10
+    CONTROL         "48 kHz", 1503, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 192, 16, 40, 10
+    LTEXT           "Channels:", -1, 10, 32, 50, 10
+    CONTROL         "Mono", 1504, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 62, 32, 40, 10
+    CONTROL         "Stereo", 1505, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 104, 32, 40, 10
+
+    GROUPBOX        "aptX HD (529 / 576 kbps, 24-bit)", -1, 4, 56, 392, 50
+    LTEXT           "Sample rates:", -1, 10, 70, 50, 10
+    CONTROL         "16 kHz", 1520, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 62, 70, 40, 10
+    CONTROL         "32 kHz", 1521, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 104, 70, 40, 10
+    CONTROL         "44.1 kHz", 1522, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 146, 70, 44, 10
+    CONTROL         "48 kHz", 1523, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 192, 70, 40, 10
+    LTEXT           "Channels:", -1, 10, 86, 50, 10
+    CONTROL         "Mono", 1524, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 62, 86, 40, 10
+    CONTROL         "Stereo", 1525, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 104, 86, 40, 10
+    LTEXT           "Input (fixed):", -1, 236, 70, 60, 10
+    CONTROL         "16-bit", 1526, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 298, 70, 40, 10
+    CONTROL         "24-bit", 1527, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 342, 70, 40, 10
+
+    GROUPBOX        "aptX Low Latency (352 / 384 kbps, about 40 ms)", -1, 4, 110, 392, 66
+    LTEXT           "Sample rates:", -1, 10, 124, 50, 10
+    CONTROL         "16 kHz", 1540, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 62, 124, 40, 10
+    CONTROL         "32 kHz", 1541, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 104, 124, 40, 10
+    CONTROL         "44.1 kHz", 1542, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 146, 124, 44, 10
+    CONTROL         "48 kHz", 1543, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 192, 124, 40, 10
+    LTEXT           "Channels:", -1, 10, 140, 50, 10
+    CONTROL         "Mono", 1544, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 62, 140, 40, 10
+    CONTROL         "Stereo", 1545, "Button", BS_AUTOCHECKBOX | WS_TABSTOP | WS_DISABLED, 104, 140, 40, 10
+    LTEXT           "Target buffer level (frames):", -1, 10, 157, 100, 10
+    EDITTEXT        1548, 112, 155, 36, 12, ES_NUMBER | ES_AUTOHSCROLL
+    CONTROL         "", 1549, UPDOWN_CLASS, UDS_ALIGNRIGHT | UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS, 148, 155, 10, 12
+    LTEXT           "(0 = encoder default)", -1, 164, 157, 120, 10
+    LTEXT           "", IDC_APTX_NOTE, 4, 182, 392, 80, SS_NOPREFIX
+    CONTROL         "Auto (compatible rates)", 1510, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 244, 16, 142, 10
+    CONTROL         "Auto (compatible rates)", 1530, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 244, 86, 142, 10
+    CONTROL         "Auto (compatible rates)", 1550, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 244, 124, 142, 10
+
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_LDAC DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "Quality", -1, 4, 2, 190, 70
+    CONTROL         "High quality (990 / 909 kbps)", IDC_LDAC_QHQ, "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 10, 14, 170, 10
+    CONTROL         "Standard quality (660 / 606 kbps)", IDC_LDAC_QSQ, "Button", BS_AUTORADIOBUTTON, 10, 27, 170, 10
+    CONTROL         "Mobile quality (330 / 303 kbps)", IDC_LDAC_QMQ, "Button", BS_AUTORADIOBUTTON, 10, 40, 170, 10
+    CONTROL         "Adaptive (encoder chooses, starts at standard)", IDC_LDAC_QABR, "Button", BS_AUTORADIOBUTTON, 10, 53, 180, 10
+    GROUPBOX        "Adaptive bitrate", -1, 198, 2, 198, 34
+    CONTROL         "Step down the quality under congestion (ABR)", IDC_LDAC_ABR, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 204, 15, 188, 10
+    GROUPBOX        "Encoder input", -1, 198, 40, 198, 32
+    CONTROL         "Auto", IDC_LDAC_FAUTO, "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 204, 53, 32, 10
+    CONTROL         "16-bit", IDC_LDAC_F16, "Button", BS_AUTORADIOBUTTON, 238, 53, 36, 10
+    CONTROL         "24-bit", IDC_LDAC_F24, "Button", BS_AUTORADIOBUTTON, 276, 53, 36, 10
+    CONTROL         "32-bit", IDC_LDAC_F32, "Button", BS_AUTORADIOBUTTON, 314, 53, 36, 10
+    CONTROL         "Float", IDC_LDAC_FF32, "Button", BS_AUTORADIOBUTTON, 352, 53, 40, 10
+    GROUPBOX        "Sample rates", -1, 4, 76, 190, 46
+    CONTROL         "44.1 kHz", IDC_LDAC_R44, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 101, 44, 10
+    CONTROL         "48 kHz", IDC_LDAC_R48, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 56, 101, 40, 10
+    CONTROL         "88.2 kHz", IDC_LDAC_R88, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 98, 101, 44, 10
+    CONTROL         "96 kHz", IDC_LDAC_R96, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 144, 101, 40, 10
+    GROUPBOX        "Channel modes", -1, 198, 76, 198, 46
+    CONTROL         "Mono", IDC_LDAC_CMONO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 204, 101, 40, 10
+    CONTROL         "Dual channel", IDC_LDAC_CDUAL, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 246, 101, 60, 10
+    CONTROL         "Stereo", IDC_LDAC_CSTEREO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 310, 101, 40, 10
+    LTEXT           "", IDC_LDAC_BITRATE, 4, 128, 392, 26, SS_NOPREFIX
+    LTEXT           "", IDC_LDAC_NOTE, 4, 158, 392, 100, SS_NOPREFIX
+    CONTROL         "Auto (compatible rates)", IDC_LDAC_RAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 89, 176, 10
+    CONTROL         "Auto (compatible channels)", IDC_LDAC_CAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 204, 89, 180, 10
+
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_TRANSPORT DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "Buffering and latency", -1, 4, 2, 392, 70
+    LTEXT           "Target buffer (ms):", -1, 10, 16, 70, 10
+    CONTROL         "", IDC_TR_TARGET_SLIDER, TRACKBAR_CLASS, WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, 112, 13, 190, 15
+    EDITTEXT        IDC_TR_TARGET_EDIT, 306, 14, 36, 12, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "20 .. 400", -1, 346, 16, 40, 10
+    LTEXT           "Maximum before trimming (ms):", -1, 10, 34, 100, 10
+    CONTROL         "", IDC_TR_MAX_SLIDER, TRACKBAR_CLASS, WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, 112, 31, 190, 15
+    EDITTEXT        IDC_TR_MAX_EDIT, 306, 32, 36, 12, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "40 .. 1000", -1, 346, 34, 40, 10
+    LTEXT           "A smaller target buffer lowers the audio delay; a larger one rides out interference. When the backlog exceeds the maximum, the oldest audio is trimmed.", -1, 10, 48, 380, 20
+    GROUPBOX        "Adaptive bitrate (SBC, AAC, LDAC)", -1, 4, 76, 392, 38
+    CONTROL         "Reduce the bitrate when the link is congested and raise it after sustained clean traffic", IDC_TR_ABR, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 88, 320, 10
+    LTEXT           "Floor (kbps):", -1, 10, 101, 50, 10
+    EDITTEXT        IDC_TR_ABRFLOOR, 62, 99, 40, 12, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "Bounded by the negotiated ceiling and codec limits.", -1, 110, 101, 200, 10
+    GROUPBOX        "Behaviour", -1, 4, 118, 392, 80
+    CONTROL         "Suspend the stream during calls (SCO link active) and resume afterwards", IDC_TR_SUSPENDSCO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 130, 380, 10
+    CONTROL         "Start streaming as soon as the headset connects (even while Windows is silent)", IDC_TR_AUTOSTART, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 143, 380, 10
+    CONTROL         "Accept AVDTP delay reports from the headset for lip-sync", IDC_TR_DELAYREPORT, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 156, 380, 10
+    CONTROL         "Expose all sample rates to Windows (exclusive mode players can pick 88.2 / 96 kHz)", IDC_TR_ALLRATES, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 169, 380, 10
+    CONTROL         "Automatic receiver volume, with software volume fallback", IDC_TR_SWVOLUME, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 182, 380, 10
+    GROUPBOX        "Reconnect and volume", -1, 4, 202, 392, 40
+    LTEXT           "Reconnect delay (ms):", -1, 10, 216, 80, 10
+    EDITTEXT        IDC_TR_RECONNECT, 92, 214, 44, 12, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "Persisted volume (dB, 0 = full):", -1, 160, 216, 110, 10
+    EDITTEXT        IDC_TR_VOLUME, 272, 214, 36, 12, ES_AUTOHSCROLL
+    CONTROL         "", IDC_TR_VOLUME_SPIN, UPDOWN_CLASS, UDS_ALIGNRIGHT | UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS, 308, 214, 10, 12
+    LTEXT           "Automatic adapter policy enables ABR. Disabling ABR selects manual policy. Floor changes renegotiate the stream when Apply live is enabled.", IDC_TR_NOTE, 4, 244, 392, 18
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_ADAPTER DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_AD_NAME, 4, 4, 392, 22, SS_NOPREFIX
+    CONTROL         "Automatic adapter policy and adaptive bitrate", IDC_AD_AUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 4, 30, 242, 12
+    PUSHBUTTON      "Auto quality + codecs", IDC_AD_BEST, 272, 28, 124, 16
+    LTEXT           "Automatic policy respects your codec ceilings. Use Auto quality + codecs to start at the highest supported settings. Apply saves the checkbox change.", -1, 4, 49, 392, 24
+    EDITTEXT        IDC_AD_REPORT, 4, 78, 392, 180, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
+END
+
+IDD_PAGE_SINK DIALOGEX 0, 0, 400, 262
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_SINK_INFO, 4, 5, 330, 10, SS_NOPREFIX
+    PUSHBUTTON      "Refresh", IDC_SINK_REFRESH, 340, 2, 56, 14
+    CONTROL         "", IDC_SINK_LIST, WC_LISTVIEW, WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER, 4, 20, 392, 96
+    EDITTEXT        IDC_SINK_DETAIL, 4, 120, 392, 138, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
+END
+
+// ------------------------------------------------------------------------------------
+IDD_PAGE_DRIVER DIALOGEX 0, 0, 400, 330
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    GROUPBOX        "PN driver requirements - current session", -1, 4, 2, 392, 76
+    CONTROL         "Test Mode: Unknown", IDC_DRV_TEST_LIGHT, "Static", SS_OWNERDRAW, 10, 16, 116, 12
+    CONTROL         "Secure Boot: Unknown", IDC_DRV_SECURE_LIGHT, "Static", SS_OWNERDRAW, 131, 16, 121, 12
+    CONTROL         "Memory Integrity: Unknown", IDC_DRV_HVCI_LIGHT, "Static", SS_OWNERDRAW, 257, 16, 133, 12
+    LTEXT           "Checking requirements...", IDC_DRV_READINESS, 10, 33, 380, 23, SS_NOPREFIX
+    PUSHBUTTON      "Requirements...", IDC_DRV_REQUIREMENTS, 10, 59, 91, 14
+    PUSHBUTTON      "Windows Security", IDC_DRV_SECURITY, 106, 59, 101, 14
+    PUSHBUTTON      "Windows / Test Mode...", IDC_DRV_BOOT_MODE, 212, 59, 178, 14
+    GROUPBOX        "This headset", -1, 4, 82, 392, 96
+    LTEXT           "Driver:", -1, 10, 94, 48, 10
+    LTEXT           "", IDC_DRV_CURRENT, 60, 94, 330, 10, SS_NOPREFIX
+    LTEXT           "Provider:", -1, 10, 106, 48, 10
+    LTEXT           "", IDC_DRV_PROVIDER, 60, 106, 330, 10, SS_NOPREFIX
+    LTEXT           "Version:", -1, 10, 118, 48, 10
+    LTEXT           "", IDC_DRV_VERSION, 60, 118, 330, 10, SS_NOPREFIX
+    LTEXT           "INF:", -1, 10, 130, 48, 10
+    LTEXT           "", IDC_DRV_INF, 60, 130, 330, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "Status:", -1, 10, 142, 48, 10
+    LTEXT           "", IDC_DRV_STATUS, 60, 142, 330, 10, SS_NOPREFIX
+    PUSHBUTTON      "Use PN-A2DP driver", IDC_DRV_USE_PNA2DP, 10, 158, 110, 14
+    PUSHBUTTON      "Use Windows mode", IDC_DRV_USE_INBOX, 124, 158, 110, 14
+    PUSHBUTTON      "Rescan devices", IDC_DRV_RESCAN, 238, 158, 80, 14
+    GROUPBOX        "Driver package", -1, 4, 182, 392, 44
+    LTEXT           "", IDC_DRV_PKG, 10, 194, 380, 10, SS_NOPREFIX | SS_PATHELLIPSIS
+    PUSHBUTTON      "Stage package...", IDC_DRV_STAGE, 10, 208, 90, 14
+    PUSHBUTTON      "Remove package", IDC_DRV_UNSTAGE, 104, 208, 90, 14
+    GROUPBOX        "Codec host service and plugins", -1, 4, 230, 392, 96
+    LTEXT           "", IDC_DRV_SVC, 10, 242, 380, 10, SS_NOPREFIX
+    PUSHBUTTON      "Start", IDC_DRV_SVC_START, 10, 254, 50, 14
+    PUSHBUTTON      "Stop", IDC_DRV_SVC_STOP, 64, 254, 50, 14
+    PUSHBUTTON      "Install", IDC_DRV_SVC_INSTALL, 118, 254, 50, 14
+    PUSHBUTTON      "Remove", IDC_DRV_SVC_REMOVE, 172, 254, 50, 14
+    LTEXT           "Folder:", -1, 232, 256, 30, 10
+    LTEXT           "", IDC_DRV_INSTALLDIR, 262, 256, 90, 10, SS_NOPREFIX | SS_PATHELLIPSIS
+    PUSHBUTTON      "Open", IDC_DRV_OPENDIR, 354, 254, 36, 14
+    CONTROL         "", IDC_DRV_PLUGINS, WC_LISTVIEW, WS_TABSTOP | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_NOSORTHEADER, 10, 272, 380, 50
+END
+
+// ------------------------------------------------------------------------------------
+IDD_BOOT_MODE DIALOGEX 0, 0, 410, 284
+STYLE DS_SETFONT | DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "PN-A2DP - Windows boot mode"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Windows boot mode", -1, 12, 10, 386, 12
+    LTEXT           "Test Mode is a Windows boot setting. Bluetooth driver selection is separate.", -1, 12, 27, 386, 20
+    GROUPBOX        "Boot status", -1, 10, 50, 390, 66
+    LTEXT           "Reading boot settings...", IDC_BOOT_STATE, 18, 62, 374, 38, SS_NOPREFIX
+    LTEXT           "", IDC_BOOT_PLATFORM, 18, 101, 374, 10, SS_NOPREFIX
+    EDITTEXT        IDC_BOOT_DEVICES, 12, 124, 386, 54, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
+    LTEXT           "", IDC_BOOT_NOTICE, 12, 188, 386, 26, SS_NOPREFIX
+    PUSHBUTTON      "Enable Test Mode", IDC_BOOT_ENABLE, 12, 219, 185, 20
+    PUSHBUTTON      "Normal Windows (Test Mode OFF)", IDC_BOOT_DISABLE, 205, 219, 193, 20
+    PUSHBUTTON      "Refresh", IDC_BOOT_REFRESH, 12, 251, 78, 20
+    DEFPUSHBUTTON   "Close", IDCANCEL, 320, 251, 78, 20
+END
+
+// ------------------------------------------------------------------------------------
+IDD_ABOUT DIALOGEX 0, 0, 300, 150
+STYLE DS_SETFONT | DS_CENTER | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About PN-A2DP"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    ICON            IDI_APP, -1, 10, 10, 20, 20
+    LTEXT           "", IDC_ABOUT_TEXT, 40, 10, 250, 110, SS_NOPREFIX
+    DEFPUSHBUTTON   "OK", IDOK, 240, 128, 50, 14
+END
+
+// ------------------------------------------------------------------------------------
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION PN_PANEL_VERSION_NUMBERS
+ PRODUCTVERSION PN_PANEL_VERSION_NUMBERS
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "PN-A2DP Project"
+            VALUE "FileDescription", "PN-A2DP Control Panel"
+            VALUE "FileVersion", PN_PANEL_VERSION_TEXT
+            VALUE "InternalName", "pna2dp-panel"
+            VALUE "LegalCopyright", "MIT License"
+            VALUE "OriginalFilename", "pna2dp-panel.exe"
+            VALUE "ProductName", "PN-A2DP"
+            VALUE "ProductVersion", PN_PANEL_VERSION_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

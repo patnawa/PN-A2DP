@@ -53,6 +53,7 @@ static VOID CsqCompleteCanceledIrp(_In_ PIO_CSQ Csq, _In_ PIRP Irp)
 
 /* ---- API ------------------------------------------------------------------- */
 
+/* Cannot fail; called from DeviceCreate so the queue is valid for every teardown path. */
 NTSTATUS CodecHostInitialize(_Out_ PPN_CODEC_HOST H, _In_ PPNA2DP_DEVICE Device)
 {
     RtlZeroMemory(H, sizeof(*H));
@@ -65,6 +66,7 @@ NTSTATUS CodecHostInitialize(_Out_ PPN_CODEC_HOST H, _In_ PPNA2DP_DEVICE Device)
 
 VOID CodecHostUninitialize(_Inout_ PPN_CODEC_HOST H)
 {
+    if (!H->Device) return;   /* never initialized */
     CodecHostUnregister(H, NULL);
     for (;;) {
         PIRP irp = IoCsqRemoveNextIrp(&H->WorkCsq, NULL);
@@ -78,6 +80,7 @@ VOID CodecHostUninitialize(_Inout_ PPN_CODEC_HOST H)
 NTSTATUS CodecHostRegister(_Inout_ PPN_CODEC_HOST H, _In_ PFILE_OBJECT File, _In_ const PNA2DP_CODEC_REGISTER *Info)
 {
     KIRQL irql;
+    if (Info->Size != sizeof(*Info)) return STATUS_INVALID_PARAMETER;
     if (Info->AbiVersion != PNA2DP_ABI_VERSION) return STATUS_REVISION_MISMATCH;
     if (Info->MaxPcmBytes < 1024 || Info->MaxEncodedBytes < 256) return STATUS_INVALID_PARAMETER;
     KeAcquireSpinLock(&H->Lock, &irql);
@@ -86,6 +89,7 @@ NTSTATUS CodecHostRegister(_Inout_ PPN_CODEC_HOST H, _In_ PFILE_OBJECT File, _In
         return STATUS_SHARING_VIOLATION;
     }
     H->Registered = TRUE;
+    InterlockedExchange(&H->Failed, 0);
     H->OwnerFile = File;
     H->Info = *Info;
     InterlockedIncrement(&H->Generation);
@@ -116,12 +120,17 @@ VOID CodecHostUnregister(_Inout_ PPN_CODEC_HOST H, _In_opt_ PFILE_OBJECT File)
 
 BOOLEAN CodecHostAvailable(_In_ PPN_CODEC_HOST H, _In_ ULONG Codec)
 {
-    return H->Registered && (H->Info.CodecMask & PNA2DP_CODEC_BIT(Codec)) != 0 && H->PendedCount > 0;
+    return H->Registered && !H->Failed && (H->Info.CodecMask & PNA2DP_CODEC_BIT(Codec)) != 0 && H->PendedCount > 0;
 }
 
 ULONG CodecHostCodecMask(_In_ PPN_CODEC_HOST H)
 {
-    return H->Registered ? H->Info.CodecMask : 0;
+    return H->Registered && !H->Failed ? H->Info.CodecMask : 0;
+}
+
+VOID CodecHostReportFailure(_Inout_ PPN_CODEC_HOST H)
+{
+    if (InterlockedExchange(&H->Failed, 1) == 0) DeviceHostChanged(H->Device);
 }
 
 NTSTATUS CodecHostQueueGetWork(_Inout_ PPN_CODEC_HOST H, _In_ PIRP Irp)
@@ -129,12 +138,26 @@ NTSTATUS CodecHostQueueGetWork(_Inout_ PPN_CODEC_HOST H, _In_ PIRP Irp)
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
     if (sp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(PNA2DP_CODEC_WORK) + 1024) return STATUS_BUFFER_TOO_SMALL;
     if (!H->Registered || H->OwnerFile != sp->FileObject) return STATUS_INVALID_DEVICE_STATE;
+    PFILE_OBJECT file = sp->FileObject;   /* the IRP may be gone once it is queued */
     IoCsqInsertIrp(&H->WorkCsq, Irp, NULL);
+    /* CLEANUP of this handle may have unregistered and flushed between the check and the
+     * insert: flush again so no request of a closed handle stays queued */
+    if (!H->Registered || H->OwnerFile != file) {
+        for (;;) {
+            PIRP irp = IoCsqRemoveNextIrp(&H->WorkCsq, file);
+            if (!irp) break;
+            irp->IoStatus.Status = STATUS_CANCELLED;
+            irp->IoStatus.Information = 0;
+            IoCompleteRequest(irp, IO_NO_INCREMENT);
+        }
+    }
     return STATUS_PENDING;
 }
 
 VOID CodecHostFlushFile(_Inout_ PPN_CODEC_HOST H, _In_ PFILE_OBJECT File)
 {
+    if (!H->Device) return;
+    CodecHostUnregister(H, File);   /* first, so a racing GET_WORK sees it and flushes itself */
     for (;;) {
         PIRP irp = IoCsqRemoveNextIrp(&H->WorkCsq, File);
         if (!irp) break;
@@ -142,7 +165,6 @@ VOID CodecHostFlushFile(_Inout_ PPN_CODEC_HOST H, _In_ PFILE_OBJECT File)
         irp->IoStatus.Information = 0;
         IoCompleteRequest(irp, IO_NO_INCREMENT);
     }
-    CodecHostUnregister(H, File);
 }
 
 NTSTATUS CodecHostDispatchWork(_Inout_ PPN_CODEC_HOST H, _In_ const PNA2DP_CODEC_WORK *Header,

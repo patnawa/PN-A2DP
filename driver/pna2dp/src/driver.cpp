@@ -41,11 +41,32 @@ extern "C" int __cdecl _purecall(void)
 typedef void (*PFN_PC_UNLOAD)(PDRIVER_OBJECT);
 static PFN_PC_UNLOAD g_PcUnload = NULL;
 static PDRIVER_DISPATCH g_PcPnpDispatch = NULL;
+static PDRIVER_DISPATCH g_PcShutdown = NULL;     /* NULL when PortCls does not handle IRP_MJ_SHUTDOWN */
+static PDRIVER_DISPATCH g_PortDispatch[IRP_MJ_MAXIMUM_FUNCTION + 1];
+
+NTSTATUS PnPortDispatchIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    UCHAR major = IoGetCurrentIrpStackLocation(Irp)->MajorFunction;
+    if (major == IRP_MJ_CREATE) PN_VERB("KS create %wZ", &IoGetCurrentIrpStackLocation(Irp)->FileObject->FileName);
+    NTSTATUS status = g_PortDispatch[major](DeviceObject, Irp);
+    // The original handler owns/completes the IRP; do not touch it after dispatch.
+    if (major == IRP_MJ_CREATE && !NT_SUCCESS(status)) PN_WARN("PortCls create failed 0x%08x", status);
+    return status;
+}
+
+/* Crash guard: a system thread clears the unclean-start count after 10 minutes of uptime. */
+static PDRIVER_OBJECT g_DriverObject = NULL;
+static KEVENT g_GuardStop;
+static PKTHREAD g_GuardThread = NULL;
+extern "C" NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(_In_ HANDLE Handle, _In_ BOOLEAN Alertable, _In_opt_ PLARGE_INTEGER Timeout);
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 extern "C" DRIVER_UNLOAD PnDriverUnload;
 static DRIVER_ADD_DEVICE PnAddDevice;
 _Dispatch_type_(IRP_MJ_PNP) static DRIVER_DISPATCH PnPnpHandler;
+_Dispatch_type_(IRP_MJ_SHUTDOWN) static DRIVER_DISPATCH PnShutdownHandler;
+static KSTART_ROUTINE PnGuardThread;
+static VOID PnStopGuardThread(void);
 static NTSTATUS PnStartDevice(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp, _In_ PRESOURCELIST ResourceList);
 
 /* ---- entry ---------------------------------------------------------------------- */
@@ -62,25 +83,98 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     status = WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
     if (!NT_SUCCESS(status)) return status;
 
+    DeviceListInitialize();
+    PnTraceInitialize();
+    status = RegCfgInitialize(DriverObject);
+    if (!NT_SUCCESS(status)) { WdfDriverMiniportUnload(WdfGetDriver()); return status; }
     RegCfgLoadGlobal(DriverObject);
     PN_INFO("pna2dp %u.%u.%u loading", PNA2DP_DRIVER_VERSION >> 24, (PNA2DP_DRIVER_VERSION >> 16) & 0xFF, PNA2DP_DRIVER_VERSION & 0xFFFF);
+
+    ULONG unclean = 0;
+    if (!RegCfgCrashGuardEnter(DriverObject, &unclean)) {
+        PN_ERR("crash guard: the last %u starts ended without a clean shutdown; not loading. "
+               "Delete HKLM\\SYSTEM\\CurrentControlSet\\Services\\pna2dp\\State\\UncleanStarts to try again.", unclean);
+        RegCfgShutdown();
+        WdfDriverMiniportUnload(WdfGetDriver());
+        return STATUS_UNSUCCESSFUL;
+    }
+    g_DriverObject = DriverObject;
+    KeInitializeEvent(&g_GuardStop, NotificationEvent, FALSE);
+    {
+        HANDLE h = NULL;
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(PsCreateSystemThread(&h, THREAD_ALL_ACCESS, &oa, NULL, NULL, PnGuardThread, NULL))) {
+            if (!NT_SUCCESS(ObReferenceObjectByHandle(h, SYNCHRONIZE, *PsThreadType, KernelMode, (PVOID *)&g_GuardThread, NULL))) {
+                // A created thread must not outlive this driver's code if the reference fails.
+                g_GuardThread = NULL;
+                KeSetEvent(&g_GuardStop, 0, FALSE);
+                ZwWaitForSingleObject(h, FALSE, NULL);
+            }
+            ZwClose(h);
+        }
+    }
 
     status = PcInitializeAdapterDriver(DriverObject, RegistryPath, (PDRIVER_ADD_DEVICE)PnAddDevice);
     if (!NT_SUCCESS(status)) {
         PN_ERR("PcInitializeAdapterDriver failed 0x%08x", status);
+        PnStopGuardThread();
+        RegCfgShutdown();
         WdfDriverMiniportUnload(WdfGetDriver());
         return status;
     }
 
     /* hook what we need; everything else stays with PortCls */
+    RtlCopyMemory(g_PortDispatch, DriverObject->MajorFunction, sizeof(g_PortDispatch));
     g_PcPnpDispatch = DriverObject->MajorFunction[IRP_MJ_PNP];
     DriverObject->MajorFunction[IRP_MJ_PNP] = PnPnpHandler;
     DriverObject->MajorFunction[IRP_MJ_CREATE] = ControlDispatchCreate;
     DriverObject->MajorFunction[IRP_MJ_CLEANUP] = ControlDispatchCleanup;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = ControlDispatchClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ControlDispatchDeviceControl;
+    /* IRP_MJ_CREATE_MAILSLOT is never set by PortCls, so it holds the I/O manager default */
+    if (DriverObject->MajorFunction[IRP_MJ_SHUTDOWN] != DriverObject->MajorFunction[IRP_MJ_CREATE_MAILSLOT]) g_PcShutdown = DriverObject->MajorFunction[IRP_MJ_SHUTDOWN];
+    DriverObject->MajorFunction[IRP_MJ_SHUTDOWN] = PnShutdownHandler;
     g_PcUnload = (PFN_PC_UNLOAD)DriverObject->DriverUnload;
     DriverObject->DriverUnload = PnDriverUnload;
+    return STATUS_SUCCESS;
+}
+
+#pragma code_seg("PAGE")
+static VOID PnGuardThread(_In_ PVOID Context)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(Context);
+    LARGE_INTEGER t;
+    t.QuadPart = -PN_HNS_PER_SEC * 600;
+    if (KeWaitForSingleObject(&g_GuardStop, Executive, KernelMode, FALSE, &t) == STATUS_TIMEOUT && g_DriverObject) {
+        RegCfgCrashGuardClear(g_DriverObject);
+        PN_INFO("crash guard: 10 minutes up, start counted as clean");
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+#pragma code_seg("PAGE")
+static VOID PnStopGuardThread(void)
+{
+    PAGED_CODE();
+    if (!g_GuardThread) return;
+    KeSetEvent(&g_GuardStop, 0, FALSE);
+    KeWaitForSingleObject(g_GuardThread, Executive, KernelMode, FALSE, NULL);
+    ObDereferenceObject(g_GuardThread);
+    g_GuardThread = NULL;
+}
+
+/* Registered per FDO in PnStartDevice: a clean shutdown or restart resets the crash guard. */
+#pragma code_seg("PAGE")
+static NTSTATUS PnShutdownHandler(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+    PAGED_CODE();
+    RegCfgCrashGuardClear(DeviceObject->DriverObject);
+    if (g_PcShutdown) return g_PcShutdown(DeviceObject, Irp);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return STATUS_SUCCESS;
 }
 
@@ -89,7 +183,10 @@ extern "C" VOID PnDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 {
     PAGED_CODE();
     PN_INFO("unloading");
+    PnStopGuardThread();
+    RegCfgCrashGuardClear(DriverObject);   /* every device was removed cleanly */
     if (g_PcUnload) g_PcUnload(DriverObject);
+    RegCfgShutdown();
     if (WdfGetDriver()) WdfDriverMiniportUnload(WdfGetDriver());
 }
 
@@ -115,7 +212,6 @@ typedef struct _PN_PORTCLS_EXTENSION {
 static NTSTATUS PnStartDevice(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp, _In_ PRESOURCELIST ResourceList)
 {
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(ResourceList);
     NTSTATUS status;
     PUNKNOWN unknown = NULL;
     IPnAdapterCommon *common = NULL;
@@ -129,7 +225,7 @@ static NTSTATUS PnStartDevice(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp, _
 
     status = common->Init(DeviceObject, DeviceObject->DriverObject);
     if (NT_SUCCESS(status)) status = PcRegisterAdapterPowerManagement(PUNKNOWN(common), DeviceObject);
-    if (NT_SUCCESS(status)) status = common->InstallFilters(Irp);
+    if (NT_SUCCESS(status)) status = common->InstallFilters(Irp, ResourceList);
     if (!NT_SUCCESS(status)) {
         PN_ERR("StartDevice failed 0x%08x", status);
         common->Cleanup();
@@ -137,6 +233,7 @@ static NTSTATUS PnStartDevice(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp, _
         return status;
     }
     ext->Common = common;
+    if (!NT_SUCCESS(IoRegisterShutdownNotification(DeviceObject))) PN_WARN("no shutdown notification; crash guard relies on the uptime timer");
     return STATUS_SUCCESS;
 }
 
@@ -150,6 +247,7 @@ static NTSTATUS PnPnpHandler(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
         IPnAdapterCommon *common = ext ? ext->Common : NULL;
         if (common) {
             PN_INFO("PnP minor 0x%02x: tearing down", sp->MinorFunction);
+            IoUnregisterShutdownNotification(DeviceObject);
             ext->Common = NULL;
             common->Cleanup();
             common->Release();

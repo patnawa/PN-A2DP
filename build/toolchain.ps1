@@ -7,7 +7,7 @@
 #   PNA2DP_WDK_ROOT   e.g. C:\Users\me\wdk\c   (NuGet "c" folder) or C:\Program Files (x86)\Windows Kits\10
 #   PNA2DP_SDK_ROOT   e.g. C:\Program Files (x86)\Windows Kits\10
 #   PNA2DP_KIT_VER    e.g. 10.0.26100.0
-#   PNA2DP_KMDF_VER   e.g. 1.33
+#   PNA2DP_KMDF_VER   e.g. 1.33 (default 1.31)
 
 $ErrorActionPreference = 'Stop'
 
@@ -40,11 +40,14 @@ function Find-WdkRoot {
 }
 $script:WdkRoot = Find-WdkRoot
 
+# KMDF 1.31 ships with Windows 10 2004 (19041), the oldest OS the INF accepts; a 1.31 binary
+# binds to any newer framework. Building against newer headers would make the driver fail
+# with Code 37 on older systems.
 function Find-KmdfVer {
     if ($env:PNA2DP_KMDF_VER) { return $env:PNA2DP_KMDF_VER }
-    $dir = Join-Path $WdkRoot 'Include\wdf\kmdf'
-    $vers = Get-ChildItem $dir | ForEach-Object { [version]$_.Name } | Sort-Object -Descending
-    return $vers[0].ToString()
+    $v = '1.31'
+    if (-not (Test-Path (Join-Path $WdkRoot "Include\wdf\kmdf\$v\wdf.h"))) { throw "KMDF $v headers not found under $WdkRoot (set PNA2DP_KMDF_VER to override)" }
+    return $v
 }
 $script:KmdfVer = Find-KmdfVer
 

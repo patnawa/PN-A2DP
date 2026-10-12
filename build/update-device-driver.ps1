@@ -5,9 +5,13 @@
 #>
 param(
     [Parameter(Mandatory)][string]$InstanceId,
-    [Parameter(Mandatory)][string]$Inf
+    [Parameter(Mandatory)][string]$Inf,
+    [switch]$PassThru
 )
 $ErrorActionPreference = 'Stop'
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this script from an elevated PowerShell.' }
+$Inf = (Resolve-Path -LiteralPath $Inf).Path
 $src = @"
 using System;
 using System.Runtime.InteropServices;
@@ -36,6 +40,8 @@ public static class PnDrv {
     public static int Install(string instanceId, string inf, out bool reboot) {
         reboot = false;
         IntPtr set = SetupDiCreateDeviceInfoList(IntPtr.Zero, IntPtr.Zero);
+        if (set == new IntPtr(-1)) return Marshal.GetLastWin32Error();
+        try {
         var dev = new SP_DEVINFO_DATA(); dev.cbSize = Marshal.SizeOf(dev);
         if (!SetupDiOpenDeviceInfo(set, instanceId, IntPtr.Zero, 0, ref dev)) return Marshal.GetLastWin32Error();
         var p = new SP_DEVINSTALL_PARAMS(); p.cbSize = Marshal.SizeOf(p);
@@ -47,13 +53,29 @@ public static class PnDrv {
         if (!SetupDiEnumDriverInfo(set, ref dev, SPDIT_COMPATDRIVER, 0, ref drv)) return Marshal.GetLastWin32Error();
         if (!SetupDiSetSelectedDriver(set, ref dev, ref drv)) return Marshal.GetLastWin32Error();
         if (!DiInstallDevice(IntPtr.Zero, set, ref dev, ref drv, DIIRFLAG_FORCE_INF, out reboot)) return Marshal.GetLastWin32Error();
-        SetupDiDestroyDeviceInfoList(set);
         return 0;
+        } finally { SetupDiDestroyDeviceInfoList(set); }
     }
 }
 "@
-Add-Type -TypeDefinition $src
+if (-not ('PnDrv' -as [type])) { Add-Type -TypeDefinition $src }
 $reboot = $false
-$rc = [PnDrv]::Install($InstanceId, $Inf, [ref]$reboot)
+# Release the host's persistent device handles before asking PnP to remove the
+# old stack. Otherwise a routine update can be deferred until a system restart.
+$hostService = Get-Service 'pna2dp-codechost' -ErrorAction SilentlyContinue
+$restartHost = $hostService -and $hostService.Status -eq 'Running'
+try {
+    if ($restartHost) {
+        $hostInfo = Get-CimInstance Win32_Service -Filter "Name='pna2dp-codechost'"
+        $hostProcess = if ($hostInfo.ProcessId) { Get-Process -Id $hostInfo.ProcessId -ErrorAction SilentlyContinue }
+        Stop-Service -InputObject $hostService -ErrorAction Stop
+        $hostService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+        if ($hostProcess -and -not $hostProcess.WaitForExit(30000)) { throw 'Codec host did not exit; device update was not attempted.' }
+    }
+    $rc = [PnDrv]::Install($InstanceId, $Inf, [ref]$reboot)
+} finally {
+    if ($restartHost) { Start-Service 'pna2dp-codechost' }
+}
 if ($rc -ne 0) { throw "DiInstallDevice failed with Win32 error $rc (0x$('{0:x}' -f $rc))" }
 Write-Host "installed $Inf on $InstanceId$(if ($reboot) { ' (reboot required)' })"
+if ($PassThru) { [pscustomobject]@{ InstanceId = $InstanceId; Inf = $Inf; RebootRequired = $reboot } }

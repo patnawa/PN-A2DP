@@ -14,6 +14,8 @@
 #include <math.h>
 
 static int failures = 0;
+static const char *vector_dir = NULL;
+static int signal_profile = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
 
 static double run_roundtrip(sbc_u32 rate, int mode, int alloc, int subbands, int blocks, int bitpool, int verbose)
@@ -27,6 +29,8 @@ static double run_roundtrip(sbc_u32 rate, int mode, int alloc, int subbands, int
     double sig = 0, err = 0, snr;
     const sbc_u32 nframes = 200;
     sbc_u32 delay;
+    FILE *encoded = NULL, *reference = NULL;
+    char path[1024];
 
     p.sample_rate = rate; p.channel_mode = (sbc_u8)mode; p.allocation = (sbc_u8)alloc;
     p.subbands = (sbc_u8)subbands; p.blocks = (sbc_u8)blocks; p.bitpool = (sbc_u8)bitpool;
@@ -43,26 +47,53 @@ static double run_roundtrip(sbc_u32 rate, int mode, int alloc, int subbands, int
         double v = 0.30 * sin(2 * 3.14159265358979 * 440.0 * t) + 0.15 * sin(2 * 3.14159265358979 * 3100.0 * t) +
                    0.08 * sin(2 * 3.14159265358979 * 9700.0 * t);
         double w = 0.25 * sin(2 * 3.14159265358979 * 660.0 * t) + 0.10 * sin(2 * 3.14159265358979 * 5200.0 * t);
+        /* Exercise near-full-scale bass, correlated and opposite-phase stereo,
+         * plus loud transients. Low-amplitude midrange tones miss these cases. */
+        if (signal_profile) {
+            v = 0.99 * sin(2 * 3.14159265358979 * 53.0 * t);
+            w = signal_profile == 2 ? -v : v;
+            if (signal_profile == 3) {
+                v = 0.70 * sin(2 * 3.14159265358979 * 63.0 * t) + 0.29 * sin(2 * 3.14159265358979 * 3011.0 * t);
+                w = 0.70 * sin(2 * 3.14159265358979 * 97.0 * t) + 0.29 * sin(2 * 3.14159265358979 * 6971.0 * t);
+            }
+            if (signal_profile >= 4) {
+                v = (i % 997 < 498) ? 1.0 : -1.0;
+                w = signal_profile == 5 ? -v : v;
+            }
+        }
         for (ch = 0; ch < nch; ch++) in[i * nch + ch] = (sbc_s16)((ch == 0 ? v : w) * 32767.0);
     }
 
+    if (vector_dir) {
+        snprintf(path, sizeof(path), "%s/%u-%d-%d-%d-%d-%d-p%d.sbc", vector_dir, rate, mode, alloc, subbands, blocks, bitpool, signal_profile);
+        encoded = fopen(path, "wb");
+        snprintf(path, sizeof(path), "%s/%u-%d-%d-%d-%d-%d-p%d.pcm", vector_dir, rate, mode, alloc, subbands, blocks, bitpool, signal_profile);
+        reference = fopen(path, "wb");
+        CHECK(encoded && reference, "open interoperability vectors");
+        if (reference) { fwrite(in, sizeof(sbc_s16), (size_t)nframes * pcm_per * nch, reference); fclose(reference); }
+    }
     for (f = 0; f < nframes; f++) {
         sbc_u32 len = sbc_encode_frame(e, in + (size_t)f * pcm_per * nch, buf, sizeof(buf));
         sbc_u32 consumed, dframes, dch, drate;
         CHECK(len == e->frame_length, "frame length %u != %u", len, e->frame_length);
         CHECK(len == sbc_frame_length(&p), "frame length formula");
+        if (encoded) fwrite(buf, 1, len, encoded);
         consumed = sbc_decode_frame(d, buf, len, dec, pcm_per * nch, &dframes, &dch, &drate);
         CHECK(consumed == len, "decode consumed %u != %u (frame %u)", consumed, len, f);
         CHECK(dframes == pcm_per && dch == nch && drate == rate, "decode params");
         memcpy(out + (size_t)f * pcm_per * nch, dec, (size_t)pcm_per * nch * sizeof(sbc_s16));
     }
+    if (encoded) fclose(encoded);
     /* The filterbank pair delays the signal by 10*subbands - subbands... measure the delay empirically */
     {
-        sbc_u32 best = 0; double bestc = -1e30;
+        sbc_u32 best = 0; double beste = 1e100;
         for (delay = 0; delay < 200; delay++) {
-            double c = 0;
-            for (i = 2000; i < 6000; i++) c += (double)in[i * nch] * out[(i + delay) * nch];
-            if (c > bestc) { bestc = c; best = delay; }
+            double error = 0;
+            for (i = 2000; i < 6000; i++) {
+                double difference = (double)in[i * nch] - out[(i + delay) * nch];
+                error += difference * difference;
+            }
+            if (error < beste) { beste = error; best = delay; }
         }
         delay = best;
     }
@@ -79,10 +110,11 @@ static double run_roundtrip(sbc_u32 rate, int mode, int alloc, int subbands, int
     return snr;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     sbc_params p;
     double snr;
+    if (argc > 1) vector_dir = argv[1];
 
     /* 1. frame length / bitrate sanity (values from the A2DP spec examples) */
     p.sample_rate = 44100; p.channel_mode = SBC_MODE_JOINT; p.allocation = SBC_ALLOC_LOUDNESS; p.subbands = 8; p.blocks = 16; p.bitpool = 53;
@@ -103,6 +135,13 @@ int main(void)
     snr = run_roundtrip(32000, SBC_MODE_STEREO, SBC_ALLOC_LOUDNESS, 4, 8, 40, 1);  CHECK(snr > 15.0, "SNR 4sb/40 too low: %.1f", snr);
     snr = run_roundtrip(48000, SBC_MODE_DUAL, SBC_ALLOC_LOUDNESS, 8, 16, 128, 1);  CHECK(snr > 40.0, "SNR dual/128 too low: %.1f", snr);
     snr = run_roundtrip(48000, SBC_MODE_JOINT, SBC_ALLOC_LOUDNESS, 8, 16, 250, 1); CHECK(snr > 45.0, "SNR joint/250 too low: %.1f", snr);
+
+    for (signal_profile = 1; signal_profile <= 5; ++signal_profile) {
+        printf("Loud/bass profile %d\n", signal_profile);
+        snr = run_roundtrip(48000, SBC_MODE_JOINT, SBC_ALLOC_LOUDNESS, 8, 16, 53, 1);
+        CHECK(snr > 45.0, "loud/bass SNR too low: %.1f", snr);
+    }
+    signal_profile = 0;
 
     /* 2. live bitpool change keeps decoding */
     {

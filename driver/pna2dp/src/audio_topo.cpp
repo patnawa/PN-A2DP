@@ -1,13 +1,13 @@
 /*
- * audio_topo.cpp - topology miniport: master volume + mute nodes and a headphone jack.
+ * audio_topo.cpp - topology miniport: master volume, mute and receiver endpoint.
  *
- * Volume changes made by the user (or by the AVRCP service when the headset reports
- * EVENT_VOLUME_CHANGED) land here. By default the sink applies the gain through AVRCP
- * absolute volume; the pump applies digital gain only when PNA2DP_CFG_SOFTWARE_VOLUME is set.
+ * Windows endpoint volume and mute land here. The Bluetooth service can bridge
+ * these controls to AVRCP; otherwise the pump applies the gain locally.
  *
  * SPDX-License-Identifier: MIT
  */
 #include "pna2dp.h"
+#include "audio_policy.h"
 
 /* ---- filter descriptor ------------------------------------------------------ */
 
@@ -19,8 +19,8 @@ static PKSDATARANGE g_TopoBridgeRanges[] = { &g_TopoBridgeRange[0] };
 static PCPIN_DESCRIPTOR g_TopoPins[] = {
     /* PN_TOPO_PIN_WAVEIN: from the wave filter */
     { 0, 0, 0, NULL, { 0, NULL, 0, NULL, SIZEOF_ARRAY(g_TopoBridgeRanges), g_TopoBridgeRanges, KSPIN_DATAFLOW_IN, KSPIN_COMMUNICATION_NONE, &KSCATEGORY_AUDIO, NULL, 0 } },
-    /* PN_TOPO_PIN_LINEOUT: the headset */
-    { 0, 0, 0, NULL, { 0, NULL, 0, NULL, SIZEOF_ARRAY(g_TopoBridgeRanges), g_TopoBridgeRanges, KSPIN_DATAFLOW_OUT, KSPIN_COMMUNICATION_NONE, &KSNODETYPE_HEADPHONES, NULL, 0 } },
+    /* PN_TOPO_PIN_LINEOUT: category is selected per receiver at Init. */
+    { 0, 0, 0, NULL, { 0, NULL, 0, NULL, SIZEOF_ARRAY(g_TopoBridgeRanges), g_TopoBridgeRanges, KSPIN_DATAFLOW_OUT, KSPIN_COMMUNICATION_NONE, &KSNODETYPE_SPEAKER, NULL, 0 } },
 };
 
 static PCPROPERTY_ITEM g_TopoVolumeProps[] = {
@@ -29,8 +29,11 @@ static PCPROPERTY_ITEM g_TopoVolumeProps[] = {
 static PCPROPERTY_ITEM g_TopoMuteProps[] = {
     { &KSPROPSETID_Audio, KSPROPERTY_AUDIO_MUTE, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportTopology::PropertyHandlerTopoNode },
 };
-DEFINE_PCAUTOMATION_TABLE_PROP(g_TopoVolumeAutomation, g_TopoVolumeProps);
-DEFINE_PCAUTOMATION_TABLE_PROP(g_TopoMuteAutomation, g_TopoMuteProps);
+static PCEVENT_ITEM g_TopoNodeEvents[] = {
+    { &KSEVENTSETID_AudioControlChange, KSEVENT_CONTROL_CHANGE, KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT, CPnMiniportTopology::EventHandlerControlChange },
+};
+DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(g_TopoVolumeAutomation, g_TopoVolumeProps, g_TopoNodeEvents);
+DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(g_TopoMuteAutomation, g_TopoMuteProps, g_TopoNodeEvents);
 
 static PCNODE_DESCRIPTOR g_TopoNodes[] = {
     { 0, &g_TopoVolumeAutomation, &KSNODETYPE_VOLUME, &KSAUDFNAME_MASTER_VOLUME },
@@ -44,17 +47,29 @@ static PCCONNECTION_DESCRIPTOR g_TopoConnections[] = {
 };
 
 static PCPROPERTY_ITEM g_TopoFilterProps[] = {
+    { &PN_KSPROPSETID_BluetoothVolume, 1, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportTopology::PropertyHandlerTopoFilter },
     { &KSPROPSETID_Jack, KSPROPERTY_JACK_DESCRIPTION, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportTopology::PropertyHandlerTopoFilter },
     { &KSPROPSETID_Jack, KSPROPERTY_JACK_DESCRIPTION2, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportTopology::PropertyHandlerTopoFilter },
 };
-DEFINE_PCAUTOMATION_TABLE_PROP(g_TopoFilterAutomation, g_TopoFilterProps);
+static PCEVENT_ITEM g_TopoFilterEvents[] = {
+    { &PN_KSPROPSETID_BluetoothVolume, 1, KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT, CPnMiniportTopology::EventHandlerControlChange },
+    { &KSEVENTSETID_AudioControlChange, KSEVENT_CONTROL_CHANGE, KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT, CPnMiniportTopology::EventHandlerControlChange },
+};
+DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(g_TopoFilterAutomation, g_TopoFilterProps, g_TopoFilterEvents);
+
+/* BthAvrcp watches this interface class on the AudioSink device instance. PortCls
+ * publishes it with the Topology reference and owns its PnP lifetime. */
+static GUID g_TopoCategories[] = {
+    STATICGUIDOF(KSCATEGORY_AUDIO), STATICGUIDOF(KSCATEGORY_TOPOLOGY),
+    { 0xe630310c, 0x1733, 0x42bb, { 0x98, 0x47, 0x7e, 0x45, 0xd1, 0xa2, 0x74, 0x90 } },
+};
 
 PCFILTER_DESCRIPTOR g_PnTopoFilterDescriptor = {
     0, &g_TopoFilterAutomation,
     sizeof(PCPIN_DESCRIPTOR), SIZEOF_ARRAY(g_TopoPins), g_TopoPins,
     sizeof(PCNODE_DESCRIPTOR), SIZEOF_ARRAY(g_TopoNodes), g_TopoNodes,
     SIZEOF_ARRAY(g_TopoConnections), g_TopoConnections,
-    0, NULL
+    SIZEOF_ARRAY(g_TopoCategories), g_TopoCategories
 };
 
 static KSJACK_DESCRIPTION g_JackDesc = {
@@ -138,15 +153,19 @@ NTSTATUS NewPnMiniportTopology(_Out_ PUNKNOWN *Unknown, _In_ PPNADAPTERCOMMON Ad
 }
 
 #pragma code_seg("PAGE")
-CPnMiniportTopology::CPnMiniportTopology(_In_opt_ PUNKNOWN UnknownOuter) : CUnknown(UnknownOuter), m_Adapter(NULL), m_Port(NULL), m_PortEvents(NULL)
+CPnMiniportTopology::CPnMiniportTopology(_In_opt_ PUNKNOWN UnknownOuter) : CUnknown(UnknownOuter), m_Adapter(NULL), m_Port(NULL), m_PortEvents(NULL), m_RemoteListeners(0)
 {
     PAGED_CODE();
+    m_Filter = g_PnTopoFilterDescriptor;
+    RtlCopyMemory(m_Pins, g_TopoPins, sizeof(m_Pins));
+    m_Filter.Pins = m_Pins;
 }
 
 #pragma code_seg("PAGE")
 CPnMiniportTopology::~CPnMiniportTopology()
 {
     PAGED_CODE();
+    if (m_Adapter) m_Adapter->GetDevice()->Adapter->SetTopologyMiniport(NULL);
     if (m_PortEvents) { m_PortEvents->Release(); m_PortEvents = NULL; }
     if (m_Adapter) { m_Adapter->Release(); m_Adapter = NULL; }
 }
@@ -171,7 +190,10 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportTopology::Init(_In_ PUNKNOWN UnknownAdapter, 
     NTSTATUS status = UnknownAdapter->QueryInterface(IID_IPnAdapterCommon, (PVOID *)&m_Adapter);
     if (!NT_SUCCESS(status)) return status;
     m_Port = Port;
+    m_Pins[PN_TOPO_PIN_LINEOUT].KsPinDescriptor.Category =
+        PnEndpointIsHeadphones(m_Adapter->GetDevice()->Link.RemoteCod) ? &KSNODETYPE_HEADPHONES : &KSNODETYPE_SPEAKER;
     Port->QueryInterface(IID_IPortEvents, (PVOID *)&m_PortEvents);
+    m_Adapter->GetDevice()->Adapter->SetTopologyMiniport(this);
     return STATUS_SUCCESS;
 }
 
@@ -179,7 +201,7 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportTopology::Init(_In_ PUNKNOWN UnknownAdapter, 
 STDMETHODIMP_(NTSTATUS) CPnMiniportTopology::GetDescription(_Out_ PPCFILTER_DESCRIPTOR *Description)
 {
     PAGED_CODE();
-    *Description = &g_PnTopoFilterDescriptor;
+    *Description = &m_Filter;
     return STATUS_SUCCESS;
 }
 
@@ -292,7 +314,51 @@ NTSTATUS CPnMiniportTopology::PropertyHandlerTopoFilter(_In_ PPCPROPERTY_REQUEST
     PAGED_CODE();
     CPnMiniportTopology *t = (CPnMiniportTopology *)Req->MajorTarget;
     if (!t) return STATUS_INVALID_PARAMETER;
+    if (IsEqualGUIDAligned(*Req->PropertyItem->Set, PN_KSPROPSETID_BluetoothVolume)) return t->HandleRemoteVolume(Req);
     return t->HandleJack(Req);
+}
+
+NTSTATUS CPnMiniportTopology::HandleRemoteVolume(_In_ PPCPROPERTY_REQUEST Req)
+{
+    PAGED_CODE();
+    if (Req->Verb & KSPROPERTY_TYPE_BASICSUPPORT)
+        return PnPropertyBasicSupport(Req, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT, VT_I4);
+    if (Req->ValueSize < sizeof(LONG)) { Req->ValueSize = sizeof(LONG); return STATUS_BUFFER_TOO_SMALL; }
+    LONG *value = (LONG *)Req->Value;
+    if (Req->Verb & KSPROPERTY_TYPE_GET) {
+        LONG db = m_Adapter->GetVolume(0);
+        *value = m_Adapter->GetMute(0) || db < PN_REMOTE_VOLUME_MIN_DB16 ? PN_REMOTE_VOLUME_MIN_DB16 : db;
+        Req->ValueSize = sizeof(LONG);
+        return STATUS_SUCCESS;
+    }
+    if (Req->Verb & KSPROPERTY_TYPE_SET) {
+        if (*value < PN_REMOTE_VOLUME_MIN_DB16 || *value > 0) return STATUS_INVALID_PARAMETER;
+        m_Adapter->GetDevice()->Adapter->SetRemoteVolume(*value);
+        return STATUS_SUCCESS;
+    }
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+
+NTSTATUS CPnMiniportTopology::EventHandlerControlChange(_In_ PPCEVENT_REQUEST Req)
+{
+    PAGED_CODE();
+    CPnMiniportTopology *t = (CPnMiniportTopology *)Req->MajorTarget;
+    if (!t || !t->m_PortEvents) return STATUS_INVALID_PARAMETER;
+    BOOLEAN remote = IsEqualGUIDAligned(*Req->EventItem->Set, PN_KSPROPSETID_BluetoothVolume);
+    switch (Req->Verb) {
+    case PCEVENT_VERB_SUPPORT: return STATUS_SUCCESS;
+    case PCEVENT_VERB_ADD:
+        if (!Req->EventEntry) return STATUS_INVALID_PARAMETER;
+        if (remote) InterlockedIncrement(&t->m_RemoteListeners);
+        t->m_PortEvents->AddEventToEventList(Req->EventEntry);
+        if (remote) PN_INFO("Windows Bluetooth volume listener attached");
+        return STATUS_SUCCESS;
+    case PCEVENT_VERB_REMOVE:
+        if (remote && InterlockedDecrement(&t->m_RemoteListeners) == 0)
+            t->m_Adapter->GetDevice()->Adapter->DisableRemoteVolume();
+        return STATUS_SUCCESS;
+    default: return STATUS_INVALID_PARAMETER;
+    }
 }
 
 #pragma code_seg("PAGE")
@@ -300,5 +366,12 @@ VOID CPnMiniportTopology::GenerateVolumeEvent()
 {
     PAGED_CODE();
     if (m_PortEvents) m_PortEvents->GenerateEventList((GUID *)&KSEVENTSETID_AudioControlChange, KSEVENT_CONTROL_CHANGE, FALSE, ULONG(-1), TRUE, PN_TOPO_NODE_VOLUME);
+    if (m_PortEvents) m_PortEvents->GenerateEventList((GUID *)&KSEVENTSETID_AudioControlChange, KSEVENT_CONTROL_CHANGE, FALSE, ULONG(-1), TRUE, PN_TOPO_NODE_MUTE);
+}
+
+VOID CPnMiniportTopology::GenerateRemoteVolumeEvent()
+{
+    PAGED_CODE();
+    if (m_PortEvents) m_PortEvents->GenerateEventList((GUID *)&PN_KSPROPSETID_BluetoothVolume, 1, FALSE, ULONG(-1), FALSE, ULONG(-1));
 }
 #pragma code_seg()

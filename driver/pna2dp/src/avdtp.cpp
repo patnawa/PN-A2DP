@@ -8,8 +8,10 @@
 #define AVDTP_EVT_MEDIA_DOWN   0x2
 #define AVDTP_EVT_MEDIA_UP     0x4
 #define AVDTP_EVT_SIG_UP       0x8
+#define AVDTP_EVT_RUNNING      0x40000000   /* event work item queued or running */
 
 static VOID AvdtpQueueEvent(_Inout_ PAVDTP_SESSION S, _In_ ULONG Bits);
+static VOID AvdtpAcpWorker(_In_ PAVDTP_SESSION S);
 
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                      */
@@ -70,8 +72,9 @@ static NTSTATUS AvdtpWriteMessage(_Inout_ PAVDTP_SESSION S, _In_ UCHAR MsgType, 
                                   _In_reads_bytes_opt_(Len) const UCHAR *Payload, _In_ ULONG Len)
 {
     PPN_L2CAP_CHANNEL ch = &S->Signalling;
-    ULONG mtu = ch->OutMtu ? ch->OutMtu : 48;
-    if (mtu < 8) mtu = 48;
+    if (Len > AVDTP_MAX_SIGNAL_PAYLOAD || (!Payload && Len)) return STATUS_INVALID_PARAMETER;
+    ULONG mtu = PN_MIN(ch->OutMtu, ch->WriteCapacity);
+    if (mtu < 8) return STATUS_INVALID_PARAMETER;
     if (!PnChannelIsConnected(ch)) return STATUS_CONNECTION_DISCONNECTED;
 
     if (Len + 2 <= mtu) {
@@ -126,6 +129,12 @@ static NTSTATUS AvdtpTransact(_Inout_ PAVDTP_SESSION S, _In_ UCHAR SignalId, _In
     KIRQL irql;
     if (ErrorCode) *ErrorCode = 0;
     if (!S->SignallingUp) return STATUS_CONNECTION_DISCONNECTED;
+    if (S->Signalling.State == PnChannelConnecting) {
+        /* the remote opened signalling and our accept has not completed yet */
+        LARGE_INTEGER t;
+        t.QuadPart = -PN_HNS_PER_MS * 5000;
+        KeWaitForSingleObject(&S->Signalling.ConnectedEvent, Executive, KernelMode, FALSE, &t);
+    }
 
     KeAcquireSpinLock(&S->Lock, &irql);
     S->NextLabel = (UCHAR)((S->NextLabel + 1) & 0x0F);
@@ -173,45 +182,6 @@ static NTSTATUS AvdtpTransact(_Inout_ PAVDTP_SESSION S, _In_ UCHAR SignalId, _In
 /* Capability parsing                                                           */
 /* ------------------------------------------------------------------------- */
 
-static VOID ParseServiceCapabilities(_In_reads_bytes_(Len) const UCHAR *P, _In_ ULONG Len, _Inout_ PAVDTP_REMOTE_SEP Sep)
-{
-    ULONG i = 0;
-    Sep->ServiceCaps = 0;
-    Sep->CapsValid = FALSE;
-    while (i + 2 <= Len) {
-        UCHAR cat = P[i], l = P[i + 1];
-        const UCHAR *d = P + i + 2;
-        if (i + 2 + l > Len) break;
-        switch (cat) {
-        case AVDTP_CAT_MEDIA_TRANSPORT: Sep->ServiceCaps |= PNA2DP_SVC_MEDIA_TRANSPORT; break;
-        case AVDTP_CAT_REPORTING: Sep->ServiceCaps |= PNA2DP_SVC_REPORTING; break;
-        case AVDTP_CAT_RECOVERY: Sep->ServiceCaps |= PNA2DP_SVC_RECOVERY; break;
-        case AVDTP_CAT_CONTENT_PROTECTION: Sep->ServiceCaps |= PNA2DP_SVC_CONTENT_PROTECTION; break;
-        case AVDTP_CAT_HEADER_COMPRESSION: Sep->ServiceCaps |= PNA2DP_SVC_HEADER_COMPRESSION; break;
-        case AVDTP_CAT_MULTIPLEXING: Sep->ServiceCaps |= PNA2DP_SVC_MULTIPLEXING; break;
-        case AVDTP_CAT_DELAY_REPORTING: Sep->ServiceCaps |= PNA2DP_SVC_DELAY_REPORTING; break;
-        case AVDTP_CAT_MEDIA_CODEC:
-            if (l >= 2) {
-                Sep->MediaType = (UCHAR)(d[0] >> 4);
-                Sep->MediaCodecType = d[1];
-                Sep->CodecCapsLength = (UCHAR)PN_MIN(l - 2, sizeof(Sep->CodecCaps));
-                RtlCopyMemory(Sep->CodecCaps, d + 2, Sep->CodecCapsLength);
-                A2DP_CODEC_CAPS caps;
-                if (A2dpParseCaps(Sep->MediaCodecType, Sep->CodecCaps, Sep->CodecCapsLength, &caps, &Sep->VendorId, &Sep->VendorCodecId)) {
-                    Sep->Codec = caps.Codec;
-                } else {
-                    Sep->Codec = PNA2DP_CODEC_NONE;
-                }
-                Sep->CapsValid = TRUE;
-            }
-            break;
-        default:
-            break;
-        }
-        i += 2 + l;
-    }
-}
-
 /* ------------------------------------------------------------------------- */
 /* Receive path (DISPATCH): header parsing, reassembly, routing                 */
 /* ------------------------------------------------------------------------- */
@@ -225,23 +195,34 @@ static VOID AvdtpHandleMessage(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Label, _In_ 
         if (!item) return;
         item->Label = Label;
         item->SignalId = SignalId;
+        item->Generation = S->Signalling.Generation;
         item->Length = PN_MIN(Len, AVDTP_MAX_SIGNAL_PAYLOAD);
         RtlCopyMemory(item->Payload, Payload, item->Length);
         KeAcquireSpinLock(&S->AcpQueueLock, &irql);
+        if (S->AcpQueueDepth >= 32) {
+            KeReleaseSpinLock(&S->AcpQueueLock, irql);
+            PnFree(item, PNA2DP_TAG_AVDTP);
+            return;
+        }
         InsertTailList(&S->AcpQueue, &item->Link);
+        S->AcpQueueDepth++;
         KeReleaseSpinLock(&S->AcpQueueLock, irql);
         if (InterlockedCompareExchange(&S->AcpWorkQueued, 1, 0) == 0) {
-            IoQueueWorkItem(S->AcpWorkItem, [](PDEVICE_OBJECT, PVOID Ctx) {
-                PAVDTP_SESSION s = (PAVDTP_SESSION)Ctx;
-                extern VOID AvdtpAcpWorker(PAVDTP_SESSION);
-                AvdtpAcpWorker(s);
-            }, DelayedWorkQueue, S);
+            if (S->AcpWorkItem && ExAcquireRundownProtection(&S->WorkRundown)) {
+                IoQueueWorkItem(S->AcpWorkItem, [](PDEVICE_OBJECT, PVOID Ctx) {
+                    PAVDTP_SESSION s = (PAVDTP_SESSION)Ctx;
+                    AvdtpAcpWorker(s);
+                    ExReleaseRundownProtection(&s->WorkRundown);   /* last access */
+                }, DelayedWorkQueue, S);
+            } else {
+                InterlockedExchange(&S->AcpWorkQueued, 0);   /* shutting down: AvdtpUninitialize frees the queue */
+            }
         }
         return;
     }
     /* response */
     KeAcquireSpinLock(&S->Lock, &irql);
-    if (S->Txn.Active && S->Txn.Label == Label) {
+    if (S->Txn.Active && S->Txn.Label == Label && S->Txn.SignalId == SignalId && S->Txn.MessageType == 0xff) {
         S->Txn.MessageType = MsgType;
         S->Txn.PayloadLength = PN_MIN(Len, AVDTP_MAX_SIGNAL_PAYLOAD);
         RtlCopyMemory(S->Txn.Payload, Payload, S->Txn.PayloadLength);
@@ -250,8 +231,8 @@ static VOID AvdtpHandleMessage(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Label, _In_ 
         if (MsgType == AVDTP_MSG_RESPONSE_REJECT && Len >= 2 && (SignalId == AVDTP_SET_CONFIGURATION || SignalId == AVDTP_RECONFIGURE)) {
             S->Txn.ErrorCode = Payload[1];
         }
-        KeReleaseSpinLock(&S->Lock, irql);
         KeSetEvent(&S->Txn.Done, 0, FALSE);
+        KeReleaseSpinLock(&S->Lock, irql);
     } else {
         KeReleaseSpinLock(&S->Lock, irql);
         PN_WARN("AVDTP stray response label %u signal %s", Label, SigName(SignalId));
@@ -262,52 +243,22 @@ static VOID AvdtpSignallingReceive(_In_ PVOID Context, _In_ PPN_L2CAP_CHANNEL Ch
 {
     UNREFERENCED_PARAMETER(Channel);
     PAVDTP_SESSION S = (PAVDTP_SESSION)Context;
-    if (Len < 1) return;
-    UCHAR label = Data[0] >> 4;
-    UCHAR pkt = (Data[0] >> 2) & 3;
-    UCHAR msgType = Data[0] & 3;
-    AVDTP_REASSEMBLY *R = &S->Reasm;
-
-    switch (pkt) {
-    case AVDTP_PKT_SINGLE:
-        if (Len < 2) return;
-        AvdtpHandleMessage(S, label, msgType, (UCHAR)(Data[1] & 0x3F), Data + 2, Len - 2);
-        break;
-    case AVDTP_PKT_START:
-        if (Len < 3) return;
-        R->Active = TRUE;
-        R->Label = label;
-        R->MessageType = msgType;
-        R->Nosp = Data[1];
-        R->SignalId = (UCHAR)(Data[2] & 0x3F);
-        R->Length = PN_MIN(Len - 3, AVDTP_MAX_SIGNAL_PAYLOAD);
-        RtlCopyMemory(R->Buffer, Data + 3, R->Length);
-        if (R->Nosp) R->Nosp--;
-        break;
-    case AVDTP_PKT_CONTINUE:
-    case AVDTP_PKT_END:
-        if (!R->Active || R->Label != label) { R->Active = FALSE; return; }
-        {
-            ULONG chunk = PN_MIN(Len - 1, AVDTP_MAX_SIGNAL_PAYLOAD - R->Length);
-            RtlCopyMemory(R->Buffer + R->Length, Data + 1, chunk);
-            R->Length += chunk;
-        }
-        if (R->Nosp) R->Nosp--;
-        if (pkt == AVDTP_PKT_END) {
-            R->Active = FALSE;
-            AvdtpHandleMessage(S, R->Label, R->MessageType, R->SignalId, R->Buffer, R->Length);
-        }
-        break;
-    }
+    KIRQL irql;
+    KeAcquireSpinLock(&S->ReasmLock, &irql);
+    AVDTP_REASSEMBLY *r = &S->Reasm;
+    if (AvdtpReassemble(r, Data, Len) == AvdtpComplete)
+        AvdtpHandleMessage(S, r->Label, r->MessageType, r->SignalId, r->Buffer, r->Length);
+    KeReleaseSpinLock(&S->ReasmLock, irql);
 }
 
-static VOID AvdtpSignallingClosed(_In_ PVOID Context, _In_ PPN_L2CAP_CHANNEL Channel, _In_ NTSTATUS Status)
+static VOID AvdtpSignallingClosed(_In_ PVOID Context, _In_ PPN_L2CAP_CHANNEL Channel, _In_ NTSTATUS Status, _In_ ULONG Generation)
 {
-    UNREFERENCED_PARAMETER(Channel);
     PAVDTP_SESSION S = (PAVDTP_SESSION)Context;
+    if (Generation != Channel->Generation) return;   /* an earlier connection: already replaced */
     PN_INFO("signalling channel down 0x%08x", Status);
     S->SignallingUp = FALSE;
     S->DownStatus = Status;
+    S->SigDownGen = Generation;
     KeSetEvent(&S->Txn.Done, 0, FALSE);       /* unblock any waiter */
     AvdtpQueueEvent(S, AVDTP_EVT_SIG_DOWN);
 }
@@ -319,13 +270,14 @@ static VOID AvdtpMediaReceive(_In_ PVOID Context, _In_ PPN_L2CAP_CHANNEL Channel
     if (S->Cb.OnMediaPacket) S->Cb.OnMediaPacket(S->Cb.Context, Data, Len);
 }
 
-static VOID AvdtpMediaClosed(_In_ PVOID Context, _In_ PPN_L2CAP_CHANNEL Channel, _In_ NTSTATUS Status)
+static VOID AvdtpMediaClosed(_In_ PVOID Context, _In_ PPN_L2CAP_CHANNEL Channel, _In_ NTSTATUS Status, _In_ ULONG Generation)
 {
-    UNREFERENCED_PARAMETER(Channel);
     PAVDTP_SESSION S = (PAVDTP_SESSION)Context;
+    if (Generation != Channel->Generation) return;   /* an earlier connection: already replaced */
     PN_INFO("media channel down 0x%08x", Status);
     S->MediaUp = FALSE;
     S->DownStatus = Status;
+    S->MediaDownGen = Generation;
     AvdtpQueueEvent(S, AVDTP_EVT_MEDIA_DOWN);
 }
 
@@ -342,29 +294,119 @@ static VOID AvdtpMediaWriteDone(_In_ PVOID Context, _In_ PPN_L2CAP_CHANNEL Chann
 /* Deferred events (PASSIVE)                                                    */
 /* ------------------------------------------------------------------------- */
 
-static LONG g_AvdtpPendingEventsDummy;   /* keeps the linker quiet if unused */
+typedef enum { AcceptReady, AcceptFailed, AcceptStale } AVDTP_ACCEPT_RESULT;
+static VOID AvdtpResetStream(_Inout_ PAVDTP_SESSION S);
+
+/* PASSIVE: wait for the accept of a remote-opened channel to complete, then start its
+ * readers. Stale: the accepted connection was replaced (by our own connect or a newer
+ * accept) before this ran, so this event no longer describes the channel. */
+static AVDTP_ACCEPT_RESULT AvdtpOnAcceptedChannelReady(_Inout_ PAVDTP_SESSION S, _In_ BOOLEAN Media, _Out_ PULONG EvalGen)
+{
+    PPN_L2CAP_CHANNEL ch = Media ? &S->Media : &S->Signalling;
+    ULONG gen = Media ? S->MediaAcceptGen : S->SigAcceptGen;
+    *EvalGen = gen;
+    if (ch->Generation != gen || !ch->RemoteInitiated) return AcceptStale;
+    PULONG done = Media ? &S->MediaUpDoneGen : &S->SigUpDoneGen;
+    if (*done == gen) return AcceptStale;   /* bit set again for a generation already handled */
+    *done = gen;                            /* single worker instance: no lock needed */
+    LARGE_INTEGER t;
+    t.QuadPart = -PN_HNS_PER_MS * 10000;
+    NTSTATUS wait = KeWaitForSingleObject(&ch->ConnectedEvent, Executive, KernelMode, FALSE, &t);
+    if (ch->Generation != gen) return AcceptStale;
+    if (wait == STATUS_SUCCESS && ch->OpenStatus != STATUS_PENDING && NT_SUCCESS(ch->OpenStatus) && PnChannelIsConnected(ch)) {
+        /* a new signalling session: the stream of the previous one is gone. Reset it before
+         * the readers run, so no command of the new session sees stale stream state. */
+        if (!Media && S->StreamState != AvdtpStateIdle) AvdtpResetStream(S);
+        /* a stale down handled meanwhile may have cleared the flag of this connection */
+        KIRQL irql;
+        KeAcquireSpinLock(&ch->Lock, &irql);
+        if (ch->Generation == gen && ch->State == PnChannelConnected) { if (Media) S->MediaUp = TRUE; else S->SignallingUp = TRUE; }
+        KeReleaseSpinLock(&ch->Lock, irql);
+        PnChannelStartReaders(ch);   /* idempotent per connection; stops if it was replaced */
+        return AcceptReady;
+    }
+    PN_WARN("accepted %s channel did not open (wait 0x%08x, status 0x%08x)", Media ? "media" : "signalling", wait, ch->OpenStatus);
+    /* a late open completes into Disconnecting and closes itself instead of being orphaned */
+    if (PnChannelDisconnectGen(ch, gen) || ch->Generation == gen) {
+        if (Media) S->MediaUp = FALSE; else S->SignallingUp = FALSE;
+    }
+    return AcceptFailed;
+}
+
+/* Signalling of an earlier connection went down after the remote had already connected
+ * again: the AVDTP stream of the old session is gone, the new signalling channel stays. */
+static VOID AvdtpResetStream(_Inout_ PAVDTP_SESSION S)
+{
+    PnMutexAcquire(&S->Mutex);
+    if (S->StreamState != AvdtpStateIdle) SetStreamState(S, AvdtpStateClosing, TRUE);
+    PnChannelDisconnectSync(&S->Media);
+    S->MediaUp = FALSE;
+    S->MediaExpected = FALSE;
+    S->RemoteSepsValid = FALSE;
+    S->RemoteSepCount = 0;
+    if (S->StreamState != AvdtpStateIdle) SetStreamState(S, AvdtpStateIdle, TRUE);
+    PnMutexRelease(&S->Mutex);
+}
 
 static VOID AvdtpEventWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Context)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
     PAVDTP_SESSION S = (PAVDTP_SESSION)Context;
     if (!S) return;
+    /* Only one instance exists at a time: AVDTP_EVT_RUNNING stays set from queueing until
+     * this loop sees no more bits, so the work item is never queued while still queued. */
     for (;;) {
-        LONG bits = InterlockedExchange(&S->DownQueued, 0);
-        if (bits == 0) break;
-        if (bits & AVDTP_EVT_MEDIA_UP) {
-            SetStreamState(S, AvdtpStateOpen, TRUE);
+        LONG bits = InterlockedAnd(&S->DownQueued, AVDTP_EVT_RUNNING) & ~AVDTP_EVT_RUNNING;
+        if (bits == 0) {
+            if (InterlockedCompareExchange(&S->DownQueued, 0, AVDTP_EVT_RUNNING) == AVDTP_EVT_RUNNING) break;
+            continue;   /* new bits arrived */
         }
+        /* Downs first. Each event names the connection (generation) it is about; one whose
+         * channel has been reconnected since is stale and must not touch the new one. */
         if (bits & AVDTP_EVT_MEDIA_DOWN) {
-            if (S->Cb.OnMediaDown) S->Cb.OnMediaDown(S->Cb.Context, S->DownStatus);
-            if (S->StreamState == AvdtpStateStreaming || S->StreamState == AvdtpStateOpen || S->StreamState == AvdtpStateOpening) {
-                SetStreamState(S, S->SignallingUp ? AvdtpStateConfigured : AvdtpStateIdle, TRUE);
+            ULONG gen = S->MediaDownGen;
+            if (gen == S->Media.Generation) {
+                /* the callback takes the device StateMutex, which ranks above S->Mutex, and
+                 * re-checks the generation under it */
+                if (S->Cb.OnMediaDown) S->Cb.OnMediaDown(S->Cb.Context, S->DownStatus, gen);
+                PnMutexAcquire(&S->Mutex);
+                /* Opening is left to MEDIA_UP / AvdtpOpen, which own the new transport */
+                if ((S->StreamState == AvdtpStateStreaming || S->StreamState == AvdtpStateOpen) && !PnChannelIsConnected(&S->Media)) {
+                    SetStreamState(S, S->SignallingUp ? AvdtpStateConfigured : AvdtpStateIdle, TRUE);
+                }
+                PnMutexRelease(&S->Mutex);
             }
         }
         if (bits & AVDTP_EVT_SIG_DOWN) {
-            if (S->Cb.OnSignallingDown) S->Cb.OnSignallingDown(S->Cb.Context, S->DownStatus);
+            /* a stale one needs nothing: the new session resets the stream when it starts */
+            ULONG gen = S->SigDownGen;
+            if (gen == S->Signalling.Generation && S->Cb.OnSignallingDown) S->Cb.OnSignallingDown(S->Cb.Context, S->DownStatus, gen);
+        }
+        if (bits & AVDTP_EVT_SIG_UP) {
+            ULONG gen;
+            AvdtpOnAcceptedChannelReady(S, FALSE, &gen);
+        }
+        if (bits & AVDTP_EVT_MEDIA_UP) {
+            ULONG gen;
+            AVDTP_ACCEPT_RESULT r = AvdtpOnAcceptedChannelReady(S, TRUE, &gen);
+            if (r != AcceptStale) {
+                PnMutexAcquire(&S->Mutex);
+                if (S->Media.Generation == gen) {   /* else a newer transport owns the decision */
+                    if (r == AcceptReady && S->StreamState == AvdtpStateOpening && PnChannelIsConnected(&S->Media)) {
+                        SetStreamState(S, AvdtpStateOpen, TRUE);
+                    } else {
+                        if (r == AcceptReady && PnChannelDisconnectGen(&S->Media, gen)) {
+                            /* the stream was aborted or closed while the transport was opening */
+                            S->MediaUp = FALSE;
+                        }
+                        if (S->StreamState == AvdtpStateOpening) SetStreamState(S, S->SignallingUp ? AvdtpStateConfigured : AvdtpStateIdle, TRUE);
+                    }
+                }
+                PnMutexRelease(&S->Mutex);
+            }
         }
     }
+    ExReleaseRundownProtection(&S->WorkRundown);   /* last access to S */
 }
 
 static VOID AvdtpQueueEvent(_Inout_ PAVDTP_SESSION S, _In_ ULONG Bits)
@@ -372,10 +414,14 @@ static VOID AvdtpQueueEvent(_Inout_ PAVDTP_SESSION S, _In_ ULONG Bits)
     LONG old, next;
     do {
         old = S->DownQueued;
-        next = old | (LONG)Bits;
+        next = old | (LONG)Bits | AVDTP_EVT_RUNNING;
     } while (InterlockedCompareExchange(&S->DownQueued, next, old) != old);
-    if (old == 0 && S->DownWorkItem) {
-        IoQueueWorkItem(S->DownWorkItem, AvdtpEventWorker, DelayedWorkQueue, S);
+    if (!(old & AVDTP_EVT_RUNNING)) {
+        if (S->DownWorkItem && ExAcquireRundownProtection(&S->WorkRundown)) {
+            IoQueueWorkItem(S->DownWorkItem, AvdtpEventWorker, DelayedWorkQueue, S);
+        } else {
+            InterlockedExchange(&S->DownQueued, 0);   /* shutting down: events are moot */
+        }
     }
 }
 
@@ -439,10 +485,10 @@ static VOID AvdtpProcessCommand(_Inout_ PAVDTP_SESSION S, _In_ PAVDTP_ACP_ITEM C
         /* parse requested service capabilities */
         AVDTP_REMOTE_SEP tmp;
         RtlZeroMemory(&tmp, sizeof(tmp));
-        ParseServiceCapabilities(C->Payload + 2, C->Length - 2, &tmp);
+        AvdtpParseServiceCapabilities(C->Payload + 2, C->Length - 2, &tmp);
         UCHAR failedCat = AVDTP_CAT_MEDIA_CODEC;
         UCHAR err = AVDTP_ERR_UNSUPPORTED_CONFIGURATION;
-        if (tmp.CapsValid && S->Cb.OnRemoteSetConfiguration) {
+        if (tmp.CapsValid && tmp.Codec == sep->Codec && S->Cb.OnRemoteSetConfiguration) {
             err = S->Cb.OnRemoteSetConfiguration(S->Cb.Context, sep, intSeid, tmp.CodecCaps, tmp.CodecCapsLength, tmp.ServiceCaps, &failedCat);
         }
         if (err) { rsp[0] = failedCat; rsp[1] = err; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
@@ -475,9 +521,11 @@ static VOID AvdtpProcessCommand(_Inout_ PAVDTP_SESSION S, _In_ PAVDTP_ACP_ITEM C
         if (S->StreamState != AvdtpStateOpen) { rsp[0] = 0; rsp[1] = AVDTP_ERR_BAD_STATE; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
         AVDTP_REMOTE_SEP tmp;
         RtlZeroMemory(&tmp, sizeof(tmp));
-        ParseServiceCapabilities(C->Payload + 1, C->Length - 1, &tmp);
+        AvdtpParseServiceCapabilities(C->Payload + 1, C->Length - 1, &tmp);
         UCHAR failedCat = AVDTP_CAT_MEDIA_CODEC, err = AVDTP_ERR_UNSUPPORTED_CONFIGURATION;
-        if (tmp.CapsValid && S->Cb.OnRemoteReconfigure) err = S->Cb.OnRemoteReconfigure(S->Cb.Context, tmp.CodecCaps, tmp.CodecCapsLength, &failedCat);
+        PAVDTP_LOCAL_SEP local = FindLocalSep(S, S->LocalSeid);
+        if (tmp.CapsValid && local && tmp.Codec == local->Codec && S->Cb.OnRemoteReconfigure)
+            err = S->Cb.OnRemoteReconfigure(S->Cb.Context, tmp.CodecCaps, tmp.CodecCapsLength, &failedCat);
         if (err) { rsp[0] = failedCat; rsp[1] = err; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
         S->ConfiguredIesLength = tmp.CodecCapsLength;
         RtlCopyMemory(S->ConfiguredIes, tmp.CodecCaps, tmp.CodecCapsLength);
@@ -547,7 +595,7 @@ static VOID AvdtpProcessCommand(_Inout_ PAVDTP_SESSION S, _In_ PAVDTP_ACP_ITEM C
     }
 }
 
-VOID AvdtpAcpWorker(PAVDTP_SESSION S)
+static VOID AvdtpAcpWorker(_In_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
     for (;;) {
@@ -557,14 +605,15 @@ VOID AvdtpAcpWorker(PAVDTP_SESSION S)
         if (!IsListEmpty(&S->AcpQueue)) {
             PLIST_ENTRY e = RemoveHeadList(&S->AcpQueue);
             item = CONTAINING_RECORD(e, AVDTP_ACP_ITEM, Link);
+            S->AcpQueueDepth--;
         } else {
             InterlockedExchange(&S->AcpWorkQueued, 0);
         }
         KeReleaseSpinLock(&S->AcpQueueLock, irql);
         if (!item) break;
-        ExAcquireFastMutex(&S->Mutex);
-        if (S->SignallingUp) AvdtpProcessCommand(S, item);
-        ExReleaseFastMutex(&S->Mutex);
+        PnMutexAcquire(&S->Mutex);
+        if (S->SignallingUp && item->Generation == S->Signalling.Generation) AvdtpProcessCommand(S, item);
+        PnMutexRelease(&S->Mutex);
         PnFree(item, PNA2DP_TAG_AVDTP);
     }
 }
@@ -573,30 +622,52 @@ VOID AvdtpAcpWorker(PAVDTP_SESSION S)
 /* Lifecycle                                                                    */
 /* ------------------------------------------------------------------------- */
 
+/* On failure everything is undone and S->Link stays NULL, so the device teardown skips the
+ * session entirely. */
 NTSTATUS AvdtpInitialize(_Out_ PAVDTP_SESSION S, _In_ PPN_BTH_LINK Link, _In_ PDEVICE_OBJECT DeviceObject, _In_ const AVDTP_CALLBACKS *Cb)
 {
     PAGED_CODE();
+    NTSTATUS status;
     RtlZeroMemory(S, sizeof(*S));
-    S->Link = Link;
     S->Cb = *Cb;
     S->DeviceObject = DeviceObject;
     ExInitializeFastMutex(&S->Mutex);
     KeInitializeSpinLock(&S->Lock);
+    KeInitializeSpinLock(&S->ReasmLock);
     KeInitializeSpinLock(&S->AcpQueueLock);
     InitializeListHead(&S->AcpQueue);
     KeInitializeEvent(&S->Txn.Done, NotificationEvent, FALSE);
+    ExInitializeRundownProtection(&S->WorkRundown);
+    S->WorkReady = TRUE;
     S->RemoteVersion = 0x0103;
     S->AcpWorkItem = IoAllocateWorkItem(DeviceObject);
     S->DownWorkItem = IoAllocateWorkItem(DeviceObject);
-    if (!S->AcpWorkItem || !S->DownWorkItem) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!S->AcpWorkItem || !S->DownWorkItem) { status = STATUS_INSUFFICIENT_RESOURCES; goto fail; }
 
-    NTSTATUS status = PnChannelInitialize(&S->Signalling, Link, FALSE, PN_L2CAP_SIG_MTU, PN_L2CAP_SIG_MTU,
-                                          AvdtpSignallingReceive, AvdtpSignallingClosed, NULL, S);
-    if (!NT_SUCCESS(status)) return status;
+    status = PnChannelInitialize(&S->Signalling, Link, FALSE, PN_L2CAP_SIG_MTU, PN_L2CAP_SIG_MTU,
+                                 AvdtpSignallingReceive, AvdtpSignallingClosed, NULL, S);
+    if (!NT_SUCCESS(status)) goto fail;
     status = PnChannelInitialize(&S->Media, Link, TRUE, 2048, 2048, AvdtpMediaReceive, AvdtpMediaClosed, AvdtpMediaWriteDone, S);
-    if (!NT_SUCCESS(status)) return status;
-    UNREFERENCED_PARAMETER(g_AvdtpPendingEventsDummy);
+    if (!NT_SUCCESS(status)) goto fail;
+    S->Link = Link;
     return STATUS_SUCCESS;
+
+fail:
+    /* no channel was ever connected, so no callback or work item can be pending */
+    PnChannelUninitialize(&S->Media);        /* no-op unless PnChannelInitialize ran */
+    PnChannelUninitialize(&S->Signalling);
+    if (S->AcpWorkItem) { IoFreeWorkItem(S->AcpWorkItem); S->AcpWorkItem = NULL; }
+    if (S->DownWorkItem) { IoFreeWorkItem(S->DownWorkItem); S->DownWorkItem = NULL; }
+    S->Link = NULL;
+    return status;
+}
+
+VOID AvdtpStopWork(_Inout_ PAVDTP_SESSION S)
+{
+    PAGED_CODE();
+    if (!S->WorkReady || S->WorkStopped) return;
+    S->WorkStopped = TRUE;
+    ExWaitForRundownProtectionRelease(&S->WorkRundown);
 }
 
 VOID AvdtpUninitialize(_Inout_ PAVDTP_SESSION S)
@@ -606,6 +677,7 @@ VOID AvdtpUninitialize(_Inout_ PAVDTP_SESSION S)
     AvdtpDisconnect(S);
     PnChannelUninitialize(&S->Media);
     PnChannelUninitialize(&S->Signalling);
+    AvdtpStopWork(S);   /* channels are closed: nothing can queue work any more */
     /* drain ACP queue */
     for (;;) {
         KIRQL irql;
@@ -637,6 +709,8 @@ NTSTATUS AvdtpConnectSignalling(_Inout_ PAVDTP_SESSION S)
         PN_WARN("AVDTP signalling connect failed 0x%08x", status);
         return status;
     }
+    /* a new signalling session: the stream of the previous one is gone */
+    if (S->StreamState != AvdtpStateIdle) AvdtpResetStream(S);
     S->SignallingUp = TRUE;
     S->RemoteSignallingInitiated = FALSE;
     S->Reasm.Active = FALSE;
@@ -652,9 +726,12 @@ NTSTATUS AvdtpAcceptIncoming(_Inout_ PAVDTP_SESSION S, _In_ PINDICATION_PARAMETE
         S->Reasm.Active = FALSE;
         status = PnChannelAccept(&S->Signalling, Params, PN_L2CAP_SIG_MTU);
         if (NT_SUCCESS(status)) {
-            /* mark up optimistically; readers start when the accept completes (device work item) */
+            /* mark up optimistically; readers start when the accept completes (event worker) */
+            S->SigAcceptGen = S->Signalling.Generation;
             S->SignallingUp = TRUE;
             AvdtpQueueEvent(S, AVDTP_EVT_SIG_UP);
+        } else {
+            PnLinkRejectIncoming(S->Link, Params);   /* the indication must get a response */
         }
         return status;
     }
@@ -662,9 +739,12 @@ NTSTATUS AvdtpAcceptIncoming(_Inout_ PAVDTP_SESSION S, _In_ PINDICATION_PARAMETE
         (S->MediaExpected || S->StreamState == AvdtpStateConfigured || S->StreamState == AvdtpStateOpening)) {
         status = PnChannelAccept(&S->Media, Params, PN_L2CAP_MEDIA_MTU_PREF);
         if (NT_SUCCESS(status)) {
+            S->MediaAcceptGen = S->Media.Generation;
             S->MediaExpected = FALSE;
             S->MediaUp = TRUE;
             AvdtpQueueEvent(S, AVDTP_EVT_MEDIA_UP);
+        } else {
+            PnLinkRejectIncoming(S->Link, Params);
         }
         return status;
     }
@@ -672,34 +752,26 @@ NTSTATUS AvdtpAcceptIncoming(_Inout_ PAVDTP_SESSION S, _In_ PINDICATION_PARAMETE
     return PnLinkRejectIncoming(S->Link, Params);
 }
 
-/* Called by the device layer after an accepted channel completes (SIG_UP / MEDIA_UP events). */
-extern "C" VOID AvdtpOnAcceptedChannelReady(_Inout_ PAVDTP_SESSION S, _In_ BOOLEAN Media)
-{
-    PPN_L2CAP_CHANNEL ch = Media ? &S->Media : &S->Signalling;
-    KeWaitForSingleObject(&ch->ConnectedEvent, Executive, KernelMode, FALSE, NULL);
-    if (NT_SUCCESS(ch->OpenStatus)) {
-        PnChannelStartReaders(ch);
-    } else {
-        if (Media) S->MediaUp = FALSE; else S->SignallingUp = FALSE;
-    }
-}
-
 VOID AvdtpDisconnect(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
-    ExAcquireFastMutex(&S->Mutex);
+    if (!S->Link) return;
+    PnMutexAcquire(&S->Mutex);
     if (S->StreamState != AvdtpStateIdle) SetStreamState(S, AvdtpStateClosing, FALSE);
+    /* clear the up flags only for the connections closed here: a remote reconnect accepted
+     * meanwhile (at DISPATCH) owns its own flag */
+    ULONG mg = S->Media.Generation, sg = S->Signalling.Generation;
     PnChannelDisconnectSync(&S->Media);
-    S->MediaUp = FALSE;
+    if (S->Media.Generation == mg) S->MediaUp = FALSE;
     S->MediaExpected = FALSE;
     PnChannelDisconnectSync(&S->Signalling);
-    S->SignallingUp = FALSE;
+    if (S->Signalling.Generation == sg) S->SignallingUp = FALSE;
     S->RemoteSepsValid = FALSE;
     S->RemoteSepCount = 0;
     S->Reasm.Active = FALSE;
     KeSetEvent(&S->Txn.Done, 0, FALSE);
     if (S->StreamState != AvdtpStateIdle) SetStreamState(S, AvdtpStateIdle, FALSE);
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -711,11 +783,11 @@ NTSTATUS AvdtpDiscover(_Inout_ PAVDTP_SESSION S)
     PAGED_CODE();
     NTSTATUS status;
     UCHAR err;
-    ExAcquireFastMutex(&S->Mutex);
+    PnMutexAcquire(&S->Mutex);
     S->RemoteSepCount = 0;
     S->RemoteSepsValid = FALSE;
     status = AvdtpTransact(S, AVDTP_DISCOVER, NULL, 0, &err);
-    if (!NT_SUCCESS(status)) { ExReleaseFastMutex(&S->Mutex); return status; }
+    if (!NT_SUCCESS(status)) { PnMutexRelease(&S->Mutex); return status; }
     ULONG count = S->Txn.PayloadLength / 2;
     for (ULONG i = 0; i < count && S->RemoteSepCount < AVDTP_MAX_SEPS; i++) {
         PAVDTP_REMOTE_SEP sep = &S->RemoteSeps[S->RemoteSepCount];
@@ -743,13 +815,13 @@ NTSTATUS AvdtpDiscover(_Inout_ PAVDTP_SESSION S)
             if (status == STATUS_IO_TIMEOUT || status == STATUS_CONNECTION_DISCONNECTED) break;
             continue;
         }
-        ParseServiceCapabilities(S->Txn.Payload, S->Txn.PayloadLength, sep);
+        AvdtpParseServiceCapabilities(S->Txn.Payload, S->Txn.PayloadLength, sep);
         PN_INFO("  SEP %u: %s in-use %u codec %s (type 0x%02X vid %08X cid %04X) svc 0x%02X", sep->Seid,
                 sep->Tsep ? "SNK" : "SRC", sep->InUse, A2dpCodecName(sep->Codec), sep->MediaCodecType, sep->VendorId,
                 sep->VendorCodecId, sep->ServiceCaps);
     }
     S->RemoteSepsValid = NT_SUCCESS(status) || S->RemoteSepCount > 0;
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
     return S->RemoteSepsValid ? STATUS_SUCCESS : status;
 }
 
@@ -766,8 +838,8 @@ NTSTATUS AvdtpSetConfiguration(_Inout_ PAVDTP_SESSION S, _In_ UCHAR LocalSeid, _
     if (!local) return STATUS_INVALID_PARAMETER;
     A2dpBuildLocalCaps(local->Codec, dummy, sizeof(dummy), &mct);
 
-    ExAcquireFastMutex(&S->Mutex);
-    if (S->StreamState != AvdtpStateIdle) { ExReleaseFastMutex(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    PnMutexAcquire(&S->Mutex);
+    if (S->StreamState != AvdtpStateIdle) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
     p[n++] = (UCHAR)(RemoteSeid << 2);
     p[n++] = (UCHAR)(LocalSeid << 2);
     p[n++] = AVDTP_CAT_MEDIA_TRANSPORT; p[n++] = 0;
@@ -787,7 +859,7 @@ NTSTATUS AvdtpSetConfiguration(_Inout_ PAVDTP_SESSION S, _In_ UCHAR LocalSeid, _
     } else {
         PN_WARN("SET_CONFIGURATION failed 0x%08x (avdtp error 0x%02X)", status, err);
     }
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
     return status;
 }
 
@@ -800,8 +872,8 @@ NTSTATUS AvdtpReconfigure(_Inout_ PAVDTP_SESSION S, _In_reads_bytes_(Len) const 
     PAVDTP_LOCAL_SEP local = FindLocalSep(S, S->LocalSeid);
     if (!local) return STATUS_INVALID_DEVICE_STATE;
     A2dpBuildLocalCaps(local->Codec, dummy, sizeof(dummy), &mct);
-    ExAcquireFastMutex(&S->Mutex);
-    if (S->StreamState != AvdtpStateOpen) { ExReleaseFastMutex(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    PnMutexAcquire(&S->Mutex);
+    if (S->StreamState != AvdtpStateOpen) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
     p[n++] = (UCHAR)(S->RemoteSeid << 2);
     n += AvdtpBuildMediaCodecCap(p + n, sizeof(p) - n, mct, CodecIes, Len);
     UCHAR ec = 0;
@@ -810,18 +882,18 @@ NTSTATUS AvdtpReconfigure(_Inout_ PAVDTP_SESSION S, _In_reads_bytes_(Len) const 
         S->ConfiguredIesLength = (UCHAR)PN_MIN(Len, sizeof(S->ConfiguredIes));
         RtlCopyMemory(S->ConfiguredIes, CodecIes, S->ConfiguredIesLength);
     }
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
     return status;
 }
 
 NTSTATUS AvdtpOpen(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
-    ExAcquireFastMutex(&S->Mutex);
-    if (S->StreamState != AvdtpStateConfigured) { ExReleaseFastMutex(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    PnMutexAcquire(&S->Mutex);
+    if (S->StreamState != AvdtpStateConfigured) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
     UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
     NTSTATUS status = AvdtpTransact(S, AVDTP_OPEN, p, 1, NULL);
-    if (!NT_SUCCESS(status)) { ExReleaseFastMutex(&S->Mutex); return status; }
+    if (!NT_SUCCESS(status)) { PnMutexRelease(&S->Mutex); return status; }
     SetStreamState(S, AvdtpStateOpening, FALSE);
     /* INT opens the transport channel */
     status = PnChannelConnect(&S->Media, PSM_AVDTP, PN_L2CAP_MEDIA_MTU_PREF, 10000);
@@ -830,22 +902,22 @@ NTSTATUS AvdtpOpen(_Inout_ PAVDTP_SESSION S)
         UCHAR a[1] = { (UCHAR)(S->RemoteSeid << 2) };
         AvdtpTransact(S, AVDTP_ABORT, a, 1, NULL);
         SetStreamState(S, AvdtpStateIdle, FALSE);
-        ExReleaseFastMutex(&S->Mutex);
+        PnMutexRelease(&S->Mutex);
         return status;
     }
     S->MediaUp = TRUE;
     PnChannelStartReaders(&S->Media);
     SetStreamState(S, AvdtpStateOpen, FALSE);
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS AvdtpStart(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
-    ExAcquireFastMutex(&S->Mutex);
-    if (S->StreamState == AvdtpStateStreaming) { ExReleaseFastMutex(&S->Mutex); return STATUS_SUCCESS; }
-    if (S->StreamState != AvdtpStateOpen) { ExReleaseFastMutex(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    PnMutexAcquire(&S->Mutex);
+    if (S->StreamState == AvdtpStateStreaming) { PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
+    if (S->StreamState != AvdtpStateOpen) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
     UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
     UCHAR ec = 0;
     NTSTATUS status = AvdtpTransact(S, AVDTP_START, p, 1, &ec);
@@ -853,30 +925,30 @@ NTSTATUS AvdtpStart(_Inout_ PAVDTP_SESSION S)
         SetStreamState(S, AvdtpStateStreaming, FALSE);
         status = STATUS_SUCCESS;
     }
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
     return status;
 }
 
 NTSTATUS AvdtpSuspend(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
-    ExAcquireFastMutex(&S->Mutex);
-    if (S->StreamState != AvdtpStateStreaming) { ExReleaseFastMutex(&S->Mutex); return STATUS_SUCCESS; }
+    PnMutexAcquire(&S->Mutex);
+    if (S->StreamState != AvdtpStateStreaming) { PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
     UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
     NTSTATUS status = AvdtpTransact(S, AVDTP_SUSPEND, p, 1, NULL);
     if (NT_SUCCESS(status) || status == STATUS_DEVICE_PROTOCOL_ERROR) {
         SetStreamState(S, AvdtpStateOpen, FALSE);
         status = STATUS_SUCCESS;
     }
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
     return status;
 }
 
 NTSTATUS AvdtpClose(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
-    ExAcquireFastMutex(&S->Mutex);
-    if (S->StreamState == AvdtpStateIdle) { ExReleaseFastMutex(&S->Mutex); return STATUS_SUCCESS; }
+    PnMutexAcquire(&S->Mutex);
+    if (S->StreamState == AvdtpStateIdle) { PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
     NTSTATUS status = STATUS_SUCCESS;
     if (S->StreamState == AvdtpStateOpen || S->StreamState == AvdtpStateStreaming) {
         UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
@@ -887,14 +959,14 @@ NTSTATUS AvdtpClose(_Inout_ PAVDTP_SESSION S)
     S->MediaUp = FALSE;
     S->MediaExpected = FALSE;
     SetStreamState(S, AvdtpStateIdle, FALSE);
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
     return status;
 }
 
 NTSTATUS AvdtpAbort(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
-    ExAcquireFastMutex(&S->Mutex);
+    PnMutexAcquire(&S->Mutex);
     NTSTATUS status = STATUS_SUCCESS;
     if (S->StreamState != AvdtpStateIdle) {
         UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
@@ -905,6 +977,6 @@ NTSTATUS AvdtpAbort(_Inout_ PAVDTP_SESSION S)
         S->MediaExpected = FALSE;
         SetStreamState(S, AvdtpStateIdle, FALSE);
     }
-    ExReleaseFastMutex(&S->Mutex);
+    PnMutexRelease(&S->Mutex);
     return status;
 }

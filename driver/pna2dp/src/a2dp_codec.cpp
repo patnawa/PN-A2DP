@@ -2,7 +2,8 @@
  * a2dp_codec.cpp - codec capability parsing, selection and configuration building.
  * SPDX-License-Identifier: MIT
  */
-#include "pna2dp.h"
+#include "codec_core.h"
+#include "audio_policy.h"
 
 static const struct { ULONG Mask; ULONG Hz; } g_RateTable[] = {
     { PNA2DP_RATE_8000, 8000 }, { PNA2DP_RATE_11025, 11025 }, { PNA2DP_RATE_12000, 12000 }, { PNA2DP_RATE_16000, 16000 },
@@ -42,6 +43,7 @@ static ULONG ReadLe32(const UCHAR *p) { return (ULONG)p[0] | ((ULONG)p[1] << 8) 
 static USHORT ReadLe16(const UCHAR *p) { return (USHORT)(p[0] | (p[1] << 8)); }
 static VOID WriteLe32(UCHAR *p, ULONG v) { p[0] = (UCHAR)v; p[1] = (UCHAR)(v >> 8); p[2] = (UCHAR)(v >> 16); p[3] = (UCHAR)(v >> 24); }
 static VOID WriteLe16(UCHAR *p, USHORT v) { p[0] = (UCHAR)v; p[1] = (UCHAR)(v >> 8); }
+static BOOLEAN SingleBit(ULONG v) { return v && !(v & (v - 1)); }
 
 /* ---- SBC ---------------------------------------------------------------- */
 
@@ -172,7 +174,7 @@ BOOLEAN A2dpParseCaps(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const UCH
 
     switch (MediaCodecType) {
     case A2DP_CODEC_SBC:
-        if (Len < 4) return FALSE;
+        if (Len != 4) return FALSE;
         Caps->Codec = PNA2DP_CODEC_SBC;
         Caps->RateMask = SbcRateBitsToMask(Ies[0] & 0xF0);
         Caps->ChannelModeMask = SbcChBitsToMask(Ies[0] & 0x0F);
@@ -182,10 +184,12 @@ BOOLEAN A2dpParseCaps(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const UCH
         Caps->SbcMinBitpool = Ies[2];
         Caps->SbcMaxBitpool = Ies[3];
         Caps->FormatMask = PNA2DP_FMT_S16;
-        return TRUE;
+        return Caps->RateMask && Caps->ChannelModeMask && Caps->SbcBlockMask && Caps->SbcSubbandMask &&
+               Caps->SbcAllocMask && Caps->SbcMinBitpool >= 2 && Caps->SbcMaxBitpool <= 250 &&
+               Caps->SbcMinBitpool <= Caps->SbcMaxBitpool;
 
     case A2DP_CODEC_MPEG24_AAC:
-        if (Len < 6) return FALSE;
+        if (Len != 6) return FALSE;
         Caps->Codec = PNA2DP_CODEC_AAC;
         Caps->AacObjectMask = Ies[0];
         Caps->RateMask = AacRateBitsToMask(Ies[1], Ies[2]);
@@ -193,7 +197,7 @@ BOOLEAN A2dpParseCaps(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const UCH
         Caps->AacVbr = (Ies[3] & 0x80) != 0;
         Caps->AacMaxBitrate = ((ULONG)(Ies[3] & 0x7F) << 16) | ((ULONG)Ies[4] << 8) | Ies[5];
         Caps->FormatMask = PNA2DP_FMT_S16 | PNA2DP_FMT_S24 | PNA2DP_FMT_S32;
-        return TRUE;
+        return Caps->RateMask && Caps->ChannelModeMask && Caps->AacObjectMask;
 
     case A2DP_CODEC_VENDOR: {
         if (Len < 6) return FALSE;
@@ -212,7 +216,7 @@ BOOLEAN A2dpParseCaps(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const UCH
             return TRUE;
         }
         if (vid == A2DP_VENDOR_APTX_HD && cid == A2DP_CODECID_APTX_HD) {
-            if (vlen < 1) return FALSE;
+            if (vlen < 5) return FALSE;
             Caps->Codec = PNA2DP_CODEC_APTX_HD;
             Caps->RateMask = AptxRateBitsToMask(v[0] & 0xF0);
             Caps->ChannelModeMask = ((v[0] & APTX_CH_STEREO) ? PNA2DP_CHMODE_STEREO : 0) | ((v[0] & APTX_CH_MONO) ? PNA2DP_CHMODE_MONO : 0);
@@ -268,15 +272,17 @@ BOOLEAN A2dpParseConfig(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const U
     ULONG vid; USHORT cid;
     RtlZeroMemory(Cfg, sizeof(*Cfg));
     if (!A2dpParseCaps(MediaCodecType, Ies, Len, &caps, &vid, &cid)) return FALSE;
+    if (Len > sizeof(Cfg->Ies) || !SingleBit(caps.RateMask) || !SingleBit(caps.ChannelModeMask)) return FALSE;
     Cfg->Codec = caps.Codec;
     Cfg->MediaCodecType = MediaCodecType;
-    /* a configuration has exactly one bit per field; pick the lowest set bit if several */
-    Cfg->SampleRate = A2dpRateMaskToHz(caps.RateMask & (0 - caps.RateMask));
-    if (caps.RateMask & PNA2DP_RATE_96000) Cfg->SampleRate = 96000;   /* prefer highest if sloppy sink */
-    Cfg->ChannelMode = caps.ChannelModeMask & (0 - caps.ChannelModeMask);
+    Cfg->SampleRate = A2dpRateMaskToHz(caps.RateMask);
+    Cfg->ChannelMode = caps.ChannelModeMask;
     Cfg->Channels = (Cfg->ChannelMode == PNA2DP_CHMODE_MONO) ? 1 : 2;
+    /* a configuration without a usable rate or channel mode is invalid (e.g. LDAC 176.4/192 k) */
+    if (!Cfg->SampleRate || !Cfg->ChannelMode) return FALSE;
     switch (caps.Codec) {
     case PNA2DP_CODEC_SBC:
+        if (!SingleBit(caps.SbcBlockMask) || !SingleBit(caps.SbcSubbandMask) || !SingleBit(caps.SbcAllocMask)) return FALSE;
         Cfg->SbcBlocks = (caps.SbcBlockMask & PNA2DP_SBC_BLOCKS_16) ? 16 : (caps.SbcBlockMask & PNA2DP_SBC_BLOCKS_12) ? 12 :
                          (caps.SbcBlockMask & PNA2DP_SBC_BLOCKS_8) ? 8 : 4;
         Cfg->SbcSubbands = (caps.SbcSubbandMask & PNA2DP_SBC_SUBBANDS_8) ? 8 : 4;
@@ -284,9 +290,13 @@ BOOLEAN A2dpParseConfig(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const U
         Cfg->SbcMinBitpool = caps.SbcMinBitpool;
         Cfg->SbcMaxBitpool = caps.SbcMaxBitpool;
         Cfg->SbcBitpool = caps.SbcMaxBitpool;
+        if (Cfg->SbcMaxBitpool > PN_MIN(250u, Cfg->SbcSubbands *
+            ((Cfg->ChannelMode == PNA2DP_CHMODE_MONO || Cfg->ChannelMode == PNA2DP_CHMODE_DUAL) ? 16u : 32u))) return FALSE;
         Cfg->PcmFormat = PNA2DP_FMT_S16;
         break;
     case PNA2DP_CODEC_AAC:
+        if (!SingleBit(caps.AacObjectMask) || !(caps.AacObjectMask & (AAC_OBJ_MPEG2_LC | AAC_OBJ_MPEG4_LC))) return FALSE;
+        Cfg->AacObjectMask = caps.AacObjectMask;
         Cfg->AacObjectType = (caps.AacObjectMask & AAC_OBJ_MPEG2_LC) ? 2 : (caps.AacObjectMask & AAC_OBJ_MPEG4_LC) ? 2 :
                              (caps.AacObjectMask & AAC_OBJ_HE_V1) ? 5 : 29;
         Cfg->AacVbr = caps.AacVbr;
@@ -314,6 +324,7 @@ BOOLEAN A2dpParseConfig(_In_ UCHAR MediaCodecType, _In_reads_bytes_(Len) const U
 
 ULONG A2dpBuildLocalCaps(_In_ ULONG Codec, _Out_writes_bytes_(Cap) PUCHAR Out, _In_ ULONG Cap, _Out_ PUCHAR MediaCodecType)
 {
+    *MediaCodecType = A2DP_CODEC_VENDOR;
     if (Cap < 16) return 0;
     RtlZeroMemory(Out, Cap);
     switch (Codec) {
@@ -333,7 +344,7 @@ ULONG A2dpBuildLocalCaps(_In_ ULONG Codec, _Out_writes_bytes_(Cap) PUCHAR Out, _
         AacRateMaskToBits(PNA2DP_RATE_44100 | PNA2DP_RATE_48000 | PNA2DP_RATE_88200 | PNA2DP_RATE_96000, &b1, &b2);
         Out[1] = b1;
         Out[2] = (UCHAR)(b2 | AAC_CH_MONO | AAC_CH_STEREO);
-        Out[3] = 0x80 | 0x05;   /* VBR + bitrate 0x05 xxxx = 320000 */
+        Out[3] = 0x80 | 0x04;   /* VBR + bitrate 0x04E200 = 320000 */
         Out[4] = 0xE2;
         Out[5] = 0x00;          /* 0x04E200 = 320000 */
         return 6;
@@ -380,12 +391,6 @@ static ULONG PickRate(ULONG Allowed, ULONG Preferred)
     return 0;
 }
 
-static ULONG PickHighestRate(ULONG Allowed)
-{
-    for (LONG i = (LONG)PN_ARRAYSIZE(g_RateTable) - 1; i >= 0; i--) if (g_RateTable[i].Mask & Allowed) return g_RateTable[i].Hz;
-    return 0;
-}
-
 static ULONG PickChannelMode(ULONG Allowed, ULONG PreferDual)
 {
     if (PreferDual && (Allowed & PNA2DP_CHMODE_DUAL)) return PNA2DP_CHMODE_DUAL;
@@ -396,13 +401,22 @@ static ULONG PickChannelMode(ULONG Allowed, ULONG PreferDual)
     return 0;
 }
 
-BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CONFIG *Pref, _In_ ULONG PreferredRate,
+BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *RemoteCaps, _In_ const PNA2DP_CONFIG *Pref, _In_ ULONG PreferredRate,
                          _In_ ULONG PreferredBits, _Out_ PA2DP_CODEC_CONFIG Cfg)
 {
     RtlZeroMemory(Cfg, sizeof(*Cfg));
+    UCHAR localIe[32], localType;
+    A2DP_CODEC_CAPS local, common = *RemoteCaps;
+    ULONG localLen = A2dpBuildLocalCaps(common.Codec, localIe, sizeof(localIe), &localType);
+    if (!localLen || !A2dpParseCaps(localType, localIe, localLen, &local, NULL, NULL)) return FALSE;
+    common.RateMask &= local.RateMask;
+    common.ChannelModeMask &= local.ChannelModeMask;
+    common.AacObjectMask &= local.AacObjectMask;
+    const A2DP_CODEC_CAPS *Caps = &common;
     Cfg->Codec = Caps->Codec;
     ULONG rates = Caps->RateMask;
     ULONG chmodes = Caps->ChannelModeMask;
+    if (!rates || !chmodes) return FALSE;
     BOOLEAN preferDual = (Pref->Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) != 0;
 
     switch (Caps->Codec) {
@@ -415,6 +429,7 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CON
         Cfg->SampleRate = PickRate(rates, PreferredRate);
         Cfg->ChannelMode = PickChannelMode(chmodes, preferDual);
         UCHAR blocks = Caps->SbcBlockMask, subs = Caps->SbcSubbandMask, alloc = Caps->SbcAllocMask;
+        if (!blocks || !subs || !alloc || Caps->SbcMinBitpool < 2 || Caps->SbcMinBitpool > Caps->SbcMaxBitpool || Caps->SbcMaxBitpool > 250) return FALSE;
         if (Pref->Sbc.BlockMask && (blocks & Pref->Sbc.BlockMask)) blocks &= Pref->Sbc.BlockMask;
         if (Pref->Sbc.SubbandMask && (subs & Pref->Sbc.SubbandMask)) subs &= Pref->Sbc.SubbandMask;
         if (Pref->Sbc.AllocMask && (alloc & Pref->Sbc.AllocMask)) alloc &= Pref->Sbc.AllocMask;
@@ -427,7 +442,10 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CON
             if (Pref->Sbc.MaxBitpool <= maxbp || Pref->Sbc.AllowBitpoolOverride) maxbp = Pref->Sbc.MaxBitpool;
         }
         if (Pref->Sbc.MinBitpool && Pref->Sbc.MinBitpool > minbp) minbp = Pref->Sbc.MinBitpool;
-        if (maxbp < minbp) maxbp = minbp;
+        ULONG modeMax = PN_MIN(250u, Cfg->SbcSubbands *
+            ((Cfg->ChannelMode == PNA2DP_CHMODE_MONO || Cfg->ChannelMode == PNA2DP_CHMODE_DUAL) ? 16u : 32u));
+        maxbp = (UCHAR)PN_MIN(maxbp, modeMax);
+        if (maxbp < minbp) return FALSE;
         /* Keep every frame inside a single L2CAP MTU for latency: frame <= ~ (mtu-13) */
         Cfg->SbcMinBitpool = minbp;
         Cfg->SbcMaxBitpool = maxbp;
@@ -444,9 +462,13 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CON
         Cfg->SampleRate = PickRate(rates, PreferredRate);
         Cfg->ChannelMode = (chmodes & PNA2DP_CHMODE_STEREO) ? PNA2DP_CHMODE_STEREO : PNA2DP_CHMODE_MONO;
         Cfg->AacObjectType = 2;
-        if (Pref->Aac.ObjectType == 5 && (Caps->AacObjectMask & AAC_OBJ_HE_V1)) Cfg->AacObjectType = 5;
+        Cfg->AacObjectMask = (Caps->AacObjectMask & AAC_OBJ_MPEG4_LC) ? AAC_OBJ_MPEG4_LC :
+                             (Caps->AacObjectMask & AAC_OBJ_MPEG2_LC) ? AAC_OBJ_MPEG2_LC : 0;
+        // The local SEP and encoder currently support LC only.
+        if (!Cfg->AacObjectMask) return FALSE;
         Cfg->AacVbr = Caps->AacVbr && Pref->Aac.Vbr;
-        Cfg->BitrateBps = Caps->AacMaxBitrate ? Caps->AacMaxBitrate : 256000;
+        Cfg->BitrateBps = Caps->AacMaxBitrate ? Caps->AacMaxBitrate :
+            (Pref->Aac.BitrateBps ? Pref->Aac.BitrateBps : 256000);
         if (Pref->Aac.BitrateBps && Pref->Aac.BitrateBps < Cfg->BitrateBps) Cfg->BitrateBps = Pref->Aac.BitrateBps;
         if (Cfg->BitrateBps > 320000) Cfg->BitrateBps = 320000;
         Cfg->PcmFormat = PNA2DP_FMT_S16;
@@ -457,6 +479,7 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CON
         const PNA2DP_APTX_PARAMS *ap = Caps->Codec == PNA2DP_CODEC_APTX ? &Pref->Aptx : Caps->Codec == PNA2DP_CODEC_APTX_HD ? &Pref->AptxHd : &Pref->AptxLl;
         if (ap->RateMask) rates &= ap->RateMask;
         if (!rates) rates = Caps->RateMask;
+        if (!(chmodes & PNA2DP_CHMODE_STEREO)) return FALSE; // bundled encoder requires stereo
         Cfg->MediaCodecType = A2DP_CODEC_VENDOR;
         Cfg->SampleRate = PickRate(rates, PreferredRate);
         Cfg->ChannelMode = (chmodes & PNA2DP_CHMODE_STEREO) ? PNA2DP_CHMODE_STEREO : PNA2DP_CHMODE_MONO;
@@ -472,10 +495,6 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CON
         Cfg->MediaCodecType = A2DP_CODEC_VENDOR;
         /* LDAC: prefer the engine rate when the sink has it, otherwise the highest */
         Cfg->SampleRate = PickRate(rates, PreferredRate);
-        if (PreferredBits >= 24 && (rates & (PNA2DP_RATE_96000 | PNA2DP_RATE_88200)) && Cfg->SampleRate < 88200 &&
-            (Pref->Flags & PNA2DP_CFG_EXPOSE_ALL_RATES)) {
-            Cfg->SampleRate = PickHighestRate(rates);
-        }
         Cfg->ChannelMode = (chmodes & PNA2DP_CHMODE_STEREO) ? PNA2DP_CHMODE_STEREO : (chmodes & PNA2DP_CHMODE_DUAL) ? PNA2DP_CHMODE_DUAL : PNA2DP_CHMODE_MONO;
         if (preferDual && (chmodes & PNA2DP_CHMODE_DUAL)) Cfg->ChannelMode = PNA2DP_CHMODE_DUAL;
         Cfg->LdacEqmid = (Pref->Ldac.Eqmid <= PNA2DP_LDAC_EQMID_MQ) ? Pref->Ldac.Eqmid : PNA2DP_LDAC_EQMID_SQ;
@@ -505,6 +524,23 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CON
     return TRUE;
 }
 
+/* Conservative initial envelope for a confirmed Basic Rate-only adapter.
+ * EDR/unknown radios retain the user's ceiling and are measured during playback.
+ * This is a policy budget, not a measured link speed. Never violate sink minima. */
+BOOLEAN A2dpConstrainBasicRadio(_Inout_ PA2DP_CODEC_CONFIG Cfg)
+{
+    const ULONG budget = 350000;
+    if (Cfg->Codec == PNA2DP_CODEC_SBC) {
+        while (Cfg->SbcBitpool > Cfg->SbcMinBitpool && A2dpNominalBitrate(Cfg) > budget) Cfg->SbcBitpool--;
+        Cfg->SbcMaxBitpool = Cfg->SbcBitpool;
+    } else if (Cfg->Codec == PNA2DP_CODEC_LDAC) Cfg->LdacEqmid = PNA2DP_LDAC_EQMID_MQ;
+    else if (Cfg->Codec == PNA2DP_CODEC_AAC) Cfg->BitrateBps = PN_MIN(Cfg->BitrateBps, budget);
+    else if (A2dpNominalBitrate(Cfg) > budget) return FALSE;
+    Cfg->MaxBitrateBps = Cfg->BitrateBps = A2dpNominalBitrate(Cfg);
+    A2dpSerializeConfig(Cfg);
+    return TRUE;
+}
+
 VOID A2dpSerializeConfig(_Inout_ PA2DP_CODEC_CONFIG Cfg)
 {
     PUCHAR o = Cfg->Ies;
@@ -522,7 +558,8 @@ VOID A2dpSerializeConfig(_Inout_ PA2DP_CODEC_CONFIG Cfg)
         break;
     case PNA2DP_CODEC_AAC: {
         UCHAR b1, b2;
-        o[0] = (UCHAR)(Cfg->AacObjectType == 5 ? AAC_OBJ_HE_V1 : Cfg->AacObjectType == 29 ? AAC_OBJ_HE_V2 : AAC_OBJ_MPEG2_LC);
+        o[0] = Cfg->AacObjectMask ? Cfg->AacObjectMask :
+               (UCHAR)(Cfg->AacObjectType == 5 ? AAC_OBJ_HE_V1 : Cfg->AacObjectType == 29 ? AAC_OBJ_HE_V2 : AAC_OBJ_MPEG4_LC);
         AacRateMaskToBits(rateMask, &b1, &b2);
         o[1] = b1;
         o[2] = (UCHAR)(b2 | (Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? AAC_CH_MONO : AAC_CH_STEREO));
@@ -607,4 +644,42 @@ ULONG A2dpNominalBitrate(_In_ const A2DP_CODEC_CONFIG *Cfg)
     default:
         return 0;
     }
+}
+
+ULONG A2dpQualityAtLevel(_In_ const A2DP_CODEC_CONFIG *Base, ULONG Level, ULONG FloorBps, _Out_opt_ A2DP_CODEC_CONFIG *Result)
+{
+    A2DP_CODEC_CONFIG cfg = *Base;
+    switch (cfg.Codec) {
+    case PNA2DP_CODEC_SBC: {
+        /* ladder: max bitpool down to min in steps of ~15% */
+        ULONG maxbp = cfg.SbcMaxBitpool, minbp = PN_MAX(cfg.SbcMinBitpool, 2u);
+        ULONG bp = maxbp;
+        for (ULONG i = 0; i < Level; i++) {
+            ULONG step = PN_MAX(bp / 7, 2u);
+            if (bp <= minbp + step) { bp = minbp; break; }
+            bp -= step;
+        }
+        if (bp < minbp) bp = minbp;
+        if (bp > maxbp) bp = maxbp;
+        cfg.SbcBitpool = (UCHAR)bp;
+        while (cfg.SbcBitpool < maxbp && A2dpNominalBitrate(&cfg) < FloorBps) cfg.SbcBitpool++;
+        break;
+    }
+    case PNA2DP_CODEC_LDAC:
+        cfg.LdacEqmid = (UCHAR)PnLdacAbrQuality(Base->LdacEqmid, Level);
+        while (cfg.LdacEqmid > Base->LdacEqmid && A2dpNominalBitrate(&cfg) < FloorBps) cfg.LdacEqmid--;
+        break;
+    case PNA2DP_CODEC_AAC: {
+        static const ULONG ladder[] = { 0, 256000, 192000, 128000, 96000 };
+        ULONG b = cfg.MaxBitrateBps;
+        if (Level) b = PN_MIN(b, ladder[PN_MIN(Level, PN_ARRAYSIZE(ladder) - 1)]);
+        cfg.BitrateBps = PnQualityBoundBitrate(b, FloorBps, cfg.MaxBitrateBps);
+        break;
+    }
+    default:
+        break;
+    }
+    cfg.BitrateBps = A2dpNominalBitrate(&cfg);
+    if (Result) *Result = cfg;
+    return cfg.BitrateBps;
 }

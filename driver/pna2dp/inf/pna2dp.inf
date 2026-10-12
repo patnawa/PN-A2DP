@@ -12,7 +12,7 @@ Signature   = "$Windows NT$"
 Class       = MEDIA
 ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
-DriverVer   = 10/10/2026,0.1.0.0
+DriverVer   = 10/11/2026,0.1.0.16
 CatalogFile = pna2dp.cat
 PnpLockDown = 1
 
@@ -26,15 +26,12 @@ pna2dp.sys = 1,,
 PnA2dp_CopyFiles = 13     ; run from the driver store
 
 [Manufacturer]
-%ProviderName% = PnA2dp, NTamd64.10.0...19041, NTamd64.10.0...22000, NTarm64.10.0...22000
+%ProviderName% = PnA2dp, NTamd64.10.0...19041, NTamd64.10.0...22000
 
 [PnA2dp.NTamd64.10.0...19041]
 %PnA2dp.DeviceDesc% = PnA2dp_Win10, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}
 
 [PnA2dp.NTamd64.10.0...22000]
-%PnA2dp.DeviceDesc% = PnA2dp_Win11, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}
-
-[PnA2dp.NTarm64.10.0...22000]
 %PnA2dp.DeviceDesc% = PnA2dp_Win11, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}
 
 ;---------------------------------------------------------------------------
@@ -81,12 +78,14 @@ HKR, Parameters, DebugLevel, %REG_DWORD%, 3
 ;---------------------------------------------------------------------------
 
 [PnA2dp_Win10.Interfaces]
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Wave%,    PnA2dp_Wave
 AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Topology%, PnA2dp_Topology_Win10
 AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_Topology%, PnA2dp_Topology_Win10
 AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Wave%,     PnA2dp_Wave
 AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_Wave%,     PnA2dp_Wave
 
 [PnA2dp_Win11.Interfaces]
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Wave%,    PnA2dp_Wave
 AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Topology%, PnA2dp_Topology_Win11
 AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_Topology%, PnA2dp_Topology_Win11
 AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Wave%,     PnA2dp_Wave
@@ -150,6 +149,7 @@ KSNAME_Topology         = "Topology"
 KSNODETYPE_ANY          = "{00000000-0000-0000-0000-000000000000}"
 KSCATEGORY_AUDIO        = "{6994ad04-93ef-11d0-a3cc-00a0c9223196}"
 KSCATEGORY_RENDER       = "{65e8773e-8f56-11d0-a3b9-00a0c9223196}"
+KSCATEGORY_REALTIME     = "{eb115ffc-10c8-4964-831d-6dcb02e6f23f}"
 KSCATEGORY_TOPOLOGY     = "{dda54a40-1e4c-11d1-a050-405705c10000}"
 
 PKEY_AudioEndpoint_Association               = "{1da5d803-d492-4edd-8c23-e0c0ffee7f0e},2"

@@ -15,7 +15,7 @@
  */
 #pragma once
 
-#define PN_L2CAP_READERS        3       /* continuous readers per channel */
+#define PN_L2CAP_READERS        1       /* one chain preserves signalling packet order */
 #define PN_L2CAP_MAX_WRITES     8       /* bounded outstanding writes per channel */
 #define PN_L2CAP_SIG_MTU        672
 #define PN_L2CAP_MEDIA_MTU_PREF 1024    /* preferred incoming/outgoing media MTU */
@@ -37,7 +37,8 @@ typedef VOID (*PFN_PN_L2CAP_RECEIVE)(
 typedef VOID (*PFN_PN_L2CAP_EVENT)(
     _In_ PVOID Context,
     _In_ PPN_L2CAP_CHANNEL Channel,
-    _In_ NTSTATUS Status);           /* channel went down (remote close or failure) */
+    _In_ NTSTATUS Status,            /* channel went down (remote close or failure) */
+    _In_ ULONG Generation);          /* the connection it concerns (see PN_L2CAP_CHANNEL) */
 
 typedef VOID (*PFN_PN_L2CAP_WRITE_DONE)(
     _In_ PVOID Context,
@@ -50,10 +51,14 @@ typedef struct _PN_L2CAP_READER {
     struct _BRB_L2CA_ACL_TRANSFER Brb;
     WDFREQUEST   Request;
     WDFMEMORY    Memory;
+    WDFMEMORY    BrbMemory;     /* reused for every send of Request */
     PUCHAR       Buffer;
     ULONG        BufferSize;
     KDPC         ResubmitDpc;
+    KSPIN_LOCK   SendLock;       /* prevents cancellation from racing the send itself */
     LONG         Stopping;
+    LONG         Outstanding;   /* Request is sent and not completed */
+    ULONG        Generation;    /* connection this reader chain belongs to */
     KEVENT       StoppedEvent;
     PPN_L2CAP_CHANNEL Channel;
 } PN_L2CAP_READER, *PPN_L2CAP_READER;
@@ -63,6 +68,8 @@ typedef struct _PN_L2CAP_WRITE {
     struct _BRB_L2CA_ACL_TRANSFER Brb;
     WDFREQUEST   Request;
     WDFMEMORY    Memory;        /* preallocated, wraps Buffer */
+    WDFMEMORY    BrbMemory;     /* reused for every send of Request */
+    LONG         Outstanding;
     PUCHAR       Buffer;
     ULONG        Capacity;
     ULONG        Length;
@@ -81,11 +88,18 @@ typedef struct PN_L2CAP_CHANNEL {
     BOOLEAN                RemoteInitiated;
     BOOLEAN                IsMedia;             /* second channel = media transport */
 
-    struct _BRB_L2CA_OPEN_ENHANCED_CHANNEL OpenBrb;   /* also used for close */
-    WDFREQUEST             OpenCloseRequest;
+    struct _BRB_L2CA_OPEN_ENHANCED_CHANNEL OpenBrb;   /* open / accept response */
+    WDFREQUEST             OpenCloseRequest;    /* carries opens only (name kept for history) */
+    WDFMEMORY              OpenCloseBrbMemory;
+    struct _BRB_L2CA_CLOSE_CHANNEL CloseBrb;    /* own request: a cancel of an open never hits a close */
+    WDFREQUEST             CloseRequest;
+    WDFMEMORY              CloseBrbMemory;
+    FAST_MUTEX             StartMutex;          /* serializes PnChannelStartReaders (innermost mutex) */
     KEVENT                 DisconnectedEvent;   /* set when fully closed */
     KEVENT                 ConnectedEvent;      /* set when open completes (any status) */
     NTSTATUS               OpenStatus;
+    ULONG                  Generation;          /* +1 per connect/accept; tags events of one connection */
+    BOOLEAN                ReadersStarted;      /* for this generation (under Lock) */
 
     PN_L2CAP_READER        Readers[PN_L2CAP_READERS];
     ULONG                  ReadersInitialized;
@@ -125,7 +139,11 @@ typedef struct _PN_BTH_LINK {
     BTH_ADDR                     RemoteAddress;
     BTH_COD                      RemoteCod;
     CHAR                         RemoteName[BTH_MAX_NAME_SIZE];
+    WCHAR                        RemoteNameW[BTH_MAX_NAME_SIZE];
     BTH_HOST_FEATURE_MASK        HostFeatures;
+    BTH_LOCAL_RADIO_INFO          RadioInfo;        /* cached for the actual local address */
+    NTSTATUS                     RadioQueryStatus;
+    BOOLEAN                      RadioInfoValid;
     WDFREQUEST                   SyncRequest;     /* serialized init-time requests */
     FAST_MUTEX                   SyncRequestMutex;
 
@@ -160,11 +178,12 @@ NTSTATUS PnLinkQueryRemoteInfo(_Inout_ PPN_BTH_LINK Link);
 NTSTATUS PnLinkQueryRemoteSdp(_Inout_ PPN_BTH_LINK Link, _In_ USHORT ServiceUuid16);
 NTSTATUS PnLinkRegisterServer(_Inout_ PPN_BTH_LINK Link, _In_ PFN_PN_LINK_INCOMING OnIncoming,
                               _In_ PVOID Context);
-VOID     PnLinkUnregisterServer(_Inout_ PPN_BTH_LINK Link);
+BOOLEAN  PnLinkUnregisterServer(_Inout_ PPN_BTH_LINK Link);   /* TRUE: a registered server could not be removed */
 NTSTATUS PnLinkRegisterRadioEvents(_Inout_ PPN_BTH_LINK Link, _In_ PFN_PN_LINK_SCO OnSco,
                                    _In_ PFN_PN_LINK_ACL OnAcl, _In_ PVOID Context);
 VOID     PnLinkUnregisterRadioEvents(_Inout_ PPN_BTH_LINK Link);
 NTSTATUS PnLinkSendBrbSync(_In_ PPN_BTH_LINK Link, _In_ PBRB Brb, _In_ ULONG BrbSize);
+NTSTATUS PnLinkEnsureActive(_Inout_ PPN_BTH_LINK Link);   /* PASSIVE: leave sniff/park before streaming */
 
 /* ---- channels ---------------------------------------------------------------- */
 NTSTATUS PnChannelInitialize(_Out_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_BTH_LINK Link,
@@ -184,7 +203,9 @@ NTSTATUS PnChannelAccept(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ PINDICATION_PARAMETE
 NTSTATUS PnLinkRejectIncoming(_In_ PPN_BTH_LINK Link, _In_ PINDICATION_PARAMETERS Params);
 /* Close (DISPATCH ok). Returns TRUE if a close was initiated. */
 BOOLEAN  PnChannelDisconnect(_Inout_ PPN_L2CAP_CHANNEL Ch);
+BOOLEAN  PnChannelDisconnectGen(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ ULONG Generation);   /* only that connection */
 VOID     PnChannelDisconnectSync(_Inout_ PPN_L2CAP_CHANNEL Ch);
+VOID     PnChannelCancelConnect(_Inout_ PPN_L2CAP_CHANNEL Ch);   /* cut short an outgoing open in progress */
 NTSTATUS PnChannelStartReaders(_Inout_ PPN_L2CAP_CHANNEL Ch);
 VOID     PnChannelStopReaders(_Inout_ PPN_L2CAP_CHANNEL Ch);
 BOOLEAN  PnChannelIsConnected(_In_ PPN_L2CAP_CHANNEL Ch);

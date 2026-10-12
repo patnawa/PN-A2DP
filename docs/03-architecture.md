@@ -58,7 +58,7 @@ and `02-windows-bluetooth-audio-internals.md`.
 4. A latency guard trims the ring when it exceeds `MaxLatencyMs`; the ABR controller
    watches write completion latency and queue depth, lowers the bitrate ladder
    (SBC bitpool, LDAC EQMID, AAC bitrate) after sustained congestion and raises it again
-   after a quiet period. SBC bitpool and LDAC EQMID changes are in band and need no
+   after 30 seconds of continuously healthy traffic. Idle time does not count. SBC bitpool and LDAC EQMID changes are in band and need no
    AVDTP signalling.
 5. Latency is reported back to Windows through `GetHWLatency` and the presentation
    position (ring fill + packets in flight + measured completion time + the sink's AVDTP
@@ -120,7 +120,7 @@ reconnect, and the codec-host protocol.
 | Latency to apps | not reported | measured path latency + AVDTP delay reports exposed through WaveRT |
 | Remote initiated streams | supported | supported, including remote SET_CONFIGURATION with codec validation |
 | Status to apps | registry polling | event IOCTL (pended), plus stats |
-| ABR | on/off | leaky-bucket controller with hysteresis and codec ladders |
+| ABR | on/off | time-window controller with hysteresis and bounded codec ladders |
 | Licensing | paid, motherboard locked | MIT |
 | Signing | attestation signed | test-signed builds; attestation signing requires an EV certificate (see 04) |
 
@@ -132,4 +132,6 @@ reconnect, and the codec-host protocol.
   table is restricted to supported rates and a mismatch is logged).
 * FastStream / aptX LL bidirectional back-channel.
 * HLK test pass and attestation-signed releases.
-* GUI (WinUI 3) on top of `pna2dpctl`'s IOCTL usage.
+
+The control panel and the installer (per-device driver switching, codec configuration,
+packaging) are described in `07-control-panel-and-installer.md`.

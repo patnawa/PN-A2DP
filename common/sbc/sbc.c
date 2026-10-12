@@ -455,7 +455,11 @@ sbc_u32 sbc_encode_frame(sbc_encoder *e, const sbc_s16 *pcm, sbc_u8 *out, sbc_u3
             sbc_u32 maxL = 0, maxR = 0, maxM = 0, maxS = 0;
             for (blk = 0; blk < blocks; blk++) {
                 sbc_s32 l = e->sb[blk][0][sb], r = e->sb[blk][1][sb];
-                sbc_s32 m = (l + r) >> 1, s = (l - r) >> 1;
+                /* Filterbank overshoot can put a valid subband above 2^30.
+                 * Widen before adding: loud correlated bass otherwise wraps
+                 * during the joint-stereo decision and corrupts the frame. */
+                sbc_s32 m = (sbc_s32)(((sbc_s64)l + r) >> 1);
+                sbc_s32 s = (sbc_s32)(((sbc_s64)l - r) >> 1);
                 sbc_u32 al = (sbc_u32)(l < 0 ? -l : l), ar = (sbc_u32)(r < 0 ? -r : r);
                 sbc_u32 am = (sbc_u32)(m < 0 ? -m : m), as = (sbc_u32)(s < 0 ? -s : s);
                 if (al > maxL) maxL = al; if (ar > maxR) maxR = ar;
@@ -466,8 +470,8 @@ sbc_u32 sbc_encode_frame(sbc_encoder *e, const sbc_s16 *pcm, sbc_u8 *out, sbc_u3
                 e->join[sb] = 1;
                 for (blk = 0; blk < blocks; blk++) {
                     sbc_s32 l = e->sb[blk][0][sb], r = e->sb[blk][1][sb];
-                    e->sb[blk][0][sb] = (l + r) >> 1;
-                    e->sb[blk][1][sb] = (l - r) >> 1;
+                    e->sb[blk][0][sb] = (sbc_s32)(((sbc_s64)l + r) >> 1);
+                    e->sb[blk][1][sb] = (sbc_s32)(((sbc_s64)l - r) >> 1);
                 }
             }
         }

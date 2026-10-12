@@ -5,6 +5,27 @@
 #include "pna2dp.h"
 
 ULONG g_PnDebugLevel = PN_LEVEL_INFO;
+static HANDLE g_PersistentState = NULL;
+static HANDLE g_Parameters = NULL;
+
+NTSTATUS RegCfgInitialize(_In_ PDRIVER_OBJECT DriverObject)
+{
+    PAGED_CODE();
+    /* IoOpenDriverRegistryKey requires a system thread. Open once in DriverEntry;
+     * control IOCTLs later use these kernel handles in the caller's context. */
+    NTSTATUS status = IoOpenDriverRegistryKey(DriverObject, DriverRegKeyPersistentState,
+        KEY_READ | KEY_SET_VALUE | KEY_CREATE_SUB_KEY, 0, &g_PersistentState);
+    if (!NT_SUCCESS(status)) return status;
+    IoOpenDriverRegistryKey(DriverObject, DriverRegKeyParameters, KEY_READ, 0, &g_Parameters);
+    return STATUS_SUCCESS;
+}
+
+VOID RegCfgShutdown()
+{
+    PAGED_CODE();
+    if (g_Parameters) { ZwClose(g_Parameters); g_Parameters = NULL; }
+    if (g_PersistentState) { ZwClose(g_PersistentState); g_PersistentState = NULL; }
+}
 
 VOID RegCfgDefaults(_Out_ PPNA2DP_CONFIG Cfg)
 {
@@ -20,7 +41,7 @@ VOID RegCfgDefaults(_Out_ PPNA2DP_CONFIG Cfg)
     Cfg->CodecPriority[5] = PNA2DP_CODEC_SBC;
     Cfg->EnabledCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_AAC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX) |
                             PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_HD) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_LL) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_LDAC);
-    Cfg->Flags = PNA2DP_CFG_ABR_ENABLE | PNA2DP_CFG_APPLY_LIVE | PNA2DP_CFG_SUSPEND_ON_SCO | PNA2DP_CFG_DELAY_REPORTING;
+    Cfg->Flags = PNA2DP_CFG_ABR_ENABLE | PNA2DP_CFG_APPLY_LIVE | PNA2DP_CFG_SUSPEND_ON_SCO | PNA2DP_CFG_DELAY_REPORTING | PNA2DP_CFG_SOFTWARE_VOLUME | PNA2DP_CFG_AUTO_QUALITY;
     Cfg->TargetLatencyMs = PN_PUMP_DEFAULT_TARGET_MS;
     Cfg->MaxLatencyMs = PN_PUMP_DEFAULT_MAX_MS;
     Cfg->AbrFloorBps = 128000;
@@ -54,17 +75,22 @@ BOOLEAN RegCfgValidate(_Inout_ PPNA2DP_CONFIG Cfg)
     }
     if (!any) Cfg->CodecPriority[0] = PNA2DP_CODEC_SBC;
     Cfg->EnabledCodecMask |= PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);   /* SBC is mandatory */
+    Cfg->Flags |= PNA2DP_CFG_SOFTWARE_VOLUME;   /* no AVRCP absolute-volume implementation */
+    if (Cfg->Flags & PNA2DP_CFG_AUTO_QUALITY) {
+        Cfg->Flags |= PNA2DP_CFG_ABR_ENABLE;
+        Cfg->Ldac.AbrEnable = 1;
+    }
     return TRUE;
 }
 
 static NTSTATUS OpenDeviceKey(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Address, _In_ BOOLEAN Create, _In_ ACCESS_MASK Access, _Out_ PHANDLE Key)
 {
     PAGED_CODE();
-    HANDLE params = NULL;
+    UNREFERENCED_PARAMETER(DriverObject);
+    HANDLE params = g_PersistentState;
     *Key = NULL;
-    NTSTATUS status = IoOpenDriverRegistryKey(DriverObject, DriverRegKeyParameters, Create ? KEY_ALL_ACCESS : KEY_READ,
-                                              Create ? 0 : 0, &params);
-    if (!NT_SUCCESS(status)) return status;
+    if (!params) return STATUS_DEVICE_NOT_READY;
+    NTSTATUS status;
     WCHAR sub[64];
     RtlStringCchPrintfW(sub, PN_ARRAYSIZE(sub), L"Devices\\%012llX", Address);
     UNICODE_STRING name;
@@ -78,13 +104,18 @@ static NTSTATUS OpenDeviceKey(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Ad
         OBJECT_ATTRIBUTES oad;
         HANDLE hd = NULL;
         InitializeObjectAttributes(&oad, &devices, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, params, NULL);
-        status = ZwCreateKey(&hd, KEY_ALL_ACCESS, &oad, 0, NULL, REG_OPTION_NON_VOLATILE, NULL);
-        if (NT_SUCCESS(status)) ZwClose(hd);
+        status = ZwCreateKey(&hd, KEY_CREATE_SUB_KEY, &oad, 0, NULL, REG_OPTION_NON_VOLATILE, NULL);
+        if (!NT_SUCCESS(status)) return status;
+        ZwClose(hd);
         status = ZwCreateKey(Key, Access, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, NULL);
     } else {
         status = ZwOpenKey(Key, Access, &oa);
+        /* Read legacy settings without writing the immutable Parameters key. */
+        if ((status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND) && g_Parameters) {
+            oa.RootDirectory = g_Parameters;
+            status = ZwOpenKey(Key, Access, &oa);
+        }
     }
-    ZwClose(params);
     return status;
 }
 
@@ -117,13 +148,44 @@ static NTSTATUS WriteValue(_In_ HANDLE Key, _In_ PCWSTR Name, _In_ ULONG Type, _
 NTSTATUS RegCfgLoadGlobal(_In_ PDRIVER_OBJECT DriverObject)
 {
     PAGED_CODE();
-    HANDLE params = NULL;
-    NTSTATUS status = IoOpenDriverRegistryKey(DriverObject, DriverRegKeyParameters, KEY_READ, 0, &params);
-    if (!NT_SUCCESS(status)) return status;
+    UNREFERENCED_PARAMETER(DriverObject);
+    HANDLE params = g_Parameters;
+    if (!params) return STATUS_OBJECT_NAME_NOT_FOUND;
     ULONG level = g_PnDebugLevel;
     if (NT_SUCCESS(ReadBinary(params, L"DebugLevel", &level, sizeof(level)))) g_PnDebugLevel = level;
-    ZwClose(params);
     return STATUS_SUCCESS;
+}
+
+/* ---- crash guard ---------------------------------------------------------- */
+
+BOOLEAN RegCfgCrashGuardEnter(_In_ PDRIVER_OBJECT DriverObject, _Out_ PULONG Count)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(DriverObject);
+    HANDLE key = g_PersistentState;
+    ULONG n = 0;
+    *Count = 0;
+    if (!key) return FALSE;
+    if (!NT_SUCCESS(ReadBinary(key, L"UncleanStarts", &n, sizeof(n)))) n = 0;
+    *Count = n;
+    BOOLEAN allow = n < PN_CRASH_GUARD_LIMIT;
+    if (allow) {
+        n++;
+        WriteValue(key, L"UncleanStarts", REG_DWORD, &n, sizeof(n));
+        ZwFlushKey(key);   /* must reach the disk before anything can crash */
+    }
+    return allow;
+}
+
+VOID RegCfgCrashGuardClear(_In_ PDRIVER_OBJECT DriverObject)
+{
+    PAGED_CODE();
+    UNREFERENCED_PARAMETER(DriverObject);
+    HANDLE key = g_PersistentState;
+    ULONG n = 0;
+    if (!key) return;
+    WriteValue(key, L"UncleanStarts", REG_DWORD, &n, sizeof(n));
+    ZwFlushKey(key);
 }
 
 NTSTATUS RegCfgLoadDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Address, _Inout_ PPNA2DP_CONFIG Cfg)
@@ -146,7 +208,7 @@ NTSTATUS RegCfgSaveDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Addres
 {
     PAGED_CODE();
     HANDLE key = NULL;
-    NTSTATUS status = OpenDeviceKey(DriverObject, Address, TRUE, KEY_ALL_ACCESS, &key);
+    NTSTATUS status = OpenDeviceKey(DriverObject, Address, TRUE, KEY_SET_VALUE, &key);
     if (!NT_SUCCESS(status)) return status;
     status = WriteValue(key, L"Config", REG_BINARY, Cfg, sizeof(*Cfg));
     if (Name) {
@@ -164,7 +226,7 @@ NTSTATUS RegCfgSaveCapabilities(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR 
 {
     PAGED_CODE();
     HANDLE key = NULL;
-    NTSTATUS status = OpenDeviceKey(DriverObject, Address, TRUE, KEY_ALL_ACCESS, &key);
+    NTSTATUS status = OpenDeviceKey(DriverObject, Address, TRUE, KEY_SET_VALUE, &key);
     if (!NT_SUCCESS(status)) return status;
     status = WriteValue(key, L"Capabilities", REG_BINARY, Caps, sizeof(*Caps));
     ULONG mask = Caps->CodecMask;

@@ -29,7 +29,7 @@ static PnCodecEncoder *SbcOpen(const PNA2DP_STREAM_PARAMS *p)
                                        p->ChannelMode == PNA2DP_CHMODE_STEREO ? SBC_MODE_STEREO : SBC_MODE_JOINT);
     e->params.blocks = (ie[1] & 0x10) ? 16 : (ie[1] & 0x20) ? 12 : (ie[1] & 0x40) ? 8 : 4;
     e->params.subbands = (ie[1] & 0x04) ? 8 : 4;
-    e->params.allocation = (ie[1] & 0x01) ? SBC_ALLOC_LOUDNESS : SBC_ALLOC_SNR;
+    e->params.allocation = (sbc_u8)((ie[1] & 0x01) ? SBC_ALLOC_LOUDNESS : SBC_ALLOC_SNR);
     e->params.bitpool = (uint8_t)(p->QualityIndex ? p->QualityIndex : ie[3]);
     e->mtu = p->MediaMtu;
     if (sbc_encoder_init(&e->enc, &e->params) != 0) { free(e); return nullptr; }

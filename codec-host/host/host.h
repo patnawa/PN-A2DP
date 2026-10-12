@@ -54,6 +54,7 @@ private:
     std::wstring m_path;
     PluginRegistry &m_plugins;
     HANDLE m_device = INVALID_HANDLE_VALUE;
+    HANDLE m_stopEvent = NULL;
     std::thread m_thread;
     std::atomic<bool> m_stop{false};
     std::atomic<bool> m_alive{false};

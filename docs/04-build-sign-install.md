@@ -28,34 +28,56 @@ pna2dp.sys / pna2dp.pdb          kernel driver
 package\pna2dp.inf + pna2dp.sys  install package (+ .cat and test cert after -Sign)
 pna2dp-codechost.exe             codec host service
 pna2dpctl.exe                    control tool
+pna2dp-panel.exe                 control panel (-Target gui)
+pna2dp-setup.exe                 installer with everything above embedded (-Target setup)
+dist\                            installer + portable zip (-Target package)
 sbc_test.exe                     SBC self test
 ```
 
 ## Signing
 
-Windows loads kernel drivers only when they are signed by Microsoft:
+For normal-mode installation, new kernel drivers need a Microsoft driver
+signature from the Hardware Developer Program. An EV certificate on its own,
+a trusted self-signed certificate, or an Authenticode signature on Setup does
+not replace Microsoft's kernel-driver signature.
 
-* **Attestation signing** (Partner Center, Hardware Dev Center account + EV code signing
-  certificate): sign the `.cab` of the package, upload, download the signed package.
-  No HLK tests are required for attestation; the driver loads on Windows 10 and 11
-  with Secure Boot enabled. This is what the Alternative A2DP Driver ships.
-* **WHQL / HLK**: full logo tests (`Audio`, `Bluetooth` and `Device.Streaming` HLK
-  suites) give a WHQL signature that also satisfies Windows Server and lets Windows
-  Update distribute the driver.
-* **Test signing** (development only): `build\sign-test.ps1` creates a self-signed
-  certificate, builds the catalog with `inf2cat` and signs `.sys` and `.cat`. The
-  machine must run with `bcdedit /set testsigning on` and the certificate must be in
-  the Root and TrustedPublisher stores.
+* **WHCP / HLK** is the recommended retail release path. Run the applicable HLK
+  tests and submit the signed HLK package through Partner Center.
+* **Attestation** is documented by Microsoft for testing scenarios on Windows
+  Desktop; it does not certify HLK compliance or permit retail Windows Update
+  publication. Check current program requirements before choosing it.
+* **Test signing** is for separately prepared development machines. Setup no
+  longer imports test roots or changes boot policy. `--allow-test-driver` must
+  be explicitly supplied, the package must already be trusted, and test signing
+  must already be active.
 
-Secure Boot must be disabled for test signing on most firmware; HVCI (Memory
-integrity) does not block attestation-signed drivers but does block test-signed ones
-unless the test root is deployed through `bcdedit /set nointegritychecks`-free means,
-so disable memory integrity on the development machine.
+See [the Thai account/submission/release guide](11-production-signing-th.md),
+[Microsoft's signing options](https://learn.microsoft.com/en-us/windows-hardware/drivers/dashboard/driver-signing-offerings)
+and [registration requirements](https://learn.microsoft.com/en-us/windows-hardware/drivers/dashboard/hardware-program-register).
+Memory integrity requires compatible driver code as well as acceptable signing;
+a signature alone is not evidence that the driver passed HVCI testing.
+
+Use `build/prepare-submission.ps1` to prepare a CAB and hash manifest without
+changing the machine. After Microsoft returns the signed INF/SYS/CAT, package
+those exact bytes with:
+
+```powershell
+.\build\build.ps1 -Target dist -Production -DriverPackage 'C:\SignedDriver\PN-A2DP'
+```
+
+Production packaging rejects test certificates, checks Microsoft driver signing
+and file membership, and runs SignTool kernel-policy verification before updating
+`dist`. Do not rebuild or edit the returned driver package after signing.
 
 ## Installing
 
+End users run `pna2dp-setup.exe` (`build.ps1 -Target package` produces it in
+`out\Release\dist`); it performs the steps below with a wizard, lets the user choose which
+headsets get the driver, and registers an uninstaller. See `07-control-panel-and-installer.md`.
+The script below is the equivalent for development machines:
+
 ```powershell
-.\build\install.ps1 -Package .\out\Release\package      # elevated
+.\build\install.ps1 -Package .\out\Release\package -AllowTestDriver   # elevated; prepared development PC
 ```
 
 1. `pnputil /add-driver` stages the INF in the driver store.
@@ -72,6 +94,27 @@ version will add a watchdog (the commercial product's `AltA2dpSVC` does this).
 
 `.\build\install.ps1 -Uninstall` removes the driver package; Windows re-installs the
 inbox driver on the next scan.
+
+### First load on a development machine
+
+Because the BTHENUM node of a paired headset exists at every boot, a driver that crashes
+while starting would crash every boot. Three layers protect against that:
+
+1. `build\switch-device.ps1` (elevated, after the test-signing restart) switches one
+   device: it checks that test signing is active and the certificate trusted, creates a
+   System Restore point, records the previous driver in
+   `%ProgramData%\PN-A2DP\previous-driver.txt` and reports the result.
+   `switch-device.ps1 -Rollback` reinstalls the recorded driver.
+2. Crash guard: `DriverEntry` counts every load in
+   `HKLM\SYSTEM\CurrentControlSet\Services\pna2dp\State\UncleanStarts`; a clean shutdown or
+   restart, a driver unload, or 10 minutes of uptime reset it. After two loads in a row
+   without one of those, the driver refuses to load (the device shows Code 37) and
+   Windows boots. Switching a device to PN-A2DP (`switch-device.ps1`, the installer or the
+   control panel) clears the value; delete it by hand to try again.
+3. If Windows still cannot start: after two failed boots it opens the recovery
+   environment; Troubleshoot > Advanced options > Command Prompt,
+   `bcdedit /set {default} testsigning off`, restart. Safe Mode also works because the
+   Bluetooth stack does not start there.
 
 ## Debugging
 

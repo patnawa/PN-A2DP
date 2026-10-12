@@ -32,6 +32,8 @@ bool DeviceWorker::Start()
     CloseHandle(ov.hEvent);
     if (!ok) { HostLog("register failed %lu", GetLastError()); CloseHandle(m_device); m_device = INVALID_HANDLE_VALUE; return false; }
     HostLog("registered with %ls (codecs 0x%08x)", m_path.c_str(), reg.CodecMask);
+    m_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!m_stopEvent) { CloseHandle(m_device); m_device = INVALID_HANDLE_VALUE; return false; }
     m_stop = false;
     m_alive = true;
     m_thread = std::thread(&DeviceWorker::Run, this);
@@ -41,6 +43,7 @@ bool DeviceWorker::Start()
 void DeviceWorker::Stop()
 {
     m_stop = true;
+    if (m_stopEvent) SetEvent(m_stopEvent);
     if (m_device != INVALID_HANDLE_VALUE) CancelIoEx(m_device, NULL);
     if (m_thread.joinable()) m_thread.join();
     CloseEncoder();
@@ -54,6 +57,7 @@ void DeviceWorker::Stop()
         m_device = INVALID_HANDLE_VALUE;
     }
     m_alive = false;
+    if (m_stopEvent) { CloseHandle(m_stopEvent); m_stopEvent = NULL; }
 }
 
 void DeviceWorker::Run()
@@ -61,15 +65,15 @@ void DeviceWorker::Run()
     /* Keep several GET_WORK requests pended so the driver never waits for a buffer. */
     struct Slot { OVERLAPPED ov; std::vector<uint8_t> buf; bool pending; };
     Slot slots[INFLIGHT_REQUESTS];
-    HANDLE events[INFLIGHT_REQUESTS];
     for (int i = 0; i < INFLIGHT_REQUESTS; i++) {
         memset(&slots[i].ov, 0, sizeof(OVERLAPPED));
         slots[i].ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
         slots[i].buf.resize(WORK_BUFFER_BYTES);
         slots[i].pending = false;
-        events[i] = slots[i].ov.hEvent;
+        if (!slots[i].ov.hEvent) m_stop = true;
     }
     auto submit = [&](Slot &s) {
+        if (m_stop) return false;
         ResetEvent(s.ov.hEvent);
         DWORD ret = 0;
         BOOL ok = DeviceIoControl(m_device, IOCTL_PNA2DP_CODEC_GET_WORK, NULL, 0, s.buf.data(), (DWORD)s.buf.size(), &ret, &s.ov);
@@ -79,11 +83,17 @@ void DeviceWorker::Run()
     };
     for (int i = 0; i < INFLIGHT_REQUESTS; i++) if (!submit(slots[i])) { m_stop = true; break; }
 
+    // GET_WORK is dequeued FIFO by the driver. Waiting on all slot events chooses the
+    // lowest index, not the oldest request: reusing slot 0 can jump ahead of slots 1-3.
+    // Always retire the oldest submitted slot, including OPEN/CLOSE control messages.
+    unsigned next = 0;
     while (!m_stop) {
-        DWORD w = WaitForMultipleObjects(INFLIGHT_REQUESTS, events, FALSE, 1000);
+        Slot &s = slots[next];
+        HANDLE events[] = {m_stopEvent, s.ov.hEvent};
+        DWORD w = WaitForMultipleObjects(2, events, FALSE, 1000);
         if (w == WAIT_TIMEOUT) continue;
-        if (w < WAIT_OBJECT_0 || w >= WAIT_OBJECT_0 + INFLIGHT_REQUESTS) break;
-        Slot &s = slots[w - WAIT_OBJECT_0];
+        if (w != WAIT_OBJECT_0 + 1 || m_stop) break;
+        next = (next + 1) % INFLIGHT_REQUESTS;
         DWORD got = 0;
         BOOL ok = GetOverlappedResult(m_device, &s.ov, &got, FALSE);
         s.pending = false;
@@ -97,6 +107,11 @@ void DeviceWorker::Run()
         }
         if (got >= sizeof(PNA2DP_CODEC_WORK)) {
             const PNA2DP_CODEC_WORK *work = (const PNA2DP_CODEC_WORK *)s.buf.data();
+            if (work->Size != got || work->PcmBytes > got - sizeof(*work) ||
+                work->Params.CodecInfoLength > sizeof(work->Params.CodecInfo)) {
+                HostLog("invalid work buffer (%lu bytes)", got);
+                break;
+            }
             HandleWork(work, s.buf.data() + sizeof(PNA2DP_CODEC_WORK));
         }
         if (!submit(s)) break;
@@ -150,7 +165,11 @@ void DeviceWorker::Encode(const PNA2DP_CODEC_WORK *w, const uint8_t *pcm)
         if (!m_encoder || w->StreamGeneration != m_generation) { Open(w); if (!m_encoder) { PutResult(w->Sequence, w->StreamGeneration, -1, nullptr); return; } }
     }
     if (w->Params.QualityIndex != m_lastQuality || w->Params.BitrateBps != m_lastBitrate) {
-        if (m_plugin->reconfigure) m_plugin->reconfigure(m_encoder, w->Params.QualityIndex, w->Params.BitrateBps);
+        if (!m_plugin->reconfigure || m_plugin->reconfigure(m_encoder, w->Params.QualityIndex, w->Params.BitrateBps) != 0) {
+            HostLog("%s: quality change rejected", m_plugin->name);
+            PutResult(w->Sequence, w->StreamGeneration, -1, nullptr);
+            return;
+        }
         m_lastQuality = w->Params.QualityIndex;
         m_lastBitrate = w->Params.BitrateBps;
     }
@@ -158,6 +177,7 @@ void DeviceWorker::Encode(const PNA2DP_CODEC_WORK *w, const uint8_t *pcm)
     out.buffer = m_outBuf.data();
     out.capacity = (uint32_t)m_outBuf.size();
     int rc = m_plugin->encode(m_encoder, pcm, w->PcmBytes, w->PcmFrames, &out);
+    if (out.written > out.capacity || out.buffer != m_outBuf.data()) rc = -1;
     PutResult(w->Sequence, w->StreamGeneration, rc, rc == 0 ? &out : nullptr);
 }
 

@@ -15,6 +15,7 @@ typedef struct _PN_CODEC_HOST {
     PPNA2DP_DEVICE      Device;
     KSPIN_LOCK          Lock;
     BOOLEAN             Registered;
+    LONG                Failed;           /* unusable until the service re-registers */
     PFILE_OBJECT        OwnerFile;        /* handle that registered; unregister on close */
     PNA2DP_CODEC_REGISTER Info;
     IO_CSQ              WorkCsq;          /* pended GET_WORK IRPs */
@@ -31,6 +32,7 @@ NTSTATUS CodecHostRegister(_Inout_ PPN_CODEC_HOST H, _In_ PFILE_OBJECT File, _In
 VOID     CodecHostUnregister(_Inout_ PPN_CODEC_HOST H, _In_opt_ PFILE_OBJECT File);  /* NULL = force */
 BOOLEAN  CodecHostAvailable(_In_ PPN_CODEC_HOST H, _In_ ULONG Codec);
 ULONG    CodecHostCodecMask(_In_ PPN_CODEC_HOST H);
+VOID     CodecHostReportFailure(_Inout_ PPN_CODEC_HOST H);
 
 /* IRP plumbing (called from control.cpp) */
 NTSTATUS CodecHostQueueGetWork(_Inout_ PPN_CODEC_HOST H, _In_ PIRP Irp);   /* returns STATUS_PENDING */

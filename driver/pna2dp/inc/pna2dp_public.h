@@ -29,7 +29,7 @@ DEFINE_GUID(GUID_DEVINTERFACE_PNA2DP,
 
 #define PNA2DP_ABI_VERSION          1u
 
-#define PNA2DP_DEVICE_TYPE          0x9A2D   /* FILE_DEVICE_UNKNOWN range, vendor */
+#define PNA2DP_DEVICE_TYPE          0x9A2Du  /* FILE_DEVICE_UNKNOWN range, vendor */
 
 #define PNA2DP_CTL(code, access)    CTL_CODE(PNA2DP_DEVICE_TYPE, (code), METHOD_BUFFERED, (access))
 
@@ -42,7 +42,12 @@ DEFINE_GUID(GUID_DEVINTERFACE_PNA2DP,
 #define IOCTL_PNA2DP_WAIT_EVENT         PNA2DP_CTL(0x805, FILE_READ_ACCESS)  /* pended */
 #define IOCTL_PNA2DP_RECONNECT          PNA2DP_CTL(0x806, FILE_WRITE_ACCESS)
 #define IOCTL_PNA2DP_GET_STATS          PNA2DP_CTL(0x807, FILE_READ_ACCESS)
+#define IOCTL_PNA2DP_GET_QUALITY        PNA2DP_CTL(0x80B, FILE_READ_ACCESS)
 #define IOCTL_PNA2DP_RESET_STATS        PNA2DP_CTL(0x808, FILE_WRITE_ACCESS)
+#define IOCTL_PNA2DP_GET_TRACE          PNA2DP_CTL(0x809, FILE_READ_ACCESS)
+/* Explicit diagnostic capture: input ULONG 1 arms one SBC packet, 0 reads it, 2 cancels.
+ * No audio is retained unless this write-access request is issued. */
+#define IOCTL_PNA2DP_SBC_SAMPLE         PNA2DP_CTL(0x80A, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
 
 /* ---- Codec host (inverted call) ----------------------------------------------- */
 #define IOCTL_PNA2DP_CODEC_REGISTER     PNA2DP_CTL(0x900, FILE_WRITE_ACCESS)
@@ -51,6 +56,28 @@ DEFINE_GUID(GUID_DEVINTERFACE_PNA2DP,
 #define IOCTL_PNA2DP_CODEC_PUT_RESULT   PNA2DP_CTL(0x903, FILE_WRITE_ACCESS)
 
 #pragma pack(push, 8)
+
+/* Bounded, driver-wide diagnostic history. Text is NUL-terminated diagnostic text;
+ * times are 100-ns units since boot. This read-only addition preserves ABI v1. */
+#define PNA2DP_TRACE_ENTRIES 64u
+#define PNA2DP_TRACE_TEXT_BYTES 192u
+typedef struct _PNA2DP_TRACE_ENTRY {
+    ULONGLONG TimeHns;
+    ULONG Sequence;
+    ULONG Level;
+    CHAR Text[PNA2DP_TRACE_TEXT_BYTES];
+} PNA2DP_TRACE_ENTRY;
+typedef struct _PNA2DP_TRACE {
+    ULONG Size;
+    ULONG Count;
+    PNA2DP_TRACE_ENTRY Entries[PNA2DP_TRACE_ENTRIES];
+} PNA2DP_TRACE;
+
+typedef struct _PNA2DP_SBC_SAMPLE {
+    ULONG Size, SampleRate, Channels, GainQ15, Muted, PcmBytes, SbcBytes;
+    UCHAR Pcm[7680];
+    UCHAR Sbc[4096];
+} PNA2DP_SBC_SAMPLE;
 
 /* Codec identifiers. Values are stable; they double as bit positions in masks. */
 typedef enum _PNA2DP_CODEC {
@@ -171,6 +198,7 @@ typedef struct _PNA2DP_STATUS {
 #define PNA2DP_STATUS_FLAG_FALLBACK_SBC      0x00000020
 #define PNA2DP_STATUS_FLAG_AUDIO_ACTIVE      0x00000040  /* WaveRT pin in RUN */
 #define PNA2DP_STATUS_FLAG_RADIO_IN_RANGE    0x00000080
+#define PNA2DP_STATUS_FLAG_REMOTE_VOLUME     0x00000100  /* Windows confirmed receiver volume */
 
 /* One remote stream endpoint (SEP) as reported by AVDTP GET_(ALL_)CAPABILITIES. */
 typedef struct _PNA2DP_REMOTE_SEP {
@@ -271,10 +299,49 @@ typedef struct _PNA2DP_CONFIG {
 #define PNA2DP_CFG_SUSPEND_ON_SCO        0x00000004
 #define PNA2DP_CFG_AUTO_START_ON_CONNECT 0x00000008  /* START immediately after OPEN */
 #define PNA2DP_CFG_EXPOSE_ALL_RATES      0x00000010  /* advertise every rate (exclusive apps) */
-#define PNA2DP_CFG_SOFTWARE_VOLUME       0x00000020  /* apply volume digitally, not only AVRCP */
+#define PNA2DP_CFG_SOFTWARE_VOLUME       0x00000020  /* always enabled until AVRCP volume is implemented */
 #define PNA2DP_CFG_DELAY_REPORTING       0x00000040  /* accept AVDTP delay reports */
 #define PNA2DP_CFG_DUAL_CHANNEL_PREFER   0x00000080  /* SBC: prefer dual channel over joint */
 #define PNA2DP_CFG_HOST_CODECS_ONLY      0x00000100  /* never fall back to kernel SBC */
+#define PNA2DP_CFG_AUTO_QUALITY          0x00000200  /* adapter-aware limits + live ABR */
+
+/* Optional read-only extension: older ABI-1 drivers may reject GET_QUALITY. */
+#define PNA2DP_QUALITY_RADIO_VALID       0x00000001
+#define PNA2DP_QUALITY_AUTO              0x00000002
+#define PNA2DP_QUALITY_ABR               0x00000004
+#define PNA2DP_QUALITY_CONSERVATIVE      0x00000008
+#define PNA2DP_QUALITY_IDLE              0
+#define PNA2DP_QUALITY_SAMPLING          1
+#define PNA2DP_QUALITY_STABLE            2
+#define PNA2DP_QUALITY_CONGESTED         3
+#define PNA2DP_QUALITY_RECOVERING        4
+typedef struct _PNA2DP_QUALITY {
+    ULONG Size;
+    ULONG Flags;
+    ULONGLONG LocalAddress;
+    ULONGLONG LmpFeatures;       /* adapter capability, not negotiated link speed */
+    ULONG RadioQueryStatus;     /* NTSTATUS; failure means unknown */
+    USHORT Manufacturer;
+    USHORT HciRevision;
+    USHORT LmpSubversion;
+    UCHAR HciVersion;
+    UCHAR LmpVersion;
+    ULONG Health;
+    ULONG Codec;
+    ULONG BitrateBps;
+    ULONG CeilingBps;
+    ULONG FloorBps;
+    ULONG Level;
+    ULONG MaxLevel;
+    ULONG HealthyMs;
+    ULONG CongestedMs;
+    ULONG CompletedPackets;    /* latest observation window */
+    ULONG SlowPackets;
+    ULONG FailedPackets;
+    ULONG BacklogPeakUs;
+    ULONG ObservationMs;
+    ULONG Reserved[4];
+} PNA2DP_QUALITY;
 
 /* Event mask returned by IOCTL_PNA2DP_WAIT_EVENT (output ULONG). */
 #define PNA2DP_EVENT_STATE_CHANGED       0x00000001
@@ -304,7 +371,10 @@ typedef struct _PNA2DP_STATS {
     ULONG      AbrUpgrades;
     ULONG      HostRoundTripAvgUs;  /* codec host encode round trip */
     ULONG      HostTimeouts;
-    ULONG      Reserved[7];
+    ULONG      TransportWaits;      /* retained PCM/results while TX queue was full */
+    ULONG      WaveLateTicks;       /* timer callbacks later than a notification period */
+    ULONG      WaveMaxTickUs;
+    ULONG      Reserved[4];
 } PNA2DP_STATS, *PPNA2DP_STATS;
 
 /* ---- Codec host protocol ----------------------------------------------------- */

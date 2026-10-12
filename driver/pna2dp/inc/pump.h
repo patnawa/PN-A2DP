@@ -14,6 +14,7 @@
  * SPDX-License-Identifier: MIT
  */
 #pragma once
+#include "audio_policy.h"
 
 #define PN_PUMP_RING_MS            600     /* PCM ring capacity */
 #define PN_PUMP_MAX_PACKET         2048    /* staging buffer per RTP packet */
@@ -61,9 +62,14 @@ typedef struct _PN_ABR {
     BOOLEAN     Enabled;
     ULONG       Level;             /* 0 = best quality */
     ULONG       MaxLevel;
-    ULONG       CongestionScore;   /* leaky bucket */
-    LONGLONG    LastChangeHns;
-    LONGLONG    LastCongestionHns;
+    PN_QUALITY_WINDOW Window;
+    LONGLONG    LastObservationHns;
+    volatile LONG Completed;
+    volatile LONG Slow;
+    volatile LONG Failed;
+    volatile LONG Pressure;
+    ULONG       BacklogPeakUs;
+    ULONG       FloorBps;
     ULONG       Downgrades;
     ULONG       Upgrades;
 } PN_ABR;
@@ -77,9 +83,14 @@ typedef struct _PN_PUMP {
     HANDLE              ThreadHandle;
     PKTHREAD            Thread;
     KEVENT              WakeEvent;
+    KEVENT              Idle;              /* signalled while the thread is outside a step batch */
     LONG                Running;           /* thread alive */
     LONG                StreamActive;      /* encoding/sending enabled */
-    LONG                Generation;        /* increments per OPEN; tags host work */
+    LONG                Generation;        /* increments per OPEN/CLOSE; tags host work */
+
+    /* live changes requested by other threads, applied by the pump thread between steps */
+    LONG                PendingBitpool;    /* 0 = none */
+    LONG                PendingAbrReset;
 
     /* encoder */
     PN_ENCODER_OWNER    Owner;
@@ -87,6 +98,8 @@ typedef struct _PN_PUMP {
     sbc_encoder         Sbc;
     ULONG               PcmFramesPerCodecFrame;
     ULONG               CodecFrameBytes;      /* encoded bytes per frame (SBC) */
+    ULONG               SbcBitpoolCeiling;    /* negotiated maximum, limited by the transport MTU */
+    ULONG               LdacBaseQuality;     /* configured ceiling; ABR only reduces from it */
     ULONG               CodecFramesPerPacket;
     ULONG               EncoderPcmFormat;     /* PNA2DP_FMT_* expected by the encoder */
     PUCHAR              ConvBuffer;           /* PCM converted to encoder format */
@@ -106,6 +119,7 @@ typedef struct _PN_PUMP {
     ULONG               HostNextSequence;
     LONG                HostOutstanding;
     LIST_ENTRY          HostResults;          /* PN_ENCODED_BLOCK ordered by sequence */
+    ULONG               HostResultCount;      /* under HostLock */
     KSPIN_LOCK          HostLock;
     ULONG               HostTimeouts;
     ULONG               HostRoundTripAvgUs;
@@ -114,13 +128,15 @@ typedef struct _PN_PUMP {
     /* volume (software path) */
     LONG                VolumeDb16;           /* 16.16 dB, 0 = unity */
     ULONG               VolumeGainQ15;        /* linear gain, Q15 (32768 = unity) */
-    BOOLEAN             SoftwareVolume;
     BOOLEAN             Muted;
 
     PN_ABR              Abr;
+    PNA2DP_QUALITY      Quality;        /* published snapshot, protected by Lock */
     PNA2DP_STATS        Stats;
     ULONG               TxAvgUs;
     ULONG               TxMaxUs;
+    volatile ULONG      SampleState;    /* 0 empty, 1 armed, 2 ready; Lock protects sample */
+    PNA2DP_SBC_SAMPLE    Sample;
 } PN_PUMP, *PPN_PUMP;
 
 NTSTATUS PumpInitialize(_Out_ PPN_PUMP P, _In_ PPNA2DP_DEVICE Device);
@@ -154,6 +170,8 @@ NTSTATUS PumpHostResult(_Inout_ PPN_PUMP P, _In_ const PNA2DP_CODEC_RESULT *R, _
 VOID     PumpHostLost(_Inout_ PPN_PUMP P);
 
 VOID     PumpGetStats(_In_ PPN_PUMP P, _Out_ PPNA2DP_STATS Stats);
+VOID     PumpGetQuality(_In_ PPN_PUMP P, _Out_ PNA2DP_QUALITY *Quality);
 VOID     PumpResetStats(_Inout_ PPN_PUMP P);
+NTSTATUS PumpSbcSample(_Inout_ PPN_PUMP P, _In_ ULONG Action, _Out_opt_ PNA2DP_SBC_SAMPLE *Sample);
 ULONG    PumpCurrentBitrate(_In_ PPN_PUMP P);
 ULONG    PumpEstimatedLatencyUs(_In_ PPN_PUMP P);

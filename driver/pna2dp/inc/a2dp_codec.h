@@ -118,6 +118,7 @@ typedef struct _A2DP_CODEC_CONFIG {
     UCHAR   SbcBitpool;        /* current (ABR) */
     /* AAC */
     UCHAR   AacObjectType;     /* 2 LC, 5 HEv1, 29 HEv2 */
+    UCHAR   AacObjectMask;     /* wire object bit; MPEG-2 LC and MPEG-4 LC both use AOT 2 */
     BOOLEAN AacVbr;
     /* LDAC */
     UCHAR   LdacEqmid;
@@ -149,6 +150,7 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CON
 
 /* Re-serialise Cfg into Cfg->Ies (after an ABR / live parameter change). */
 VOID    A2dpSerializeConfig(_Inout_ PA2DP_CODEC_CONFIG Cfg);
+BOOLEAN A2dpConstrainBasicRadio(_Inout_ PA2DP_CODEC_CONFIG Cfg);
 
 /* Nominal bitrate for a config (SBC computed from bitpool, others from tables). */
 ULONG   A2dpNominalBitrate(_In_ const A2DP_CODEC_CONFIG *Cfg);
@@ -157,3 +159,5 @@ ULONG   A2dpNominalBitrate(_In_ const A2DP_CODEC_CONFIG *Cfg);
 ULONG   A2dpRateMaskToHz(_In_ ULONG SingleBit);
 ULONG   A2dpHzToRateMask(_In_ ULONG Hz);
 const char *A2dpCodecName(_In_ ULONG Codec);
+
+ULONG A2dpQualityAtLevel(_In_ const A2DP_CODEC_CONFIG *Base, ULONG Level, ULONG FloorBps, _Out_opt_ A2DP_CODEC_CONFIG *Result);

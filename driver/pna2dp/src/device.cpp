@@ -12,28 +12,51 @@
 
 static LIST_ENTRY g_DeviceList;
 static KSPIN_LOCK g_DeviceListLock;
-static LONG g_DeviceListInit;
 
-static VOID DeviceListInit(void)
+/* Called once from DriverEntry, before any device can be added. */
+VOID DeviceListInitialize(void)
 {
-    if (InterlockedCompareExchange(&g_DeviceListInit, 1, 0) == 0) {
-        InitializeListHead(&g_DeviceList);
-        KeInitializeSpinLock(&g_DeviceListLock);
-    }
+    InitializeListHead(&g_DeviceList);
+    KeInitializeSpinLock(&g_DeviceListLock);
 }
 
-PPNA2DP_DEVICE DeviceFromFdo(_In_ PDEVICE_OBJECT Fdo)
+VOID DeviceReference(_Inout_ PPNA2DP_DEVICE D)
+{
+    InterlockedIncrement(&D->RefCount);
+}
+
+VOID DeviceRelease(_In_ PPNA2DP_DEVICE D)
+{
+    if (InterlockedDecrement(&D->RefCount) != 0) return;
+    /* Last reference: every user is gone. Streams may have armed the suspend timer after
+     * DeviceStop, so cancel the timers once more before the memory goes away. */
+    KeCancelTimer(&D->SuspendTimer);
+    KeCancelTimer(&D->ReconnectTimer);
+    KeFlushQueuedDpcs();
+    D->Signature = 0;
+    PnFree(D, PNA2DP_TAG_DEVICE);
+}
+
+PPNA2DP_DEVICE DeviceReferenceFromFdo(_In_ PDEVICE_OBJECT Fdo)
 {
     PPNA2DP_DEVICE found = NULL;
     KIRQL irql;
-    if (!g_DeviceListInit) return NULL;
     KeAcquireSpinLock(&g_DeviceListLock, &irql);
     for (PLIST_ENTRY e = g_DeviceList.Flink; e != &g_DeviceList; e = e->Flink) {
         PPNA2DP_DEVICE d = CONTAINING_RECORD(e, PNA2DP_DEVICE, GlobalLink);
-        if (d->Fdo == Fdo) { found = d; break; }
+        if (d->Fdo == Fdo && !d->Removing) { DeviceReference(d); found = d; break; }
     }
     KeReleaseSpinLock(&g_DeviceListLock, irql);
     return found;
+}
+
+/* Work items hold rundown protection from queueing until the end of the worker, so
+ * DeviceStop can wait for them before anything they touch is freed. */
+static BOOLEAN DeviceQueueWorkItem(_Inout_ PPNA2DP_DEVICE D, _In_ PIO_WORKITEM Item, _In_ PIO_WORKITEM_ROUTINE Routine)
+{
+    if (D->Removing || !Item || !ExAcquireRundownProtection(&D->WorkRundown)) return FALSE;
+    IoQueueWorkItem(Item, Routine, DelayedWorkQueue, D);
+    return TRUE;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -74,31 +97,32 @@ NTSTATUS DeviceQueueWaitEvent(_Inout_ PPNA2DP_DEVICE D, _In_ PIRP Irp)
     KeAcquireSpinLock(&D->StatusLock, &irql);
     ULONG pending = D->PendingEvents;
     D->PendingEvents = 0;
+    // Insertion and the notifier's no-waiter decision share this lock.
+    if (!pending) IoCsqInsertIrp(&D->Waiters.Csq, Irp, NULL);
     KeReleaseSpinLock(&D->StatusLock, irql);
     if (pending) {
         *(PULONG)Irp->AssociatedIrp.SystemBuffer = pending;
         Irp->IoStatus.Information = sizeof(ULONG);
         return STATUS_SUCCESS;
     }
-    IoCsqInsertIrp(&D->Waiters.Csq, Irp, NULL);
     return STATUS_PENDING;
 }
 
 VOID DeviceNotifyEvent(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG EventMask)
 {
-    PIRP irp;
-    BOOLEAN delivered = FALSE;
-    while ((irp = IoCsqRemoveNextIrp(&D->Waiters.Csq, NULL)) != NULL) {
+    KIRQL irql;
+    KeAcquireSpinLock(&D->StatusLock, &irql);
+    EventMask |= D->PendingEvents;
+    PIRP irp = IoCsqRemoveNextIrp(&D->Waiters.Csq, NULL);
+    D->PendingEvents = irp ? 0 : EventMask;
+    KeReleaseSpinLock(&D->StatusLock, irql);
+    while (irp) {
         *(PULONG)irp->AssociatedIrp.SystemBuffer = EventMask;
         irp->IoStatus.Status = STATUS_SUCCESS;
         irp->IoStatus.Information = sizeof(ULONG);
         IoCompleteRequest(irp, IO_NO_INCREMENT);
-        delivered = TRUE;
-    }
-    if (!delivered) {
-        KIRQL irql;
         KeAcquireSpinLock(&D->StatusLock, &irql);
-        D->PendingEvents |= EventMask;
+        irp = IoCsqRemoveNextIrp(&D->Waiters.Csq, NULL);
         KeReleaseSpinLock(&D->StatusLock, irql);
     }
 }
@@ -155,6 +179,7 @@ static VOID UpdateStatusLocked(_Inout_ PPNA2DP_DEVICE D)
     if (D->Avdtp.RemoteSignallingInitiated) s->Flags |= PNA2DP_STATUS_FLAG_REMOTE_INITIATED;
     if (D->AudioRequest == PnAudioRun) s->Flags |= PNA2DP_STATUS_FLAG_AUDIO_ACTIVE;
     if (D->Link.AclConnected) s->Flags |= PNA2DP_STATUS_FLAG_RADIO_IN_RANGE;
+    if (D->RemoteVolumeActive) s->Flags |= PNA2DP_STATUS_FLAG_REMOTE_VOLUME;
     if (D->Pump.Owner == PnEncoderKernelSbc && D->Config.CodecPriority[0] != PNA2DP_CODEC_SBC && !CodecHostCodecMask(&D->Host)) s->Flags |= PNA2DP_STATUS_FLAG_HOST_MISSING;
 }
 
@@ -165,10 +190,7 @@ NTSTATUS DeviceGetStatus(_In_ PPNA2DP_DEVICE D, _Out_ PPNA2DP_STATUS Status)
     UpdateStatusLocked(D);
     *Status = D->Status;
     KeReleaseSpinLock(&D->StatusLock, irql);
-    /* name conversion outside the lock */
-    ULONG i = 0;
-    for (; i < 63 && D->Link.RemoteName[i]; i++) Status->RemoteName[i] = (WCHAR)(UCHAR)D->Link.RemoteName[i];
-    Status->RemoteName[i] = 0;
+    RtlStringCchCopyW(Status->RemoteName, PN_ARRAYSIZE(Status->RemoteName), D->Link.RemoteNameW);
     return STATUS_SUCCESS;
 }
 
@@ -222,7 +244,7 @@ static VOID RefreshCapabilities(_Inout_ PPNA2DP_DEVICE D)
     KeAcquireSpinLock(&D->StatusLock, &irql);
     D->Caps = caps;
     KeReleaseSpinLock(&D->StatusLock, irql);
-    RegCfgSaveCapabilities(D->DriverObject, D->Link.RemoteAddress, &caps);
+    RegCfgSaveCapabilities(D->DriverObject, D->Link.RemoteAddress, &caps);   /* PASSIVE: StateMutex is a PnMutex */
     DeviceNotifyEvent(D, PNA2DP_EVENT_CAPS_CHANGED);
 }
 
@@ -243,6 +265,8 @@ static PAVDTP_LOCAL_SEP LocalSepForCodec(_In_ PPNA2DP_DEVICE D, _In_ ULONG Codec
 /* Picks codec/config according to priority list. Returns the remote SEP and fills Cfg. */
 static AVDTP_REMOTE_SEP *ChooseConfig(_Inout_ PPNA2DP_DEVICE D, _Out_ PA2DP_CODEC_CONFIG Cfg, _Out_ PN_ENCODER_OWNER *Owner, _Out_ PUCHAR LocalSeid)
 {
+    BOOLEAN conservative = (D->Config.Flags & PNA2DP_CFG_AUTO_QUALITY) &&
+        PnAdapterNeedsConservativeProfile(D->Link.RadioInfoValid, D->Link.RadioInfo.radioInfo.lmpSupportedFeatures);
     ULONG prefRate = D->AudioStreamOpen ? D->AudioRate : 48000;
     ULONG prefBits = D->AudioStreamOpen ? D->AudioValidBits : 16;
     for (ULONG pi = 0; pi < PN_ARRAYSIZE(D->Config.CodecPriority); pi++) {
@@ -258,7 +282,9 @@ static AVDTP_REMOTE_SEP *ChooseConfig(_Inout_ PPNA2DP_DEVICE D, _Out_ PA2DP_CODE
             if (!r->CapsValid || r->Codec != codec || r->Tsep != AVDTP_TSEP_SINK || r->InUse) continue;
             A2DP_CODEC_CAPS caps;
             if (!A2dpParseCaps(r->MediaCodecType, r->CodecCaps, r->CodecCapsLength, &caps, NULL, NULL)) continue;
+            if (D->AudioStreamOpen) caps.RateMask &= A2dpHzToRateMask(prefRate);
             if (A2dpSelectConfig(&caps, &D->Config, prefRate, prefBits, Cfg)) {
+                if (conservative && !A2dpConstrainBasicRadio(Cfg)) continue;
                 *Owner = owner;
                 *LocalSeid = local->Seid;
                 return r;
@@ -268,9 +294,12 @@ static AVDTP_REMOTE_SEP *ChooseConfig(_Inout_ PPNA2DP_DEVICE D, _Out_ PA2DP_CODE
     /* last resort: SBC with any sink SEP */
     for (ULONG i = 0; i < D->Avdtp.RemoteSepCount; i++) {
         AVDTP_REMOTE_SEP *r = &D->Avdtp.RemoteSeps[i];
-        if (!r->CapsValid || r->Codec != PNA2DP_CODEC_SBC || r->Tsep != AVDTP_TSEP_SINK) continue;
+        if (!r->CapsValid || r->Codec != PNA2DP_CODEC_SBC || r->Tsep != AVDTP_TSEP_SINK || r->InUse) continue;
         A2DP_CODEC_CAPS caps;
-        if (A2dpParseCaps(r->MediaCodecType, r->CodecCaps, r->CodecCapsLength, &caps, NULL, NULL) && A2dpSelectConfig(&caps, &D->Config, prefRate, prefBits, Cfg)) {
+        if (!A2dpParseCaps(r->MediaCodecType, r->CodecCaps, r->CodecCapsLength, &caps, NULL, NULL)) continue;
+        if (D->AudioStreamOpen) caps.RateMask &= A2dpHzToRateMask(prefRate);
+        if (A2dpSelectConfig(&caps, &D->Config, prefRate, prefBits, Cfg)) {
+            if (conservative && !A2dpConstrainBasicRadio(Cfg)) continue;
             PAVDTP_LOCAL_SEP local = LocalSepForCodec(D, PNA2DP_CODEC_SBC);
             *Owner = PnEncoderKernelSbc;
             *LocalSeid = local ? local->Seid : 1;
@@ -286,6 +315,7 @@ static AVDTP_REMOTE_SEP *ChooseConfig(_Inout_ PPNA2DP_DEVICE D, _Out_ PA2DP_CODE
 
 static VOID ScheduleReconnect(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG DelayMs)
 {
+    if (D->Removing) return;   /* DeviceStop cancels the timer after every source is stopped */
     LARGE_INTEGER due;
     due.QuadPart = -PN_HNS_PER_MS * (LONGLONG)DelayMs;
     KeSetTimer(&D->ReconnectTimer, due, &D->ReconnectDpc);
@@ -341,12 +371,23 @@ static NTSTATUS EnsureConfiguredAndOpen(_Inout_ PPNA2DP_DEVICE D)
         D->Active = cfg;
         D->ActiveValid = TRUE;
         KeReleaseSpinLock(&D->StatusLock, irql);
-        D->Pump.Owner = owner;
-        st = AvdtpStateConfigured;
+        st = AvdtpStateConfigured;   /* StartPumpIfNeeded picks the encoder owner again */
     }
     if (st == AvdtpStateConfigured) {
         NTSTATUS status = AvdtpOpen(&D->Avdtp);
-        if (!NT_SUCCESS(status)) { D->Status.LastError = (ULONG)status; return status; }
+        if (!NT_SUCCESS(status)) {
+            D->Status.LastError = (ULONG)status;
+            if (status == STATUS_DEVICE_PROTOCOL_ERROR || status == STATUS_NOT_SUPPORTED) {
+                /* the sink no longer has this stream configured: abort to Idle so the next
+                 * attempt sends SET_CONFIGURATION again instead of repeating OPEN */
+                AvdtpAbort(&D->Avdtp);
+                KIRQL irql;
+                KeAcquireSpinLock(&D->StatusLock, &irql);
+                D->ActiveValid = FALSE;
+                KeReleaseSpinLock(&D->StatusLock, irql);
+            }
+            return status;
+        }
         st = AvdtpStateOpen;
         DeviceNotifyEvent(D, PNA2DP_EVENT_STATE_CHANGED);
     }
@@ -367,7 +408,7 @@ static NTSTATUS StartPumpIfNeeded(_Inout_ PPNA2DP_DEVICE D)
     }
     NTSTATUS status = PumpStartStream(&D->Pump, &D->Active, AvdtpMediaChannel(&D->Avdtp), AvdtpMediaMtu(&D->Avdtp), owner, &D->Config);
     if (!NT_SUCCESS(status)) D->Status.LastError = (ULONG)status;
-    PumpSetVolume(&D->Pump, D->VolumeDb16, D->Muted);
+    PumpSetVolume(&D->Pump, D->RemoteVolumeActive ? 0 : D->VolumeDb16, D->Muted);
     return status;
 }
 
@@ -380,6 +421,16 @@ static VOID Reconcile(_Inout_ PPNA2DP_DEVICE D, _In_ BOOLEAN SuspendDue)
     AVDTP_STREAM_STATE st = AvdtpGetState(&D->Avdtp);
 
     if (want) {
+        /* the remote closed or aborted the stream under a running pump: stop it before
+         * anything is reconfigured, so the next PumpStartStream sets the encoder up again */
+        if (PumpIsStreaming(&D->Pump) && st != AvdtpStateStreaming && st != AvdtpStateOpen) PumpStopStream(&D->Pump);
+        /* the codec host went away while it was encoding: renegotiate (SBC in the kernel) */
+        if (PumpIsStreaming(&D->Pump) && D->Pump.Owner == PnEncoderHost && !CodecHostCodecMask(&D->Host)) {
+            PN_WARN("codec host lost while streaming %s; renegotiating", A2dpCodecName(D->Active.Codec));
+            PumpStopStream(&D->Pump);
+            AvdtpClose(&D->Avdtp);
+            D->ActiveValid = FALSE;
+        }
         if (!NT_SUCCESS(EnsureSignalling(D))) {
             if (D->ReconnectAttempts < 10) { D->ReconnectAttempts++; ScheduleReconnect(D, D->Config.ReconnectDelayMs + 500 * D->ReconnectAttempts); }
             DeviceNotifyEvent(D, PNA2DP_EVENT_ERROR);
@@ -408,7 +459,10 @@ static VOID Reconcile(_Inout_ PPNA2DP_DEVICE D, _In_ BOOLEAN SuspendDue)
                     D->Active = cfg;
                 }
             } else {
-                PN_WARN("sink does not support %u Hz for %s; engine audio will be rate-mismatched", D->AudioRate, A2dpCodecName(cfg.Codec));
+                PN_WARN("sink does not support %u Hz for %s; selecting another codec", D->AudioRate, A2dpCodecName(cfg.Codec));
+                PumpStopStream(&D->Pump);
+                AvdtpClose(&D->Avdtp);
+                D->ActiveValid = FALSE;
             }
         }
         NTSTATUS status = EnsureConfiguredAndOpen(D);
@@ -420,10 +474,17 @@ static VOID Reconcile(_Inout_ PPNA2DP_DEVICE D, _In_ BOOLEAN SuspendDue)
         }
         st = AvdtpGetState(&D->Avdtp);
         if (st == AvdtpStateOpen || st == AvdtpStateStreaming) {
-            if (!NT_SUCCESS(StartPumpIfNeeded(D))) { DeviceNotifyEvent(D, PNA2DP_EVENT_ERROR); return; }
             if (st == AvdtpStateOpen) {
+                /* A media channel may stay open while its ACL goes into sniff mode.
+                 * Wake the link before the latency-sensitive START transaction. */
+                PnLinkEnsureActive(&D->Link);
                 status = AvdtpStart(&D->Avdtp);
-                if (!NT_SUCCESS(status)) { PumpStopStream(&D->Pump); DeviceNotifyEvent(D, PNA2DP_EVENT_ERROR); return; }
+                if (!NT_SUCCESS(status)) { DeviceNotifyEvent(D, PNA2DP_EVENT_ERROR); return; }
+            }
+            if (!NT_SUCCESS(StartPumpIfNeeded(D))) {
+                if (AvdtpGetState(&D->Avdtp) == AvdtpStateStreaming) AvdtpSuspend(&D->Avdtp);
+                DeviceNotifyEvent(D, PNA2DP_EVENT_ERROR);
+                return;
             }
             DeviceNotifyEvent(D, PNA2DP_EVENT_STATE_CHANGED);
         }
@@ -448,23 +509,29 @@ static VOID ConnectWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Conte
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)Context;
     if (!D) return;
     InterlockedExchange(&D->ConnectQueued, 0);
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
     if (!D->Removing) {
         /* Opportunistic connect: bring the signalling channel up and learn capabilities so
-         * the endpoint's format list matches the sink before audio starts. */
-        if (NT_SUCCESS(EnsureSignalling(D))) {
+         * the endpoint's format list matches the sink before audio starts. When audio is
+         * already wanted, Reconcile does the same with retry scheduling; connecting here too
+         * would double the time a speaker that is off holds StateMutex. */
+        BOOLEAN want = D->AudioRequest == PnAudioRun && D->AudioStreamOpen;
+        if (!want && NT_SUCCESS(EnsureSignalling(D))) {
             EnsureDiscovered(D);
             if (D->Config.Flags & PNA2DP_CFG_AUTO_START_ON_CONNECT) EnsureConfiguredAndOpen(D);
         }
         Reconcile(D, FALSE);
     }
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
+    ExReleaseRundownProtection(&D->WorkRundown);   /* last access to D */
 }
 
 VOID DeviceQueueConnect(_Inout_ PPNA2DP_DEVICE D)
 {
     if (D->Removing) return;
-    if (InterlockedCompareExchange(&D->ConnectQueued, 1, 0) == 0) IoQueueWorkItem(D->ConnectWorkItem, ConnectWorker, DelayedWorkQueue, D);
+    if (InterlockedCompareExchange(&D->ConnectQueued, 1, 0) == 0) {
+        if (!DeviceQueueWorkItem(D, D->ConnectWorkItem, ConnectWorker)) InterlockedExchange(&D->ConnectQueued, 0);
+    }
 }
 
 static VOID AudioWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Context)
@@ -473,9 +540,10 @@ static VOID AudioWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Context
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)Context;
     if (!D) return;
     LONG flags = InterlockedExchange(&D->AudioQueued, 0);
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
     Reconcile(D, (flags & 2) != 0);
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
+    ExReleaseRundownProtection(&D->WorkRundown);
 }
 
 static VOID QueueAudioWork(_Inout_ PPNA2DP_DEVICE D, _In_ BOOLEAN SuspendDue)
@@ -483,7 +551,7 @@ static VOID QueueAudioWork(_Inout_ PPNA2DP_DEVICE D, _In_ BOOLEAN SuspendDue)
     if (D->Removing) return;
     LONG old, next;
     do { old = D->AudioQueued; next = old | 1 | (SuspendDue ? 2 : 0); } while (InterlockedCompareExchange(&D->AudioQueued, next, old) != old);
-    if (old == 0) IoQueueWorkItem(D->AudioWorkItem, AudioWorker, DelayedWorkQueue, D);
+    if (old == 0 && !DeviceQueueWorkItem(D, D->AudioWorkItem, AudioWorker)) InterlockedExchange(&D->AudioQueued, 0);
 }
 
 static VOID SuspendDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Ctx, _In_opt_ PVOID A1, _In_opt_ PVOID A2)
@@ -506,10 +574,11 @@ static VOID ScoWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Context)
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)Context;
     if (!D) return;
     InterlockedExchange(&D->ScoQueued, 0);
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
     Reconcile(D, FALSE);
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
     DeviceNotifyEvent(D, PNA2DP_EVENT_SCO_CHANGED);
+    ExReleaseRundownProtection(&D->WorkRundown);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -529,7 +598,9 @@ static VOID OnSco(_In_ PVOID Context, _In_ BOOLEAN Active)
     UNREFERENCED_PARAMETER(Active);
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)Context;
     if (D->Removing) return;
-    if (InterlockedCompareExchange(&D->ScoQueued, 1, 0) == 0) IoQueueWorkItem(D->ScoWorkItem, ScoWorker, DelayedWorkQueue, D);
+    if (InterlockedCompareExchange(&D->ScoQueued, 1, 0) == 0) {
+        if (!DeviceQueueWorkItem(D, D->ScoWorkItem, ScoWorker)) InterlockedExchange(&D->ScoQueued, 0);
+    }
 }
 
 static VOID OnAcl(_In_ PVOID Context, _In_ BOOLEAN Connected)
@@ -570,8 +641,7 @@ static UCHAR OnRemoteSetConfiguration(_In_ PVOID Ctx, _In_ PAVDTP_LOCAL_SEP Loca
     D->Active = cfg;
     D->ActiveValid = TRUE;
     KeReleaseSpinLock(&D->StatusLock, irql);
-    D->Pump.Owner = owner;
-    PN_INFO("remote configured %s @ %u Hz", A2dpCodecName(cfg.Codec), cfg.SampleRate);
+    PN_INFO("remote configured %s @ %u Hz (encoder %u)", A2dpCodecName(cfg.Codec), cfg.SampleRate, owner);
     return 0;
 }
 
@@ -611,16 +681,19 @@ static VOID OnDelayReport(_In_ PVOID Ctx, _In_ ULONG DelayTenthsMs)
     DeviceNotifyEvent(D, PNA2DP_EVENT_DELAY_REPORT);
 }
 
-static VOID OnSignallingDown(_In_ PVOID Ctx, _In_ NTSTATUS Status)
+static VOID OnSignallingDown(_In_ PVOID Ctx, _In_ NTSTATUS Status, _In_ ULONG Generation)
 {
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)Ctx;
     UNREFERENCED_PARAMETER(Status);
     if (D->Removing) return;
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
+    /* every outgoing connect runs under StateMutex: if one replaced the channel while this
+     * waited, the event is about a connection that no longer exists */
+    if (Generation != D->Avdtp.Signalling.Generation) { PnMutexRelease(&D->StateMutex); return; }
     PumpStopStream(&D->Pump);
     AvdtpDisconnect(&D->Avdtp);
     D->ActiveValid = FALSE;
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
     DeviceNotifyEvent(D, PNA2DP_EVENT_STATE_CHANGED);
     if (D->AudioRequest == PnAudioRun && D->AudioStreamOpen) ScheduleReconnect(D, D->Config.ReconnectDelayMs);
 }
@@ -631,14 +704,15 @@ static VOID OnMediaPacket(_In_ PVOID Ctx, _In_reads_bytes_(Len) const UCHAR *Dat
     /* sink role (phase 2): decode and feed a capture pin */
 }
 
-static VOID OnMediaDown(_In_ PVOID Ctx, _In_ NTSTATUS Status)
+static VOID OnMediaDown(_In_ PVOID Ctx, _In_ NTSTATUS Status, _In_ ULONG Generation)
 {
     UNREFERENCED_PARAMETER(Status);
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)Ctx;
     if (D->Removing) return;
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
+    if (Generation != D->Avdtp.Media.Generation) { PnMutexRelease(&D->StateMutex); return; }
     PumpStopStream(&D->Pump);
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
     QueueAudioWork(D, FALSE);
 }
 
@@ -648,44 +722,46 @@ VOID DeviceMediaWriteDone(PVOID Ctx, NTSTATUS Status, ULONG Bytes, LONGLONG Subm
     PumpOnWriteDone(&D->Pump, Status, Bytes, SubmitTimeHns);
 }
 
-extern "C" VOID AvdtpOnAcceptedChannelReady(_Inout_ PAVDTP_SESSION S, _In_ BOOLEAN Media);
-
 /* ------------------------------------------------------------------------- */
 /* Audio endpoint -> device                                                     */
 /* ------------------------------------------------------------------------- */
 
-VOID DeviceAudioStreamOpened(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG Rate, _In_ ULONG Channels, _In_ ULONG ContainerBits, _In_ ULONG ValidBits, _In_ BOOLEAN IsFloat)
+NTSTATUS DeviceAudioStreamOpened(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG Rate, _In_ ULONG Channels, _In_ ULONG ContainerBits, _In_ ULONG ValidBits, _In_ BOOLEAN IsFloat)
 {
     PAGED_CODE();
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
+    if (D->Removing || D->TornDown) { PnMutexRelease(&D->StateMutex); return STATUS_DEVICE_REMOVED; }
+    NTSTATUS status = PumpConfigureInput(&D->Pump, Rate, Channels, ContainerBits, ValidBits, IsFloat);
+    if (!NT_SUCCESS(status)) { PnMutexRelease(&D->StateMutex); return status; }
     D->AudioRate = Rate;
     D->AudioChannels = Channels;
     D->AudioBits = ContainerBits;
     D->AudioValidBits = ValidBits;
     D->AudioFloat = IsFloat;
-    PumpConfigureInput(&D->Pump, Rate, Channels, ContainerBits, ValidBits, IsFloat);
     D->AudioStreamOpen = TRUE;
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
     DeviceQueueConnect(D);
+    return STATUS_SUCCESS;
 }
 
 VOID DeviceAudioStreamClosed(_Inout_ PPNA2DP_DEVICE D)
 {
     PAGED_CODE();
     KeCancelTimer(&D->SuspendTimer);
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
     D->AudioRequest = PnAudioStop;
     D->AudioStreamOpen = FALSE;
     PumpStopStream(&D->Pump);
     if (AvdtpGetState(&D->Avdtp) == AvdtpStateStreaming && !D->Removing) AvdtpSuspend(&D->Avdtp);
     PumpReleaseInput(&D->Pump);
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
     DeviceNotifyEvent(D, PNA2DP_EVENT_STATE_CHANGED);
 }
 
 VOID DeviceAudioStateChanged(_Inout_ PPNA2DP_DEVICE D, _In_ PN_AUDIO_REQUEST Request)
 {
     D->AudioRequest = Request;
+    if (D->Removing) return;   /* a stream that outlives a surprise removal: nothing to drive */
     if (Request == PnAudioRun) {
         KeCancelTimer(&D->SuspendTimer);
         QueueAudioWork(D, FALSE);
@@ -701,8 +777,11 @@ VOID DeviceAudioVolumeChanged(_Inout_ PPNA2DP_DEVICE D, _In_ LONG VolumeDb16, _I
 {
     D->VolumeDb16 = VolumeDb16;
     D->Muted = Muted;
+    KIRQL irql;
+    KeAcquireSpinLock(&D->StatusLock, &irql);
     D->Config.VolumeDb16 = VolumeDb16;
-    PumpSetVolume(&D->Pump, VolumeDb16, Muted);
+    KeReleaseSpinLock(&D->StatusLock, irql);
+    PumpSetVolume(&D->Pump, D->RemoteVolumeActive ? 0 : VolumeDb16, Muted);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -714,13 +793,15 @@ NTSTATUS DeviceSetConfig(_Inout_ PPNA2DP_DEVICE D, _In_ const PNA2DP_CONFIG *Cfg
     PAGED_CODE();
     PNA2DP_CONFIG c = *Cfg;
     if (!RegCfgValidate(&c)) return STATUS_INVALID_PARAMETER;
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
     PNA2DP_CONFIG old = D->Config;
+    NTSTATUS saved = RegCfgSaveDevice(D->DriverObject, D->Link.RemoteAddress, &c, D->Link.RemoteName);
+    if (!NT_SUCCESS(saved)) { PnMutexRelease(&D->StateMutex); return saved; }
     KIRQL irql;
     KeAcquireSpinLock(&D->StatusLock, &irql);
     D->Config = c;
     KeReleaseSpinLock(&D->StatusLock, irql);
-    RegCfgSaveDevice(D->DriverObject, D->Link.RemoteAddress, &c, D->Link.RemoteName);
+    D->Adapter->SetVolume(ULONG(-1), c.VolumeDb16);
 
     BOOLEAN codecChanged = RtlCompareMemory(old.CodecPriority, c.CodecPriority, sizeof(c.CodecPriority)) != sizeof(c.CodecPriority) ||
                            old.EnabledCodecMask != c.EnabledCodecMask ||
@@ -730,18 +811,20 @@ NTSTATUS DeviceSetConfig(_Inout_ PPNA2DP_DEVICE D, _In_ const PNA2DP_CONFIG *Cfg
                            RtlCompareMemory(&old.Aptx, &c.Aptx, sizeof(c.Aptx)) != sizeof(c.Aptx) ||
                            RtlCompareMemory(&old.AptxHd, &c.AptxHd, sizeof(c.AptxHd)) != sizeof(c.AptxHd) ||
                            RtlCompareMemory(&old.AptxLl, &c.AptxLl, sizeof(c.AptxLl)) != sizeof(c.AptxLl) ||
-                           ((old.Flags ^ c.Flags) & (PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_HOST_CODECS_ONLY | PNA2DP_CFG_DELAY_REPORTING));
-    PumpSetAbr(&D->Pump, (c.Flags & PNA2DP_CFG_ABR_ENABLE) != 0);
+                           old.AbrFloorBps != c.AbrFloorBps ||
+                           ((old.Flags ^ c.Flags) & (PNA2DP_CFG_AUTO_QUALITY | PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_HOST_CODECS_ONLY | PNA2DP_CFG_DELAY_REPORTING));
+    PumpSetAbr(&D->Pump, (c.Flags & PNA2DP_CFG_ABR_ENABLE) != 0 &&
+        (D->Pump.Cfg.Codec != PNA2DP_CODEC_LDAC || c.Ldac.AbrEnable != 0));
     D->Pump.TargetLatencyMs = c.TargetLatencyMs;
     D->Pump.MaxLatencyMs = c.MaxLatencyMs;
-    D->Pump.SoftwareVolume = (c.Flags & PNA2DP_CFG_SOFTWARE_VOLUME) != 0;
 
     if (codecChanged && D->ActiveValid) {
         /* Live path: if only the SBC bitpool changed, apply in band; otherwise renegotiate. */
+        PNA2DP_CONFIG bitpoolOnly = old;
+        bitpoolOnly.Sbc.MaxBitpool = c.Sbc.MaxBitpool;
         BOOLEAN onlyBitpool = D->Active.Codec == PNA2DP_CODEC_SBC && old.Sbc.MaxBitpool != c.Sbc.MaxBitpool &&
-                              c.Sbc.MaxBitpool && c.Sbc.MaxBitpool <= D->Active.SbcMaxBitpool &&
-                              old.Sbc.RateMask == c.Sbc.RateMask && old.Sbc.ChannelModeMask == c.Sbc.ChannelModeMask &&
-                              old.Sbc.BlockMask == c.Sbc.BlockMask && old.Sbc.SubbandMask == c.Sbc.SubbandMask && old.Sbc.AllocMask == c.Sbc.AllocMask;
+                              c.Sbc.MaxBitpool >= D->Active.SbcMinBitpool && c.Sbc.MaxBitpool <= D->Active.SbcMaxBitpool &&
+                              RtlCompareMemory(&bitpoolOnly, &c, sizeof(c)) == sizeof(c);
         if (onlyBitpool) {
             PumpSetSbcBitpool(&D->Pump, c.Sbc.MaxBitpool);
             D->Active.SbcBitpool = c.Sbc.MaxBitpool;
@@ -754,7 +837,7 @@ NTSTATUS DeviceSetConfig(_Inout_ PPNA2DP_DEVICE D, _In_ const PNA2DP_CONFIG *Cfg
             if (wasRunning) QueueAudioWork(D, FALSE);
         }
     }
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
     DeviceNotifyEvent(D, PNA2DP_EVENT_CONFIG_CHANGED);
     return STATUS_SUCCESS;
 }
@@ -762,12 +845,12 @@ NTSTATUS DeviceSetConfig(_Inout_ PPNA2DP_DEVICE D, _In_ const PNA2DP_CONFIG *Cfg
 NTSTATUS DeviceReconnect(_Inout_ PPNA2DP_DEVICE D)
 {
     PAGED_CODE();
-    ExAcquireFastMutex(&D->StateMutex);
+    PnMutexAcquire(&D->StateMutex);
     PumpStopStream(&D->Pump);
     AvdtpDisconnect(&D->Avdtp);
     D->ActiveValid = FALSE;
     D->ReconnectAttempts = 0;
-    ExReleaseFastMutex(&D->StateMutex);
+    PnMutexRelease(&D->StateMutex);
     DeviceQueueConnect(D);
     return STATUS_SUCCESS;
 }
@@ -804,11 +887,12 @@ static VOID BuildLocalSeps(_Inout_ PPNA2DP_DEVICE D)
 NTSTATUS DeviceCreate(_In_ PDEVICE_OBJECT Fdo, _In_ PDEVICE_OBJECT Pdo, _In_ PDRIVER_OBJECT DriverObject, _In_ CPnAdapterCommon *Adapter, _Out_ PPNA2DP_DEVICE *Device)
 {
     PAGED_CODE();
-    DeviceListInit();
+    *Device = NULL;
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)PnAllocNp(sizeof(*D), PNA2DP_TAG_DEVICE);
     if (!D) return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(D, sizeof(*D));
     D->Signature = PNA2DP_DEVICE_SIGNATURE;
+    D->RefCount = 1;
     D->Fdo = Fdo;
     D->Pdo = Pdo;
     D->DriverObject = DriverObject;
@@ -818,15 +902,24 @@ NTSTATUS DeviceCreate(_In_ PDEVICE_OBJECT Fdo, _In_ PDEVICE_OBJECT Pdo, _In_ PDR
     KeInitializeSpinLock(&D->Waiters.Lock);
     InitializeListHead(&D->Waiters.Queue);
     IoCsqInitialize(&D->Waiters.Csq, WCsqInsert, WCsqRemove, WCsqPeek, WCsqAcquire, WCsqRelease, WCsqCancel);
+    ExInitializeRundownProtection(&D->WorkRundown);
+    ExInitializeRundownProtection(&D->ControlRundown);
     KeInitializeTimer(&D->SuspendTimer);
     KeInitializeDpc(&D->SuspendDpc, SuspendDpc, D);
     KeInitializeTimer(&D->ReconnectTimer);
     KeInitializeDpc(&D->ReconnectDpc, ReconnectDpc, D);
+    /* Everything DeviceStop and DeviceTeardown touch is valid from here on, whatever
+     * DeviceStart later manages to bring up. */
+    CodecHostInitialize(&D->Host, D);
     D->ConnectWorkItem = IoAllocateWorkItem(Fdo);
     D->AudioWorkItem = IoAllocateWorkItem(Fdo);
     D->ScoWorkItem = IoAllocateWorkItem(Fdo);
-    if (!D->ConnectWorkItem || !D->AudioWorkItem || !D->ScoWorkItem) { DeviceDestroy(D); return STATUS_INSUFFICIENT_RESOURCES; }
     RegCfgDefaults(&D->Config);
+    if (!D->ConnectWorkItem || !D->AudioWorkItem || !D->ScoWorkItem) {
+        DeviceTeardown(D);
+        DeviceRelease(D);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     *Device = D;
     return STATUS_SUCCESS;
 }
@@ -838,6 +931,12 @@ NTSTATUS DeviceStart(_Inout_ PPNA2DP_DEVICE D)
     D->WdfDevice = D->Adapter->GetWdfDevice();
     status = PnLinkInitialize(&D->Link, D->WdfDevice, D->Fdo, D->Pdo);
     if (!NT_SUCCESS(status)) return status;
+    size_t nameBytes = 0;
+    RtlStringCbLengthW(D->Link.RemoteNameW, sizeof(D->Link.RemoteNameW), &nameBytes);
+    NTSTATUS nameStatus = IoSetDevicePropertyData(D->Pdo, &DEVPKEY_Device_FriendlyName,
+        LOCALE_NEUTRAL, PLUGPLAY_PROPERTY_PERSISTENT, DEVPROP_TYPE_STRING,
+        (ULONG)(nameBytes + sizeof(WCHAR)), D->Link.RemoteNameW);
+    if (!NT_SUCCESS(nameStatus)) PN_WARN("device friendly name failed 0x%08x", nameStatus);
     if (!NT_SUCCESS(RegCfgLoadDevice(D->DriverObject, D->Link.RemoteAddress, &D->Config))) {
         RegCfgDefaults(&D->Config);
         RegCfgSaveDevice(D->DriverObject, D->Link.RemoteAddress, &D->Config, D->Link.RemoteName);
@@ -845,8 +944,6 @@ NTSTATUS DeviceStart(_Inout_ PPNA2DP_DEVICE D)
     D->VolumeDb16 = D->Config.VolumeDb16;
 
     status = PumpInitialize(&D->Pump, D);
-    if (!NT_SUCCESS(status)) return status;
-    status = CodecHostInitialize(&D->Host, D);
     if (!NT_SUCCESS(status)) return status;
 
     AVDTP_CALLBACKS cb;
@@ -866,28 +963,33 @@ NTSTATUS DeviceStart(_Inout_ PPNA2DP_DEVICE D)
     status = PnLinkRegisterServer(&D->Link, OnIncoming, D);
     if (!NT_SUCCESS(status)) PN_WARN("incoming AVDTP connections unavailable (0x%08x)", status);
     PnLinkRegisterRadioEvents(&D->Link, OnSco, OnAcl, D);
-    ControlRegisterInterface(D);
+    status = ControlRegisterInterface(D);
+    if (!NT_SUCCESS(status)) return status;
 
     KIRQL irql;
     KeAcquireSpinLock(&g_DeviceListLock, &irql);
     InsertTailList(&g_DeviceList, &D->GlobalLink);
     KeReleaseSpinLock(&g_DeviceListLock, irql);
 
-    PumpSetVolume(&D->Pump, D->VolumeDb16, FALSE);
-    /* learn the sink's capabilities early (best effort, in the background) */
+    PumpSetVolume(&D->Pump, D->RemoteVolumeActive ? 0 : D->VolumeDb16, FALSE);
+    /* learn the capabilities of the sink early (best effort, in the background) */
     ScheduleReconnect(D, 1500);
     PN_INFO("device started for %012llX (%s)", D->Link.RemoteAddress, D->Link.RemoteName);
     return STATUS_SUCCESS;
 }
 
+/* Quiesce. Safe on a device whose DeviceStart failed part way, and safe to call twice.
+ * Order matters: first stop every source of new work (IOCTLs, Bluetooth indications,
+ * radio events, channels), then wait for the work already queued, and only then cancel
+ * the timers, because workers and callbacks are what re-arm them. */
 VOID DeviceStop(_Inout_ PPNA2DP_DEVICE D)
 {
     PAGED_CODE();
+    if (D->Stopped) return;
+    D->Stopped = TRUE;
     InterlockedExchange(&D->Removing, 1);
-    KeCancelTimer(&D->SuspendTimer);
-    KeCancelTimer(&D->ReconnectTimer);
-    KeFlushQueuedDpcs();
-    ControlUnregisterInterface(D);
+
+    /* no new control handles; wait for IOCTLs in progress */
     if (D->GlobalLink.Flink) {
         KIRQL irql;
         KeAcquireSpinLock(&g_DeviceListLock, &irql);
@@ -895,15 +997,38 @@ VOID DeviceStop(_Inout_ PPNA2DP_DEVICE D)
         D->GlobalLink.Flink = D->GlobalLink.Blink = NULL;
         KeReleaseSpinLock(&g_DeviceListLock, irql);
     }
-    ExAcquireFastMutex(&D->StateMutex);
+    ExWaitForRundownProtectionRelease(&D->ControlRundown);
+    ControlUnregisterInterface(D);
+
+    /* no new radio events or incoming connections */
+    PnLinkUnregisterRadioEvents(&D->Link);
+    if (PnLinkUnregisterServer(&D->Link)) {
+        /* BthPort may still call the server callback with &D->Link: keep D allocated forever */
+        DeviceReference(D);
+    }
+
+    /* a worker may be holding StateMutex in an outgoing connect to a speaker that is off */
+    if (D->Avdtp.Link) {
+        PnChannelCancelConnect(&D->Avdtp.Signalling);
+        PnChannelCancelConnect(&D->Avdtp.Media);
+    }
+
+    /* stop streaming and close the channels: no more L2CAP callbacks after this */
+    PnMutexAcquire(&D->StateMutex);
     PumpStopStream(&D->Pump);
     if (D->Avdtp.Link) {
         if (AvdtpGetState(&D->Avdtp) != AvdtpStateIdle) AvdtpClose(&D->Avdtp);
         AvdtpDisconnect(&D->Avdtp);
     }
-    ExReleaseFastMutex(&D->StateMutex);
-    PnLinkUnregisterRadioEvents(&D->Link);
-    PnLinkUnregisterServer(&D->Link);
+    PnMutexRelease(&D->StateMutex);
+
+    /* wait for AVDTP and device work items that were already queued */
+    AvdtpStopWork(&D->Avdtp);
+    ExWaitForRundownProtectionRelease(&D->WorkRundown);
+    KeCancelTimer(&D->SuspendTimer);
+    KeCancelTimer(&D->ReconnectTimer);
+    KeFlushQueuedDpcs();
+
     DeviceNotifyEvent(D, PNA2DP_EVENT_STATE_CHANGED);
     for (;;) {
         PIRP irp = IoCsqRemoveNextIrp(&D->Waiters.Csq, NULL);
@@ -915,16 +1040,20 @@ VOID DeviceStop(_Inout_ PPNA2DP_DEVICE D)
     CodecHostUninitialize(&D->Host);
 }
 
-VOID DeviceDestroy(_Inout_ PPNA2DP_DEVICE D)
+/* Free the subsystems after DeviceStop. The structure itself stays valid until the last
+ * reference is released, so late calls from streams or control handles stay harmless. */
+VOID DeviceTeardown(_Inout_ PPNA2DP_DEVICE D)
 {
     PAGED_CODE();
-    if (!D) return;
+    if (D->TornDown) return;
+    DeviceStop(D);
+    PnMutexAcquire(&D->StateMutex);
+    D->TornDown = TRUE;
+    PnMutexRelease(&D->StateMutex);
     if (D->Pump.Device) PumpUninitialize(&D->Pump);
     if (D->Avdtp.Link) AvdtpUninitialize(&D->Avdtp);
-    if (D->Link.DdiValid || D->Link.IoTarget) PnLinkUninitialize(&D->Link);
-    if (D->ConnectWorkItem) IoFreeWorkItem(D->ConnectWorkItem);
-    if (D->AudioWorkItem) IoFreeWorkItem(D->AudioWorkItem);
-    if (D->ScoWorkItem) IoFreeWorkItem(D->ScoWorkItem);
-    D->Signature = 0;
-    PnFree(D, PNA2DP_TAG_DEVICE);
+    PnLinkUninitialize(&D->Link);
+    if (D->ConnectWorkItem) { IoFreeWorkItem(D->ConnectWorkItem); D->ConnectWorkItem = NULL; }
+    if (D->AudioWorkItem) { IoFreeWorkItem(D->AudioWorkItem); D->AudioWorkItem = NULL; }
+    if (D->ScoWorkItem) { IoFreeWorkItem(D->ScoWorkItem); D->ScoWorkItem = NULL; }
 }

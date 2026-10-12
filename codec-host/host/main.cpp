@@ -62,6 +62,8 @@ static void RunHost(HANDLE stopEvent)
         for (auto &d : devs) {
             auto it = workers.find(d);
             if (it == workers.end() || !it->second->Alive()) {
+                // Release the old handle's exclusive codec registration before replacing it.
+                if (it != workers.end()) { it->second->Stop(); workers.erase(it); }
                 auto w = std::make_unique<DeviceWorker>(d, plugins);
                 if (w->Start()) workers[d] = std::move(w);
             }
@@ -90,14 +92,24 @@ static VOID WINAPI ServiceCtrlHandler(DWORD ctrl)
 static VOID WINAPI ServiceMain(DWORD, LPWSTR *)
 {
     g_statusHandle = RegisterServiceCtrlHandlerW(kServiceName, ServiceCtrlHandler);
+    if (!g_statusHandle) return;
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_stopEvent) {
+        g_status.dwCurrentState = SERVICE_STOPPED;
+        g_status.dwWin32ExitCode = GetLastError();
+        SetServiceStatus(g_statusHandle, &g_status);
+        return;
+    }
     g_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
     g_status.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(g_statusHandle, &g_status);
-    g_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     RunHost(g_stopEvent);
     g_status.dwCurrentState = SERVICE_STOPPED;
+    g_status.dwControlsAccepted = 0;
     SetServiceStatus(g_statusHandle, &g_status);
+    CloseHandle(g_stopEvent);
+    g_stopEvent = NULL;
 }
 
 static int InstallService(bool install)
