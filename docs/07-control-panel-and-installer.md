@@ -22,18 +22,28 @@ node, present or not) with the driver that serves it. Selecting a device that ru
 PN-A2DP opens its control interface; everything on the tabs then refers to that
 headset and is saved per headset by the driver (`Services\pna2dp\Parameters\Devices\<bdaddr>`).
 
+Tabs appear in the order of the table below (application 0.1.0.34): Status,
+Quality, Codecs, SBC, AAC, aptX, LDAC, Transport, Headset, Adapter, Driver. A device on
+the Windows driver shows Audio, Quality and Driver. Each device opens on its first tab
+(Status, or Audio in Windows mode); panels from 0.1.0.27 to 0.1.0.30 opened every
+device on Quality.
+
+When the panel starts, or the list is rebuilt with nothing selected, it selects the
+receiver in use: the one whose output is the Windows default, then a streaming one, then
+a connected one, then any PN-A2DP device. An existing selection is kept across refreshes.
+
 | Tab | What it shows / changes |
 |---|---|
+| Status | Live connection state (an idle receiver with signalling up shows as **Connected**; the driver state is `PNA2DP_STATE_DISCOVERING`), codec, format, encoder owner, bitrate and ceiling, estimated latency, sink delay report, MTU, AVDTP version, flags, last NTSTATUS; transport statistics (packets, bytes, drops, queue depth, write completion time, ABR level, codec host round trip); driver version, codec host service state, encoders available. Refreshes on every driver event (pended `WAIT_EVENT` IOCTL on a worker thread) and once a second. |
 | Quality | Background audio checks with suggested settings, a live bitrate chart and recent transport counters, and a local diagnostic export that omits device identifiers. Also available in Windows mode with explicit telemetry limits. See [audio diagnostics](14-audio-diagnostics.md). |
-| Status | Live connection state, codec, format, encoder owner, bitrate and ceiling, estimated latency, sink delay report, MTU, AVDTP version, flags, last NTSTATUS; transport statistics (packets, bytes, drops, queue depth, write completion time, ABR level, codec host round trip); driver version, codec host service state, encoders available. Refreshes on every driver event (pended `WAIT_EVENT` IOCTL on a worker thread) and once a second. |
 | Codecs | Live codec/rate/bitrate, receiver support, live state, and saved or edited settings. Activate selected puts a supported codec first and applies it with SBC fallback. Auto quality + codecs restores automatic selection. The preset picker is a loader, not an indicator of saved settings. SBC cannot be disabled. |
-| SBC | Max bitpool (slider, or the headset's maximum), min bitpool, bitpool override (XQ), dual channel preference, rate / channel mode / block / subband / allocation masks, live bitrate estimate at 44.1 and 48 kHz. |
+| SBC | Max bitpool (slider, or the headset's maximum), min bitpool, bitpool override, dual channel preference, **SBC XQ** checkbox (dual channel, 16 blocks, 8 subbands at the bitpool plain dual channel gets, packed to the radio's EDR packets; it overrides the mode, block and subband choices), rate / channel mode / block / subband / allocation masks, live bitrate estimate at 44.1 and 48 kHz. |
 | AAC | Target and peak bitrate or sink maximum, VBR, AAC-LC, afterburner, rate and channel masks. HE-AAC is not advertised. |
 | aptX | Rate and channel masks for aptX, aptX HD (plus 16/24-bit input) and aptX LL (plus target buffer level). |
 | LDAC | Quality (HQ / SQ / MQ / adaptive), ABR step-down, encoder input format, rate and channel masks, bitrate preview. |
-| Adapter | Actual radio name/address, Classic EDR capability, live health, effective bitrate range and observation counters. Auto quality + codecs detects receiver support and enables adapter-aware limits with live adaptation. |
 | Transport | Target and maximum buffer (sliders), ABR on/off and floor, reconnect delay, persisted volume, behaviour flags (suspend on SCO, auto start, delay reports, expose all rates, software volume). |
 | Headset | AVDTP version, SDP features, every remote SEP decoded (rates, channels, blocks, bitpool, AAC object types and bitrate, services) with the raw IEs. |
+| Adapter | Actual radio name/address, Classic EDR capability, live health, effective bitrate range and observation counters. Auto quality + codecs detects receiver support and enables adapter-aware limits with live adaptation. |
 | Driver | Driver, provider, version, INF, status, **Use PN-A2DP driver** / **Use Windows mode** / **Rescan**. Labelled Test Mode, Secure Boot and Memory Integrity lights; **Requirements...** explains blocked activation. **Windows Security** opens Core isolation; **Windows / Test Mode...** manages next-start Test Mode with confirmation and manual restart. Staged package with stage/remove, codec host service controls and installed plugins. |
 | Audio (Windows mode) | Selected endpoint's volume, mute, format and output status, plus Windows Sound/Bluetooth settings links. |
 
@@ -42,6 +52,27 @@ unaffected. Development-driver activation requires verified package files, actua
 Test Mode ON, Secure Boot OFF and Memory Integrity OFF. The helper rechecks the
 next-start boot mode too. Close the boot-settings dialog before switching drivers;
 a shared operation guard prevents concurrent boot and driver changes.
+
+Under the device list, **Connect** and **Disconnect** act on the selected receiver
+whatever its driver (PN-A2DP 0.1.0.21 or later, or the Windows inbox driver). They send
+the request Windows' own Connect / Disconnect send: a `KSPROPSETID_BtAudio`
+`ONESHOT_RECONNECT` / `ONESHOT_DISCONNECT` GET on the topology filter behind the
+receiver's audio endpoint (active, unplugged or disabled). The request runs off the UI
+thread; the status line reports it, and the device list follows the result through
+driver events, the per-second refresh and two follow-up reads after 2 s and 6 s, keeping
+the selection and tab. Connect is enabled while no audio session is up, Disconnect while
+a session or Bluetooth link is up. A PN-A2DP receiver with no Windows audio output at all
+(every active and unplugged endpoint checked, none belongs to it) falls back to the
+driver's reconnect, which resets the link, so only while the driver reports the session
+idle or failed; an endpoint that could not be checked or reached is reported as such, not
+as a missing output. A pressed button that disables itself hands keyboard focus to the
+other button or to the device list. Demo mode only reports what would happen. The CLI has
+the same commands: `pna2dpctl connect|disconnect [-d N]` for PN-A2DP devices and
+`pna2dpctl windows connect|disconnect [-d N]` for any paired receiver.
+
+The panel does not pair or remove receivers: pair a new receiver, or remove one, in
+Windows Settings > Bluetooth & devices, then press **Refresh**. With no stereo receiver
+paired, the status line points there.
 
 Bottom bar: **Apply** sends the edited `PNA2DP_CONFIG` with `IOCTL_PNA2DP_SET_CONFIG`
 (the driver validates, persists and applies live; bitpool changes go in band), **Revert**
@@ -80,7 +111,7 @@ directly (`--page Driver`).
 Starting with application release **0.1.0.28**, the installer wizard, executable
 version resources, and Apps & features registration all use the application
 release version. The bundled signed kernel keeps its independent driver version
-(currently 0.1.0.17). Packaging rejects a stale control-panel binary instead of
+(0.1.0.21 in application release 0.1.0.34). Packaging rejects a stale control-panel binary instead of
 labelling it as the new app release.
 
 `build.ps1 -Target setup` scans `out\<Config>` and embeds every deliverable it finds as a
@@ -203,6 +234,32 @@ the local gain path is used when receiver-volume integration is unavailable.
 * Build: stale catalogs were embedded around a rebuilt unsigned driver; `install.ps1`
   assigned to the read-only `$host` and skipped `freeaptx.dll`; non-ASCII checkout paths
   broke the installer resource script; a missing plugin submodule aborted the package.
+
+### Control panels 0.1.0.31-0.1.0.34: Connect and Disconnect, tab order, SBC XQ
+
+Released together as v0.1.0.34 with driver 0.1.0.21; see
+[driver review fixes](18-driver-review-fixes.md).
+
+- **Connect** and **Disconnect** buttons under the device list, and
+  `pna2dpctl connect|disconnect` / `pna2dpctl windows connect|disconnect`, as described
+  above. Driver 0.1.0.21 accepts the documented GET form of the one-shot properties
+  (earlier drivers accepted only SET, so Windows Settings' own Connect and Disconnect
+  were rejected for PN-A2DP endpoints). Owner-tested on hardware and reported working;
+  there is no automated log.
+- Tab order Status, Quality, Codecs, SBC, AAC, aptX, LDAC, Transport, Headset, Adapter,
+  Driver (Windows mode: Audio, Quality, Driver); each device opens on its first tab.
+- With no earlier selection the panel opens on the receiver in use (Windows default
+  output, then streaming, then connected, then any PN-A2DP device).
+- The driver state `PNA2DP_STATE_DISCOVERING`, reported whenever signalling is up
+  without a configured stream, is shown as **Connected** in the panel, `pna2dpctl` and
+  the diagnostic export.
+- **SBC XQ** checkbox on the SBC page (`sbc.xq` in the configuration text). XQ never
+  streams below plain dual channel: on receivers that advertise bitpool 53, such as the
+  Sony and the MR5, it gives bitpool 53 = 672 kbps at 48 kHz (by design; the current
+  XQ rule has not yet been played on a receiver). The SBC XQ preset sets it
+  with the receiver's maximum bitpool and no override.
+- `pna2dpctl trace` explains when it is denied for lack of elevation; `sbc_capture` also
+  needs an elevated prompt, and codec host console mode must run as LocalSystem.
 
 ### Control panel 0.1.0.26: service shutdown and responsive operations
 

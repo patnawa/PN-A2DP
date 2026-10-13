@@ -18,7 +18,8 @@ reports a pending change; the selected driver in Device Manager can already say
 Microsoft while the old driver still serves an open audio stream.
 
 Devices on the Microsoft driver show **Quality**, **Audio** and **Driver** tabs
-in panel 0.1.0.27. Quality offers read-only audio checks and diagnostic export;
+in panel 0.1.0.27; application 0.1.0.34 orders them **Audio**, **Quality**, **Driver**
+and opens on Audio. Quality offers read-only audio checks and diagnostic export;
 Bluetooth codec/packet telemetry remains unavailable in this mode.
 Devices on PN-A2DP retain the existing codec and transport tabs.
 Other third-party drivers are explicitly labelled as such; they can use the

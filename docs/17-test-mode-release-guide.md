@@ -1,16 +1,16 @@
-# PN-A2DP 0.1.0.30: download, Test Mode setup and recovery
+# PN-A2DP 0.1.0.34: download, Test Mode setup and recovery
 
-Application **0.1.0.30**, custom driver **0.1.0.18**, Windows x64.
+Application **0.1.0.34**, custom driver **0.1.0.21**, Windows x64.
 This is an **experimental prerelease**, not a Microsoft-signed retail driver.
 
 ## Choose your package
 
 | Download | Purpose | Test Mode required? |
 |---|---|---|
-| `PN-A2DP-0.1.0.30-windows-setup.exe` | Control panel using the existing Windows Bluetooth driver | No |
-| `PN-A2DP-0.1.0.30-windows-portable.zip` | Windows-mode application without installation | No |
-| `PN-A2DP-0.1.0.30-testmode-setup.exe` | Custom PN driver, codec host, control panel and codec plugins | Yes |
-| `PN-A2DP-0.1.0.30-testmode-portable.zip` | Extracted development tools, driver, licenses and codec sources | Yes, to load the PN driver |
+| `PN-A2DP-0.1.0.34-windows-setup.exe` | Control panel using the existing Windows Bluetooth driver | No |
+| `PN-A2DP-0.1.0.34-windows-portable.zip` | Windows-mode application without installation | No |
+| `PN-A2DP-0.1.0.34-testmode-setup.exe` | Custom PN driver, codec host, control panel and codec plugins | Yes |
+| `PN-A2DP-0.1.0.34-testmode-portable.zip` | Extracted development tools, driver, licenses and codec sources | Yes, to load the PN driver |
 
 The full portable archive does not make the kernel driver portable: the driver
 still needs installation and a prepared test computer. The Windows-mode installer
@@ -28,7 +28,7 @@ In PowerShell, open the download folder and compare each file's SHA-256 with the
 matching entry in `SHA256SUMS.txt`:
 
 ```powershell
-Get-FileHash .\PN-A2DP-0.1.0.30-testmode-setup.exe -Algorithm SHA256
+Get-FileHash .\PN-A2DP-0.1.0.34-testmode-setup.exe -Algorithm SHA256
 Get-FileHash .\PN-A2DP-Test-Certificate.cer -Algorithm SHA256
 ```
 
@@ -74,7 +74,9 @@ Close that dialog before driver activation.
 
 ## Verify and trust this release's test certificate
 
-Certificate subject: `CN=PN-A2DP Test Certificate`.
+Certificate subject: `CN=PN-A2DP Test Certificate`. This release uses the same
+development certificate as v0.1.0.30; if you already trusted it for that release, the
+existing trust entries cover this one too.
 
 - SHA-1 thumbprint (certificate identifier):
   `12EE1EAE30E0DEACCFB2870C393D3C148B1E210E`
@@ -108,12 +110,16 @@ loading of this development driver.
 
 ## Install and activate
 
-1. Pause music and close PN-A2DP Control Panel after saving or discarding edits.
-2. Pair your receiver in Windows Bluetooth settings and keep it powered on.
+1. **Stop playback** and close PN-A2DP Control Panel after saving or discarding edits.
+   If audio is playing during installation, the old driver stays loaded until you
+   restart Windows: `pnputil` cannot restart a device that is pending a restart.
+2. Pair your receiver in Windows Bluetooth settings and keep it powered on. For a
+   receiver with separate classic and BLE entries (for example the EDIFIER MR5), pair
+   the classic entry; the BLE entry carries no audio.
 3. From the download folder, launch the development installer explicitly:
 
    ```powershell
-   .\PN-A2DP-0.1.0.30-testmode-setup.exe --allow-test-driver
+   .\PN-A2DP-0.1.0.34-testmode-setup.exe --allow-test-driver
    ```
 
 4. Accept the administrator prompt if you intend to install. Keep the default
@@ -136,10 +142,20 @@ computer. Existing codec settings are retained on upgrade. A new Windows audio
 endpoint ID can be assigned during installation; reselect the named receiver if
 an application was pinned to its old endpoint.
 
+Setup restarts the codec host service. If a receiver is playing through a host codec
+(AAC, aptX, LDAC) at that moment, the driver falls back to SBC and several seconds of
+audio can drop; the better codec returns at the next playback start.
+
+While the development driver is installed, a receiver you pair later binds to the
+PN-A2DP driver automatically, because its INF outranks Microsoft's by date. Use
+**Driver > Use Windows mode** for any receiver that should stay on Microsoft's
+driver. The panel's **Connect** and **Disconnect** buttons, like Windows Settings'
+own buttons, connect or disconnect the selected receiver.
+
 For inspection without installing, the development package supports:
 
 ```powershell
-.\PN-A2DP-0.1.0.30-testmode-setup.exe --check --allow-test-driver --report .\pn-preflight.txt
+.\PN-A2DP-0.1.0.34-testmode-setup.exe --check --allow-test-driver --report .\pn-preflight.txt
 ```
 
 This checks signature/payload and the current Test Mode policy; a successful
@@ -179,16 +195,28 @@ not change that.
 
 ## Tested and still unverified
 
-On one Windows/Sony CMT-SBT40D/Qualcomm machine: SBC at **48 kHz / 672 kbps**,
-three reconnects in **2.18–2.60 seconds** without new transport errors, retained
-preferences, and **user-confirmed clear music, normal loudness and working
-Windows volume/mute**. The software run passed 29 verification groups, seven
-Windows-mode checks, seven signing checks and 31 live KS checks.
+On one Windows 11 / Qualcomm FastConnect 7800 machine:
 
-AAC/aptX/LDAC have software validation but no physical receiver confirmation in
-this release. LDAC independent decoding, confirmed physical-disconnect recovery,
+- **Sony CMT-SBT40D (SBC only), driver 0.1.0.19:** SBC at **48 kHz / 672 kbps**, a
+  15-second check without transport errors, and three reconnects of about
+  **2.4 seconds** with the saved volume stable.
+- **EDIFIER MR5 (SBC + LDAC), driver 0.1.0.20:** LDAC SQ (660 kbps) and **LDAC HQ
+  (990 kbps)** for 30 seconds with no drops or write failures, three reconnects of
+  about **0.3 seconds**, and no crackle in the owner's listening check.
+- **Driver 0.1.0.21** installed without a restart with playback stopped. Its
+  Connect / Disconnect support was tested by the owner and reported working; there is
+  no automated log. Its playback was not re-measured, and the Sony was not re-tested
+  after 0.1.0.19.
+
+The software run passed all 34 verification checks, including 57,229 core checks
+under AddressSanitizer, an end-to-end audio-quality harness (977 jobs, no defect
+flags) and independent decoding of SBC, AAC and the aptX family.
+
+AAC and the aptX family have software validation but no physical receiver
+confirmation. LDAC independent decoding, confirmed physical-disconnect recovery,
 sleep/wake, host-encoded hardware failure recovery, broader adapters/receivers,
-Driver Verifier and HLK remain incomplete. No universal compatibility or
+Driver Verifier and HLK remain incomplete. Under heavy congestion dual-channel SBC
+can drop to a distorted lowest step (about 132 kbps). No universal compatibility or
 production readiness is claimed. Codec licenses and corresponding-source bundles
 are included; those do not establish patent clearance or product certification.
 
@@ -199,8 +227,10 @@ are included; those do not establish patent clearance or product certification.
   และ Memory Integrity OFF ตามข้อกำหนดของรุ่นนี้ แล้วรีสตาร์ตและตรวจสถานะก่อนติดตั้ง
 - ตรวจ hash/ลายนิ้วมือใบรับรองตามด้านบนก่อนเพิ่ม Root และ TrustedPublisher
 - เปิดตัวติดตั้งด้วย `--allow-test-driver`; ตัวติดตั้งไม่ปิดระบบป้องกันและไม่รีสตาร์ตเอง
+- หยุดเล่นเสียงก่อนติดตั้ง ถ้ายังเล่นเสียงอยู่ ไดรเวอร์เดิมจะยังทำงานจนกว่าจะรีสตาร์ต Windows
+- อุปกรณ์ที่จับคู่ใหม่ระหว่างที่ติดตั้ง PN-A2DP อยู่ จะใช้ไดรเวอร์ PN-A2DP อัตโนมัติ; ใช้ Driver > Use Windows mode เพื่อย้ายกลับ
 - ก่อนปิด Test Mode ให้เปลี่ยนทุกอุปกรณ์กลับเป็น Windows mode หรือถอน PN-A2DP ก่อน
 - ถ้าเปิด BitLocker/Device Encryption ต้องเตรียม recovery key ก่อนแก้การตั้งค่า boot/firmware
 
 For exact source and validation details, use the release tag in the repository:
-[v0.1.0.30](https://github.com/patnawa/PN-A2DP/tree/v0.1.0.30).
+[v0.1.0.34](https://github.com/patnawa/PN-A2DP/tree/v0.1.0.34).

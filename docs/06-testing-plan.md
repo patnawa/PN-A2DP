@@ -1,5 +1,39 @@
 # Testing and verification
 
+## Review fixes, application 0.1.0.34 / driver 0.1.0.21 (2026-10-13)
+
+Full record: [driver review fixes](18-driver-review-fixes.md).
+
+**Software.** `build/verify.ps1 -Sign -Sanitize -Interop` passed all **34** checks:
+**57,229** core checks (26,199 at 0.1.0.30), also under AddressSanitizer, including
+50,000 malformed packet inputs; the new end-to-end audio-quality harness
+(`tools/audio-test/quality_test.cpp`, `build.ps1 -Target quality-tests`, run by
+`verify.ps1 -Interop`) with **977** jobs and **0** defect flags, plus one known issue
+measured within its recorded bounds (#31, the dual-channel SBC ABR floor at bitpool 8,
+about 132 kbps, audibly distorted under heavy congestion); FFmpeg independent decoding
+of SBC **19/19** and AAC/aptX/aptX HD/aptX LL **28/28**; 72 audio-health checks; the
+driver with `/WX` and zero warnings in Release and Debug, `/analyze` at its baseline of
+23 warnings (all in SDK/WDK headers), ApiValidator "All binaries are Universal", a valid
+INF, `/CETCOMPAT` and `/Qspectre`. LDAC still has no independent decoder test. The CI
+workflow is manual-only and has not run.
+
+**Hardware** (Windows 11 build 26300, Qualcomm FastConnect 7800):
+
+| Receiver / action | Driver | Observed result |
+|---|---|---|
+| Sony CMT-SBT40D, SBC only | 0.1.0.19 | SBC 48 kHz dual channel, bitpool 53 = 672 kbps; 15-second transport check, 1,928 packets, no errors; three software reconnects of about 2.39 s, each back at 672 kbps; saved volume stable across reconnects |
+| EDIFIER MR5 (advertises SBC and LDAC; AVDTP 1.4; media MTU 679) | 0.1.0.20 | LDAC SQ 660 kbps, 15 s: pass. LDAC HQ 990 kbps, 30 s: pass, 5,777 packets, 0 drops, write failures or latency trims, worst write completion about 11.7 ms. Three reconnects of about 0.28 s. Owner listening check: no crackle on LDAC HQ |
+| Codec-host service restart during LDAC playback (by the installer) | 0.1.0.20 | Fallback to kernel SBC as designed; several seconds of audio dropped (ring overflow) during the switch; LDAC returned at the next stream start |
+| Install of driver 0.1.0.21 and app 0.1.0.34 | 0.1.0.21 | No reboot needed with no audio playing; driver reports 0x00010015. Installing while audio plays leaves the old driver loaded until a reboot |
+| Newly paired receiver | 0.1.0.20 | Bound to PN-A2DP automatically (its INF outranks Microsoft's by date) |
+| Connect / Disconnect (panel and Windows Settings) | 0.1.0.21 | Owner-tested, reported pass; no automated log |
+
+Not covered: playback measurements on driver 0.1.0.21; the Sony on 0.1.0.20 or later
+(including SBC XQ); SBC on the MR5; AAC and aptX-family receivers; spatial playback
+(Windows reports Sonic, Dolby Atmos for Headphones and DTS Headphone:X as supported on
+the MR5 endpoint); sleep/wake; a confirmed physical power-cycle recovery;
+receiver-initiated and multipoint flows; Driver Verifier and HLK.
+
 ## Reliability update, application 0.1.0.30 / driver 0.1.0.18 (2026-10-12)
 
 Built and installed on this Sony/Qualcomm machine. **29 software groups** passed,

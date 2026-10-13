@@ -24,6 +24,8 @@ and adapter policy. This preserves volume, buffering and the configured bitrate 
   approximately 250 ms windows. Sustained congestion for one second can reduce
   bitrate, with at least two seconds between reductions. Short isolated spikes
   do not change quality. Completion time is host transport latency, not RSSI.
+  Driver 0.1.0.19 changes what counts as slow and how far one reduction can go;
+  see [below](#driver-0119-changes-software-verified-only).
 - Driver 0.1.0.18 raises quality after 30 seconds of continuously healthy traffic,
   then 10 seconds for the next step and 5 seconds for later steps. Idle periods,
   congestion and long scheduling gaps reset accelerated recovery. A reduction within
@@ -53,6 +55,103 @@ now selects from the receiver's advertised capabilities at the Windows stream's
 rate and applies the existing adapter limit. Stream reconfiguration compares rate
 and SBC channel mode, leaving automatic in-band bitrate reductions alone.
 
+## Driver 0.1.0.19 changes (software-verified only)
+
+These changes pass the policy simulations in `core_test`. On hardware, the Sony's SBC
+stream held 672 kbps on driver 0.1.0.19 and the EDIFIER MR5 streamed LDAC HQ at 990 kbps
+for 30 seconds without drops on driver 0.1.0.20; neither run reported congestion, so the
+reduction and recovery paths below have not been exercised on a receiver. The full list
+is in [driver review fixes](18-driver-review-fixes.md).
+
+**Signals.** Each write's own send time is measured: its completion minus the later
+of its submission and the previous write's completion, so time spent queued behind
+other writes no longer counts. A write is *slow* when that send time exceeds the
+media time it carries (taken from its PCM frames, so small VBR AAC units are not
+misjudged) plus a fixed 10 ms allowance: 18 ms on the Sony path, where 0.1.0.18
+compared completion latency, queueing included, with twice the media time plus
+10 ms (26 ms). Congestion is attributed to the link only when the link is the cause:
+*backlog* counts only while the TX queue was full, a full queue that delivered less
+than 90 % of real time counts as slow, and latency trims while the TX queue had room
+(the codec host starving the pump) are not congestion. *Pressure* now means packets
+dropped because the TX queue was full. A write slower than four times its media time
+(at least 20 ms) is a stall and is left out of the throughput estimate.
+
+**Reductions.** A latency trim caused by the link reduces the bitrate at once,
+skipping the 1-second confirmation and the 2-second cooldown, but only once per stall
+episode; a clean window re-arms it. When the TX queue was full, a reduction jumps to
+the first rung at or below 0.8 times the measured sustained payload throughput
+(at least four measured writes needed); otherwise it steps one rung. In the
+half-throughput simulation this settles after one trim in 500 ms, where the 0.1.0.18
+controller needed 15 trims and 12 seconds. Recovery is unchanged: 30, 10, then
+5 seconds per step, 60 seconds after a quick relapse. Because one decision can now
+skip several rungs, `AbrDowngrades` counts decisions, not rungs, and getting back to
+full quality after a deep cut takes longer.
+
+**Ladders.** The SBC ladder gains one rung whose packets fit a single 2-DH5 baseband
+packet, so ABR level numbers below the top shift by one. AAC is capped so every access
+unit fits one media packet (about 300 kbps at 44.1 kHz with MTU 895, 320 kbps at
+48 kHz); its rungs are the 320/256/192/128/96 kbps steps strictly below that cap, so the
+first reduction lowers the bitrate even when the cap is below 256 kbps.
+
+**Packet sizing.** SBC frames per packet are also limited to the local radio's largest
+baseband packet (after the 4-byte L2CAP header: 1017 bytes for 3-DH5, 675 for 2-DH5,
+548/363 for 3-slot EDR, 335 for DH5): the frame count up to the MTU's with the fewest
+air slots per frame. The packing is recomputed at every ABR rung and live bitpool change,
+so a lower rung also sends fewer packets and no rung overflows the MTU; with unknown radio
+data the old MTU rule applies. aptX packets carry 4-byte (aptX HD 6-byte) codewords in
+multiples of 8 (160 at most, aptX LL 112). The media MTU the
+driver requests is min(1024, one 3-DH5 = 1017) on 3 Mb/s EDR or unknown radios,
+675 on 2 Mb/s-only radios and 1013 (three DH5) on Basic Rate radios. The pump uses the
+smaller of the receiver's MTU and that cap, except on 2 Mb/s-only radios, where it keeps
+the receiver's MTU and lets the SBC packing choose. On this PC's 3 Mb/s FastConnect 7800
+the Sony keeps MTU 895 and 3 dual-channel frames (685 bytes) per packet.
+
+**SBC XQ** (`sbc.xq=1`, SBC page checkbox, default off) asks for dual channel,
+16 blocks and 8 subbands at the bitpool plain dual channel gets from the same receiver,
+MTU and radio (the receiver's maximum within the MTU: bitpool 53 = 617 kbps at 44.1 kHz,
+672 kbps at 48 kHz). It never streams below that: the earlier fixed points (47 for a
+3-DH5 link, 38 otherwise) gave the Sony 600 or 492 kbps instead of 672, and five
+200-byte frames never fit its 895-byte MTU. What XQ adds is the channel mode (a receiver
+whose bitpool limit is a joint-stereo budget, e.g. 35, gets 456 instead of 249 kbps) and
+the packing: frames are packed to the EDR packet both the adapter and the receiver take
+(3-DH5 only with a receiver known to do 3 Mb/s EDR, from `IOCTL_BTH_GET_RADIO_INFO`;
+2-DH5 otherwise), choosing the frame count with the fewest baseband slots per frame. The
+ABR's "fits 2-DH5" rung trades bitrate for air time only under congestion. XQ has had no
+listening or receiver test; some receivers that advertise bitpool 53 for joint stereo may
+not decode dual-channel bitpool 53 reliably.
+
+**Stalls.** When media writes stop completing for 2 seconds, the driver probes the
+receiver before tearing anything down; a short radio fade that recovers keeps the
+stream and the bitrate policy continues from its current level.
+
+## Driver 0.1.0.20: ladder changes from the audio-quality phase
+
+- **SBC packing follows the bitpool.** Frames per packet are recomputed at every ABR rung
+  and live bitpool change. Before, a bitpool lowered live and kept across a pause sized
+  the packets for the low bitpool, and the next raise sent packets over the MTU, which
+  were all dropped. Lower rungs now also send fewer packets: on the Sony, bitpool 26
+  costs 321 instead of 500 baseband slots per second.
+- **AAC reductions are CBR.** VBR applies only at the top level; each reduction is CBR
+  at the rung's bitrate, so the first step lowers the bitrate (see
+  [volume and audio quality](08-volume-and-audio-quality.md)).
+- **aptX** packets fill the MTU in multiples of 8 codewords, up to a 160-codeword cap;
+  the codec's bitrate is still
+  fixed and cannot be reduced in band.
+- **LDAC** is refused on a media MTU below 679 bytes and the next codec is tried.
+- **Codec-host stalls** count once per stall (plus once per further 500 ms), so a short
+  hiccup no longer quarantines the host.
+
+**Known issue #31: the dual-channel SBC floor.** With dual channel (the Sony's SBC
+configuration at 672 kbps, and SBC XQ), the 128 kbps ABR floor can be reached
+at bitpool 8 per channel, about 132 kbps, which is audibly distorted. It is reached only
+under heavy, sustained congestion. A higher dual-channel floor (bitpool 19-20, 250-276
+kbps) turned codec noise into latency trims and gaps on a link that sustains only
+150-200 kbps; the proper fix, reconfiguring to joint stereo below about 357 kbps, is a
+mid-stream renegotiation with an audible gap and has not been implemented. The
+audio-quality harness records it (THD+N -48.4 dB at -6 dBFS, pink-noise SNR 8.4 dB, HF
+burst +15.6 dB) and fails if it measures worse. Joint stereo at the same rate measures
+-62.6 dB THD+N.
+
 ## Limits and interpretation
 
 Bluetooth version, manufacturer ID, LE features and PHY rate cannot establish
@@ -72,9 +171,10 @@ enables ABR using the saved SBC settings. The existing
 bounded queue, latency guard and encoder-failure fallback remain active.
 
 Automatic quality does not add codecs to the receiver, create lossless bandwidth,
-or guarantee uninterrupted playback under all conditions. Only the Sony SBC path
-has been exercised on physical receiver hardware here. Other codecs have software
-negotiation, policy, encoder and decoder regression coverage.
+or guarantee uninterrupted playback under all conditions. On physical receivers here,
+only the Sony's SBC path and the EDIFIER MR5's LDAC path (SQ and HQ) have been
+exercised, without congestion. Other codecs have software negotiation, policy, encoder
+and decoder regression coverage.
 
 ## Implementation and verification
 

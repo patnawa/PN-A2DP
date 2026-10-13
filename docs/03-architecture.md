@@ -37,37 +37,58 @@ and `02-windows-bluetooth-audio-internals.md`.
 * **pna2dp-codechost.exe** is a Windows service that keeps several `GET_WORK` requests
   pended on each device's control interface. The driver completes a request with a block
   of PCM; the host encodes it with a plugin and returns the payload with `PUT_RESULT`.
-  If the service is absent or slow, the driver falls back to its in-kernel SBC encoder
-  and renegotiates the stream.
+  If the service is absent, the driver falls back to its in-kernel SBC encoder and
+  renegotiates the stream. Since driver 0.1.0.19 repeated host failures (four in a row)
+  quarantine the host for 30 s, then 2 min, then 10 min; it counts as absent meanwhile,
+  and a stream that fell back to SBC returns to the better codec at the next START or
+  pause once the quarantine ends. Only the LocalSystem service may register as a host.
 * **pna2dpctl.exe** is the control tool (and the reference for a GUI): status, remote
   capabilities, configuration, statistics, event watch, reconnect.
 
 ## 2. Data path and timing
 
 1. The audio engine writes PCM into the WaveRT cyclic buffer and advances packets
-   (event-driven mode). `CPnMiniportWaveRTStream::Tick` runs every 1 ms on a
-   high-resolution timer, computes how many bytes are due at the nominal rate, copies
-   them into the pump's PCM ring and signals notification events at packet boundaries.
-   The engine is therefore the clock; the Bluetooth path never drifts against it.
-2. The pump thread (priority 18) wakes on new PCM or on write completions, converts the
-   ring data to the encoder's input format (S16/S24/S32/F32, software volume if
-   enabled), and either encodes SBC in the kernel or ships blocks to the codec host.
+   (event-driven mode). `CPnMiniportWaveRTStream::Tick` runs on a high-resolution timer
+   (every 2 ms for notification intervals of 5 ms or more, otherwise every 1 ms),
+   computes how many frames are due at the nominal rate, copies them into the pump's
+   PCM ring and signals notification events at packet boundaries. The engine is the
+   clock. Since driver 0.1.0.19 the frames due are computed with an exact remainder,
+   so a one-hour simulation shows no drift; the earlier rounding lost up to about
+   178 ms per hour. A packet the engine has not written in time is sent as silence.
+2. The pump thread (priority 18) wakes when a PCM write completes an encoder block, on
+   write completions and on codec-host work, with a 4 ms safety tick. It converts the
+   ring data to the encoder's input format (S16/S24/S32/F32; software volume with a
+   ramp across one block; TPDF dither for 16-bit host input; exact 2:1 decimation when
+   the engine runs at twice the codec rate) and either encodes SBC in the kernel from
+   24-bit-precision input or ships blocks to the codec host.
 3. Encoded frames are wrapped per codec (RTP header + 1-byte frame header for SBC and
    LDAC, RTP only for AAC and aptX HD, bare for aptX and aptX LL) and written to the
    L2CAP media channel with a bounded number of writes in flight.
-4. A latency guard trims the ring when it exceeds `MaxLatencyMs`; the ABR controller
-   watches write completion latency and queue depth, lowers the bitrate ladder
-   (SBC bitpool, LDAC EQMID, AAC bitrate) after sustained congestion and raises it again
-   after 30 seconds of continuously healthy traffic. Idle time does not count. SBC bitpool and LDAC EQMID changes are in band and need no
-   AVDTP signalling.
-5. Latency is reported back to Windows through `GetHWLatency` and the presentation
-   position (ring fill + packets in flight + measured completion time + the sink's AVDTP
-   delay report), so players can lip-sync.
+4. A latency guard trims the ring when it exceeds `MaxLatencyMs` (at most 500 ms;
+   the trim crossfades over 4 ms). The ABR controller watches each write's own send
+   time, TX-queue-full events, failures and backlog, lowers the bitrate ladder
+   (SBC bitpool, LDAC EQMID, AAC bitrate) after congestion caused by the link and raises
+   it again after 30 seconds of continuously healthy traffic. Idle time does not count.
+   SBC bitpool and LDAC EQMID changes are in band and need no AVDTP signalling. See
+   `10-adapter-quality.md`.
+5. Latency reaches Windows through the presentation position: PCM in the ring, at the
+   codec host, in queued results and in L2CAP writes, plus one write's measured send
+   time, plus the sink delay (the AVDTP delay report, or a per-codec default when the
+   receiver does not report). The position changes smoothly (at most 1 % of real time),
+   never goes backwards within a run and resets at a stream start or stop. `GetHWLatency`
+   reports zero: this software endpoint has no DMA FIFO, and a non-zero value made
+   Windows' format probes fail.
 
 ## 3. Connection state machine (device.cpp)
 
-Everything is driven by `Reconcile()`, which runs under the device mutex from work items
-and makes reality match `AudioRequest`:
+Everything is driven by `Reconcile()`, which runs in the device workers under the state
+mutex and makes reality match `AudioRequest`. Since driver 0.1.0.19 audio-engine,
+KS property and IOCTL threads never take that mutex or wait for Bluetooth I/O: they
+record an intent (stream opened or closed, new configuration, reconnect, disconnect)
+under a short intent mutex and queue the worker. The AVDTP session has a command lock
+(one outgoing procedure at a time, held across its transaction) and a short stream lock
+that is never held across a wait, so the acceptor answers the receiver while our command
+is outstanding. The lock order is documented in `device.h` and `avdtp.h`.
 
 ```
 want = audio RUN && stream open && !(SCO active && SuspendOnSco)
@@ -83,11 +104,20 @@ not want:
                        SUSPEND
 ```
 
+Since driver 0.1.0.19: every failed pass arms a retry (1.5 s, doubling, capped at 30 s);
+a receiver SUSPEND is respected (no START for 8 s unless playback restarts or the receiver
+STARTs, one timed START per episode); a media stall of 2 s is probed with
+GET_CAPABILITIES before the stream is aborted; and an ACL-down event closes the session.
+Details are in `18-driver-review-fixes.md`.
+
 Remote-initiated flows are handled by the AVDTP acceptor: incoming L2CAP connections to
 PSM 0x19 from the paired address become the signalling channel and later the media
-channel; remote DISCOVER/GET_CAPABILITIES see our local SEPs (one per codec), remote
-SET_CONFIGURATION/OPEN/START/SUSPEND/CLOSE/ABORT/DELAYREPORT update the state and
-`Reconcile` reacts.
+channel; remote DISCOVER/GET_CAPABILITIES see our local SEPs (one per codec; a codec that
+is disabled or has no registered encoder is reported in use, SBC is always available),
+remote SET_CONFIGURATION/OPEN/START/SUSPEND/CLOSE/ABORT/DELAYREPORT update the state and
+`Reconcile` reacts. After a remote SET_CONFIGURATION the driver waits up to 1.5 s for the
+receiver's own OPEN before sending one. Commands that cross ours are resolved by the
+collision rules in `transport_policy.h`.
 
 HCI events from the radio (`GUID_BLUETOOTH_HCI_EVENT`) detect SCO links to the same
 address: by default the stream is suspended while a call is active and resumed after.
@@ -95,11 +125,14 @@ address: by default the stream is suspended while a call is active and resumed a
 ## 4. Codec selection
 
 `PNA2DP_CONFIG.CodecPriority` (default LDAC > aptX HD > AAC > aptX > aptX LL > SBC) is
-walked; a codec is used when it is enabled, the sink has a free sink SEP for it, and an
-encoder exists (kernel SBC, or a registered host plugin with pended work requests).
-`A2dpSelectConfig` intersects the sink capabilities with user preferences and the
-engine's current sample rate and bit depth, preferring the engine rate so that no
-resampling happens, and 24-bit input for LDAC and aptX HD.
+walked; a codec is used when it is enabled, the sink has a sink SEP for it, and an
+encoder exists (kernel SBC, or a registered, non-quarantined host plugin with pended
+work requests). SEPs the sink reports in use are tried last, and a (codec, SEID) pair
+the sink refused is skipped for the rest of the session. `A2dpSelectConfig` intersects
+the sink capabilities with user preferences and the engine's current sample rate and
+bit depth, preferring the engine rate so that no resampling is needed, and 24-bit input
+for LDAC and aptX HD. A 96 or 88.2 kHz engine may use a sink at exactly half that rate
+through the pump's 2:1 decimator; no other rate conversion exists.
 
 ## 5. User-mode interface
 
@@ -108,14 +141,18 @@ on the Bluetooth device node, so one instance exists per headset. IOCTLs are buf
 versioned (`PNA2DP_ABI_VERSION`) and documented in `driver/pna2dp/inc/pna2dp_public.h`:
 version, status, capabilities, get/set config (applied live; SBC bitpool changes in
 band), wait-event (pended IRP completed on state/caps/config/SCO/delay events), stats,
-reconnect, and the codec-host protocol.
+reconnect, and the codec-host protocol. Each handle gets a role from the caller's token
+when it is opened (`control_access.h`): any user may use the status, configuration,
+event, statistics and reconnect requests that the unelevated panel needs; the trace and
+SBC sample need an elevated administrator; the codec-host requests and unknown codes
+need LocalSystem.
 
 ## 6. Differences from the Alternative A2DP Driver
 
 | Area | Alternative A2DP | PN-A2DP |
 |---|---|---|
 | Codec execution | all in kernel | SBC in kernel, everything else in a user-mode plugin host (crash isolated, LGPL/Apache isolated, upgradable) |
-| Fallback | none (no sound without license) | automatic SBC fallback when a host codec is unavailable |
+| Fallback | none (no sound without license) | automatic SBC fallback when a host codec is unavailable; a failing host is quarantined and the codec returns automatically |
 | Applying changes | reconnect required | live: in-band for bitpool/EQMID, AVDTP RECONFIGURE for rate, renegotiation otherwise |
 | Latency to apps | not reported | measured path latency + AVDTP delay reports exposed through WaveRT |
 | Remote initiated streams | supported | supported, including remote SET_CONFIGURATION with codec validation |
@@ -128,8 +165,10 @@ reconnect, and the codec-host protocol.
 
 * Sink role (PC as a Bluetooth speaker) through the `{0000110a-...}` PDO and a capture
   pin; the SBC decoder already exists in `common/sbc`.
-* Kernel resampler for sinks that cannot run at the engine's rate (today the format
-  table is restricted to supported rates and a mismatch is logged).
+* General kernel resampler for sinks that cannot run at the engine's rate. Today the
+  format table offers 16-bit 48/44.1 kHz always and other rates only when an enabled
+  sink codec supports them; exact 2:1 decimation (96 -> 48, 88.2 -> 44.1 kHz) is the only
+  conversion.
 * FastStream / aptX LL bidirectional back-channel.
 * HLK test pass and attestation-signed releases.
 

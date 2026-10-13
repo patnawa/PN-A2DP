@@ -1,7 +1,9 @@
 # Audio diagnostics and live quality
 
-Panel 0.1.0.27 opens each device on the **Quality** page. It is available in both
-PN-A2DP and Windows mode and does not alter codec, volume, driver or boot settings.
+The **Quality** page is available in both PN-A2DP and Windows mode and does not alter
+codec, volume, driver or boot settings. Panels from 0.1.0.27 to 0.1.0.30 opened each
+device on it; in application 0.1.0.34 a device opens on its first tab (Status, or Audio
+in Windows mode) and Quality is the second tab.
 
 ## Check my audio
 
@@ -63,6 +65,33 @@ receiver/encoder SBC support and no unsaved edits. Clicking it saves SBC first i
 the codec preference list and enables ABR using the saved SBC settings; playback
 may briefly interrupt. It never silently changes codecs, and a 60-second cooldown
 prevents repeated requests. Settings on other codec pages remain saved.
+
+## Status flags, counters and state names (driver 0.1.0.19 and later)
+
+The driver reports these additions to ABI 1 (`pna2dp_public.h`); older drivers leave
+them 0.
+
+| Field | Meaning | Where it appears |
+|---|---|---|
+| `PNA2DP_STATUS_FLAG_REMOTE_SUSPENDED` (0x200) | The receiver suspended the stream; the driver waits instead of restarting it at once | Status page flags: "suspended by receiver" |
+| `PNA2DP_STATUS_FLAG_UNREACHABLE` (0x400) | Link lost or media stalled without an answer; the driver is retrying | Status page flags: "receiver unreachable" |
+| `PNA2DP_STATUS_FLAG_HALF_RATE` (0x800) | The engine runs at twice the codec rate and the 2:1 decimator is active | Status page flags: "2:1 rate conversion" |
+| `PNA2DP_STATS.WaveStarvedPackets` | Packets the Windows engine had not written in time; sent as faded silence | `pna2dpctl stats`: "starved packets" |
+| `PNA2DP_STATS.RingOverflowEvents` | PCM ring overruns: the oldest audio was discarded (events, not bytes) | `pna2dpctl stats`: "overflows" |
+| `PNA2DP_STATS.FragmentedPackets` | AAC access units that needed more than one RTP packet | `pna2dpctl stats`: "AAC fragmented sends" |
+| `PNA2DP_STATS.HostDroppedBlocks` | Encode blocks lost at the codec host (invalid or unanswered results) | `pna2dpctl stats`: "dropped blocks" |
+
+`PNA2DP_STATS.Underruns` keeps its historical name but counts latency-guard trims
+(shown as "latency trims"); WaveRT starvation is `WaveStarvedPackets`.
+
+`SinkReportedDelayUs` is the receiver's AVDTP delay report and is 0 when none was
+negotiated or received (driver 0.1.0.20 and later). `EstimatedLatencyUs` still adds a
+per-codec default sink delay when the receiver does not report one.
+
+In application 0.1.0.34 the driver state `PNA2DP_STATE_DISCOVERING` is shown as
+**Connected** in the panel, `pna2dpctl`, quality events and the diagnostic export. The
+driver reports it whenever signalling is up without a configured stream, which is mostly
+a connected, idle receiver; discovery itself takes well under a second.
 
 ## Diagnostic export
 
