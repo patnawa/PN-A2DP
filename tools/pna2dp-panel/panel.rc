@@ -21,7 +21,9 @@ BEGIN
     LTEXT           "Select a device", IDC_OUTPUT_TITLE, 210, 6, 400, 24, SS_NOPREFIX
     LTEXT           "", IDC_OUTPUT_SUMMARY, 210, 32, 400, 22, SS_NOPREFIX
     LTEXT           "YOUR DEVICES", IDC_DEVICE_LABEL, 7, 46, 195, 12
-    CONTROL         "", IDC_DEVICES, WC_LISTVIEW, WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | LVS_NOCOLUMNHEADER, 7, 60, 195, 238
+    CONTROL         "", IDC_DEVICES, WC_LISTVIEW, WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | LVS_NOCOLUMNHEADER, 7, 60, 195, 222
+    PUSHBUTTON      "Connect", IDC_BT_CONNECT, 7, 286, 56, 14
+    PUSHBUTTON      "Disconnect", IDC_BT_DISCONNECT, 146, 286, 56, 14
     PUSHBUTTON      "Refresh", IDC_REFRESH, 7, 302, 56, 14
     PUSHBUTTON      "About", IDC_ABOUT, 146, 302, 56, 14
     CONTROL         "", IDC_TAB, WC_TABCONTROL, WS_TABSTOP | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED, 210, 58, 413, 240
@@ -198,8 +200,8 @@ BEGIN
     EDITTEXT        IDC_SBC_MIN_EDIT, 72, 32, 30, 12, ES_NUMBER | ES_AUTOHSCROLL
     CONTROL         "", IDC_SBC_MIN_SPIN, UPDOWN_CLASS, UDS_ALIGNRIGHT | UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS, 102, 32, 10, 12
     LTEXT           "(the ABR controller never goes below this)", -1, 118, 34, 200, 10
-    CONTROL         "Allow a bitpool above the headset's advertised maximum (SBC XQ; a headset may reject it)", IDC_SBC_OVERRIDE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 49, 380, 10
-    CONTROL         "Prefer dual channel over joint stereo (each channel gets its own bitpool, XQ style)", IDC_SBC_DUAL, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 62, 380, 10
+    CONTROL         "Allow a bitpool above the headset's advertised maximum (a headset may reject it)", IDC_SBC_OVERRIDE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 49, 380, 10
+    CONTROL         "Prefer dual channel over joint stereo (each channel gets its own bitpool)", IDC_SBC_DUAL, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 62, 380, 10
 
     GROUPBOX        "Sample rates", -1, 4, 82, 96, 76
     CONTROL         "16 kHz", IDC_SBC_R16, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 106, 80, 10
@@ -222,8 +224,9 @@ BEGIN
     GROUPBOX        "Allocation", -1, 332, 82, 64, 52
     CONTROL         "Loudness", IDC_SBC_ALOUD, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 338, 106, 54, 10
     CONTROL         "SNR", IDC_SBC_ASNR, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 338, 118, 54, 10
-    LTEXT           "", IDC_SBC_BITRATE, 4, 164, 392, 22, SS_NOPREFIX
-    LTEXT           "", IDC_SBC_NOTE, 4, 190, 392, 68, SS_NOPREFIX
+    CONTROL         "SBC XQ: dual channel, 16 blocks, 8 subbands, packed to the radio packets (overrides the choices above)", IDC_SBC_XQ, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 162, 386, 10
+    LTEXT           "", IDC_SBC_BITRATE, 4, 176, 392, 22, SS_NOPREFIX
+    LTEXT           "", IDC_SBC_NOTE, 4, 200, 392, 58, SS_NOPREFIX
     CONTROL         "Auto", IDC_SBC_RAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 94, 80, 10
     CONTROL         "Auto", IDC_SBC_CAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 110, 94, 80, 10
     CONTROL         "Auto", IDC_SBC_BAUTO, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 210, 94, 48, 10

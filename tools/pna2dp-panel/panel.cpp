@@ -17,6 +17,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include <windows.h>
+#include <objbase.h>
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -54,6 +55,8 @@
 #define TIMER_STATS           1
 #define TIMER_DEMO            2
 #define TIMER_HEALTH          3
+#define TIMER_CONNECT_EARLY   4   /* re-read the connection state after Connect / Disconnect */
+#define TIMER_CONNECT_LATE    5
 
 static HINSTANCE g_inst;
 
@@ -169,7 +172,14 @@ static ULONG GetUInt(HWND dlg, int id) { return (ULONG)_wtol(GetText(dlg, id).c_
 static void SetUInt(HWND dlg, int id, ULONG v) { SetDlgItemInt(dlg, id, v, FALSE); }
 static bool Checked(HWND dlg, int id) { return IsDlgButtonChecked(dlg, id) == BST_CHECKED; }
 static void Check(HWND dlg, int id, bool v) { CheckDlgButton(dlg, id, v ? BST_CHECKED : BST_UNCHECKED); }
-static void EnableItem(HWND dlg, int id, bool v) { EnableWindow(GetDlgItem(dlg, id), v); }
+static void EnableItem(HWND dlg, int id, bool v)
+{
+    HWND item = GetDlgItem(dlg, id);
+    /* Disabling the focused control would leave the dialog without keyboard focus (Tab and
+     * Space dead until a click): move focus to the next control first. */
+    if (!v && item && GetFocus() == item) SendMessageW(GetAncestor(item, GA_ROOT), WM_NEXTDLGCTL, 0, FALSE);
+    EnableWindow(item, v);
+}
 
 /* An empty preference mask means automatic selection, not "nothing enabled".
  * Auto clears restrictions; selecting any individual option leaves Auto. */
@@ -384,6 +394,15 @@ private:
         bool failed = false;
     };
     std::shared_ptr<HealthJob> m_healthJob;
+    /* Connect / Disconnect: the KS one-shot runs on a worker; the UI polls for the result. */
+    struct ConnectJob {
+        std::wstring instanceId, name, ifacePath;
+        bool connect = false, pnDriver = false;
+        pn::OneShotStage stage = pn::OneShotStage::Lookup;
+        HRESULT hr = E_PENDING;
+        std::atomic<bool> done{false};
+    };
+    std::shared_ptr<ConnectJob> m_connectJob;
     pn::WindowsAudioInfo m_audio;
     std::vector<int> m_tabs;
     bool m_adjustingVolume = false;
@@ -464,6 +483,11 @@ private:
     void SetDirty(bool d);
     void EnableConfigPages(bool enable);
     void UpdateCodecAvailability();
+    bool SelectedSessionUp() const;
+    void UpdateConnectButtons();
+    void RequestConnection(bool connect);
+    void FinishConnectionRequest();
+    void FollowConnectionRequest();
 
     /* commands */
     bool Apply();
@@ -540,7 +564,7 @@ void Panel::InitAppearance()
     HFONT oldTitle = m_titleFont, oldBody = m_bodyFont, oldBold = m_boldFont;
     m_titleFont = font(18, FW_SEMIBOLD); m_bodyFont = font(10, FW_NORMAL); m_boldFont = font(10, FW_SEMIBOLD);
     for (int id : {IDC_BRAND, IDC_OUTPUT_TITLE}) SendDlgItemMessageW(m_hwnd, id, WM_SETFONT, (WPARAM)m_titleFont, TRUE);
-    for (int id : {IDC_BRAND_SUB, IDC_OUTPUT_SUMMARY, IDC_SAVE_HINT, IDC_STATUSTEXT, IDC_REFRESH, IDC_ABOUT, IDC_REVERT, IDC_DEFAULTS, IDC_IMPORT, IDC_EXPORT})
+    for (int id : {IDC_BRAND_SUB, IDC_OUTPUT_SUMMARY, IDC_SAVE_HINT, IDC_STATUSTEXT, IDC_REFRESH, IDC_ABOUT, IDC_BT_CONNECT, IDC_BT_DISCONNECT, IDC_REVERT, IDC_DEFAULTS, IDC_IMPORT, IDC_EXPORT})
         SendDlgItemMessageW(m_hwnd, id, WM_SETFONT, (WPARAM)m_bodyFont, TRUE);
     for (int id : {IDC_DEVICE_LABEL, IDC_BRAND_VERSION, IDC_APPLY}) SendDlgItemMessageW(m_hwnd, id, WM_SETFONT, (WPARAM)m_boldFont, TRUE);
     SendMessageW(m_devList, WM_SETFONT, (WPARAM)m_bodyFont, TRUE);
@@ -605,8 +629,9 @@ void Panel::LayoutShell()
     place(IDC_BRAND_VERSION, offset + 20, 49, side, 20);
     place(IDC_BRAND_SUB, offset + 20, 73, side, 22);
     place(IDC_DEVICE_LABEL, offset + 20, 103, side, 22);
-    place(IDC_DEVICES, offset + 16, 134, side + 8, footer - 146);
+    place(IDC_DEVICES, offset + 16, 134, side + 8, footer - 156);
     ListView_SetColumnWidth(m_devList, 0, px(side + 8) - GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) - px(4));
+    place(IDC_BT_CONNECT, offset + 20, footer - 10, 128, 34); place(IDC_BT_DISCONNECT, offset + 160, footer - 10, 128, 34);
     place(IDC_REFRESH, offset + 20, footer + 34, 128, 34); place(IDC_ABOUT, offset + 160, footer + 34, 128, 34);
     place(IDC_OUTPUT_TITLE, content + 12, 22, right - content - 24, 34);
     place(IDC_OUTPUT_SUMMARY, content + 12, 64, right - content - 24, 34);
@@ -860,6 +885,8 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDOK: if (p->m_dirty && p->m_s.open) p->Apply(); return TRUE;
         case IDC_REFRESH: p->m_eventRetry.Reset(); p->RefreshDevices(); return TRUE;
+        case IDC_BT_CONNECT: p->RequestConnection(true); return TRUE;
+        case IDC_BT_DISCONNECT: p->RequestConnection(false); return TRUE;
         case IDC_APPLY: p->Apply(); return TRUE;
         case IDC_REVERT: p->Revert(); return TRUE;
         case IDC_DEFAULTS: p->Defaults(); return TRUE;
@@ -920,7 +947,8 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     case WM_TIMER:
         if (p->m_inPrompt) return TRUE;
-        if (wp == TIMER_HEALTH) { p->FinishAudioCheck(); return TRUE; }
+        if (wp == TIMER_HEALTH) { p->FinishAudioCheck(); p->FinishConnectionRequest(); return TRUE; }
+        if (wp == TIMER_CONNECT_EARLY || wp == TIMER_CONNECT_LATE) { KillTimer(hwnd, wp); p->FollowConnectionRequest(); return TRUE; }
         if (wp == TIMER_STATS && !p->m_inPrompt && p->m_sel >= 0 && p->m_sel < (int)p->m_devices.size()) {
             if (p->m_adjustingVolume && GetCapture() != GetDlgItem(p->m_page[PG_WINDOWS], IDC_WIN_VOLUME)) p->m_adjustingVolume = false;
             if (!p->m_demo && GetTickCount64() - p->m_driverRefreshTick >= 5000) {
@@ -936,7 +964,7 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (wp == TIMER_STATS && p->m_cur == PG_ADAPTER && !p->m_inPrompt) p->LoadAdapter();
         if (wp == TIMER_STATS && p->m_cur == PG_DRIVER && !p->m_inPrompt) p->LoadReadiness();
-        if (wp == TIMER_STATS) { if (p->m_s.open) { if (p->m_s.demo) p->m_s.DemoTick(); p->m_s.Refresh(false); p->UpdateOutputSummary(); if (p->m_cur == PG_STATUS) p->LoadStatus(); if (p->m_cur == PG_CODECS) p->UpdateCodecLive(); if (p->m_cur >= PG_SBC && p->m_cur <= PG_LDAC) p->UpdateCodecDetails(); } p->LoadQuality(true); return TRUE; }
+        if (wp == TIMER_STATS) { if (p->m_s.open) { if (p->m_s.demo) p->m_s.DemoTick(); p->m_s.Refresh(false); p->UpdateOutputSummary(); if (p->m_cur == PG_STATUS) p->LoadStatus(); if (p->m_cur == PG_CODECS) p->UpdateCodecLive(); if (p->m_cur >= PG_SBC && p->m_cur <= PG_LDAC) p->UpdateCodecDetails(); } p->LoadQuality(true); p->UpdateConnectButtons(); return TRUE; }
         break;
     case WM_SIZE: if (wp != SIZE_MINIMIZED) p->LayoutShell(); return TRUE;
     case WM_GETMINMAXINFO: {
@@ -1094,6 +1122,8 @@ void Panel::OnClose()
     }
     KillTimer(m_hwnd, TIMER_STATS);
     KillTimer(m_hwnd, TIMER_HEALTH);
+    KillTimer(m_hwnd, TIMER_CONNECT_EARLY);
+    KillTimer(m_hwnd, TIMER_CONNECT_LATE);
     CloseSession();
     DestroyWindow(m_hwnd);
 }
@@ -1133,10 +1163,14 @@ bool Panel::WindowsMode() const
 
 void Panel::ConfigureTabs()
 {
+    // Overview first, then live quality, then the settings pages, then setup pages.
     m_tabs.clear();
-    m_tabs.push_back(PG_QUALITY);
-    if (WindowsMode()) { m_tabs.push_back(PG_WINDOWS); m_tabs.push_back(PG_DRIVER); }
-    else for (int i = 0; i < PG_WINDOWS; ++i) m_tabs.push_back(i);
+    if (WindowsMode()) { m_tabs.push_back(PG_WINDOWS); m_tabs.push_back(PG_QUALITY); m_tabs.push_back(PG_DRIVER); }
+    else {
+        m_tabs.push_back(PG_STATUS); m_tabs.push_back(PG_QUALITY);
+        for (int i = PG_CODECS; i <= PG_SINK; ++i) m_tabs.push_back(i);
+        m_tabs.push_back(PG_ADAPTER); m_tabs.push_back(PG_DRIVER);
+    }
     TabCtrl_DeleteAllItems(m_tab);
     for (size_t i = 0; i < m_tabs.size(); ++i) {
         TCITEMW item = {}; item.mask = TCIF_TEXT; item.pszText = (LPWSTR)kPages[m_tabs[i]].title;
@@ -1144,8 +1178,8 @@ void Panel::ConfigureTabs()
     }
     for (int id : {IDC_APPLY, IDC_REVERT, IDC_DEFAULTS, IDC_IMPORT, IDC_EXPORT})
         ShowWindow(GetDlgItem(m_hwnd, id), WindowsMode() ? SW_HIDE : SW_SHOW);
-    // Start each selected device in its actual mode, rather than leave a hidden codec page selected.
-    SelectPage(PG_QUALITY);
+    // Start each selected device on its overview page, rather than leave a hidden codec page selected.
+    SelectPage(m_tabs.front());
     LayoutPages();
 }
 
@@ -1282,30 +1316,176 @@ void Panel::RefreshDevices(bool keepSelection)
     }
     ListView_DeleteAllItems(m_devList);
     int reselect = -1;
+    /* Without a previous selection, start on the receiver the user is listening to: the Windows
+     * default output first, then a streaming one, then a connected one, then any PN-A2DP device. */
+    int best = -1, bestScore = -1;
     for (size_t i = 0; i < m_devices.size(); i++) {
         DeviceEntry &d = m_devices[i];
         std::wstring name = d.node.name.empty() ? pn::BtAddressText(d.node.address) : d.node.name;
         int row = ListViewAddRow(m_devList, name, (LPARAM)i);
         ListViewSet(m_devList, row, 1, d.node.usesPnA2dp() ? L"PN-A2DP driver mode" : d.node.usesWindowsA2dp() ? L"Windows mode" : d.node.service.empty() ? L"none" : _wcsicmp(d.node.driverInf.c_str(), PN_INBOX_A2DP_INF) == 0 ? L"Microsoft" : d.node.driverProvider.empty() ? L"other" : d.node.driverProvider);
         std::wstring state = !d.node.present ? L"not present" : d.node.connected ? L"connected" : d.node.started ? L"paired" : L"driver not started";
+        int score = d.ifacePath.empty() ? 0 : 1;
+        if (d.node.present && d.node.connected) score += 2;
         if (!d.ifacePath.empty() && !d.demo) {
             pn::Device tmp;
             PNA2DP_STATUS st;
-            if (tmp.Open(d.ifacePath, false) && tmp.GetStatus(st)) { state = pn::StateName(st.State); if (st.Codec) { state += L" "; state += pn::CodecName(st.Codec); } }
-        } else if (d.demo && d.node.usesPnA2dp()) state = L"Streaming LDAC";
+            if (tmp.Open(d.ifacePath, false) && tmp.GetStatus(st)) {
+                state = pn::StateName(st.State); if (st.Codec) { state += L" "; state += pn::CodecName(st.Codec); }
+                if (st.State != PNA2DP_STATE_IDLE) score += 2;
+                if (st.State == PNA2DP_STATE_STREAMING) score += 4;
+            }
+        } else if (d.demo && d.node.usesPnA2dp()) { state = L"Streaming LDAC"; score += 4; }
+        if (keep.empty() && !d.demo && d.node.present && d.node.connected) {
+            pn::WindowsAudioInfo audio = pn::QueryWindowsAudio(d.node.instanceId);
+            if (audio.active && audio.defaultKnown && audio.isDefault) score += 8;
+        }
+        if (score > bestScore) { bestScore = score; best = row; }
         ListViewSet(m_devList, row, 2, state);
         if (!keep.empty() && _wcsicmp(keep.c_str(), d.node.instanceId.c_str()) == 0) reselect = row;
     }
-    if (reselect < 0 && !m_devices.empty()) {
-        reselect = 0;
-        for (size_t i = 0; i < m_devices.size(); i++) if (!m_devices[i].ifacePath.empty()) { reselect = (int)i; break; }
-    }
+    if (reselect < 0) reselect = best;
     if (reselect >= 0) {
         ListView_SetItemState(m_devList, reselect, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     } else {
         m_sel = -1; m_s.Reset(); ConfigureTabs(); EnableConfigPages(false); LoadAll(); SetDirty(false);
-        SetStatusText(L"No Bluetooth stereo device is paired. Pair a headset in Windows Settings, then press Refresh.");
+        UpdateConnectButtons();
+        SetStatusText(L"No Bluetooth stereo device is paired. Pair a receiver in Windows Settings > Bluetooth & devices, then press Refresh.");
     }
+}
+
+/* ---- connect / disconnect ----------------------------------------------- */
+
+/* PN-A2DP: the AVDTP session is the connection Windows' Connect makes and Disconnect drops.
+ * Other drivers: the Windows output is active exactly while the receiver is connected for
+ * audio (unplugged otherwise); before the first output query, Windows' IsConnected. */
+bool Panel::SelectedSessionUp() const
+{
+    if (m_sel < 0 || m_sel >= (int)m_devices.size()) return false;
+    if (m_s.open) return m_s.status.State >= PNA2DP_STATE_CONNECTING && m_s.status.State <= PNA2DP_STATE_SUSPENDED;
+    if (WindowsMode() && m_audio.error != E_PENDING) return m_audio.active;
+    return m_devices[m_sel].node.connected;
+}
+
+void Panel::UpdateConnectButtons()
+{
+    bool valid = m_sel >= 0 && m_sel < (int)m_devices.size();
+    bool idle = !m_connectJob;
+    bool usable = valid && idle && m_devices[m_sel].node.present && !WindowsPending();
+    bool up = usable && SelectedSessionUp();
+    /* a link Windows reports up can always be disconnected, even with no audio session */
+    bool connect = usable && !up, disconnect = usable && (up || m_devices[m_sel].node.connected);
+    /* A pressed button usually disables itself: keep keyboard focus on the device row, or on
+     * the button that takes over (Disconnect after Connect and the other way round). */
+    HWND focus = GetFocus();
+    const struct { int id; bool enable; } buttons[] = { {IDC_BT_CONNECT, connect}, {IDC_BT_DISCONNECT, disconnect} };
+    for (const auto &b : buttons) {
+        if (b.enable || focus != GetDlgItem(m_hwnd, b.id)) continue;
+        HWND next = b.id == IDC_BT_CONNECT && disconnect ? GetDlgItem(m_hwnd, IDC_BT_DISCONNECT)
+                  : b.id == IDC_BT_DISCONNECT && connect ? GetDlgItem(m_hwnd, IDC_BT_CONNECT) : m_devList;
+        SendMessageW(m_hwnd, WM_NEXTDLGCTL, (WPARAM)next, TRUE);
+    }
+    for (const auto &b : buttons) EnableItem(m_hwnd, b.id, b.enable);
+}
+
+/* Windows' own Connect / Disconnect request (KSPROPSETID_BtAudio one-shot GET) on the
+ * receiver's audio endpoint. The driver records it and returns; the device list follows the
+ * result through driver events, the per-second refresh and two follow-up reads. */
+void Panel::RequestConnection(bool connect)
+{
+    if (m_connectJob || m_sel < 0 || m_sel >= (int)m_devices.size()) return;
+    const DeviceEntry &d = m_devices[m_sel];
+    std::wstring name = d.node.name.empty() ? pn::BtAddressText(d.node.address) : d.node.name;
+    if (m_demo) {
+        SetStatusText(L"Demo mode: " + std::wstring(connect ? L"Connect" : L"Disconnect") + L" would ask Windows to " +
+            (connect ? L"connect " : L"disconnect ") + name + L". No device was changed.");
+        return;
+    }
+    auto job = std::make_shared<ConnectJob>();
+    job->instanceId = d.node.instanceId; job->name = name; job->connect = connect; job->pnDriver = d.node.usesPnA2dp();
+    if (d.node.usesPnA2dp()) job->ifacePath = d.ifacePath;
+    m_connectJob = job;
+    UpdateConnectButtons();
+    SetStatusText((connect ? L"Connecting " : L"Disconnecting ") + name + L"...");
+    try {
+        // The worker owns its copy of the request; COM never runs on the UI thread here.
+        std::thread([job] {
+            try {
+                HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                pn::OneShotStage stage = pn::OneShotStage::Lookup;
+                job->hr = FAILED(com) && com != RPC_E_CHANGED_MODE ? com : pn::BluetoothAudioOneShot(job->instanceId, job->connect, &stage);
+                job->stage = stage;
+                if (SUCCEEDED(com)) CoUninitialize();
+            } catch (...) { job->hr = E_OUTOFMEMORY; }
+            job->done.store(true, std::memory_order_release);
+        }).detach();
+    } catch (...) { job->hr = E_OUTOFMEMORY; job->done = true; }
+}
+
+void Panel::FinishConnectionRequest()
+{
+    if (!m_connectJob || !m_connectJob->done.load(std::memory_order_acquire)) return;
+    auto job = m_connectJob; m_connectJob.reset();
+    bool requested = SUCCEEDED(job->hr);
+    std::wstring text = job->name + L": " + pn::BluetoothAudioOneShotText(job->hr, job->stage, job->connect, job->pnDriver);
+    if (job->connect && job->stage == pn::OneShotStage::NoEndpoint && !job->ifacePath.empty()) {
+        /* PN-A2DP without any Windows output: the driver's own reconnect, a link reset, only
+         * while the session is down now (the driver may have connected since the click) */
+        bool selected = m_s.open && m_sel >= 0 && m_sel < (int)m_devices.size() &&
+            !_wcsicmp(m_devices[m_sel].node.instanceId.c_str(), job->instanceId.c_str());
+        pn::Device other;
+        pn::Device &dev = selected ? m_s.dev : other;
+        PNA2DP_STATUS st = {};
+        bool statusKnown = (selected || other.Open(job->ifacePath, true)) && dev.GetStatus(st);
+        if (pn::OneShotReconnectFallback(job->connect, job->stage, statusKnown, st.State)) {
+            if (dev.Reconnect()) {
+                requested = true;
+                text = job->name + L": no Windows audio output; asked the PN-A2DP driver to reconnect.";
+            }
+        } else if (statusKnown) {
+            requested = true;
+            text = job->name + L": no Windows audio output, but the PN-A2DP session is " + pn::StateName(st.State) + L"; nothing was changed.";
+        }
+    }
+    SetStatusText(text);
+    if (requested) {
+        SetTimer(m_hwnd, TIMER_CONNECT_EARLY, 2000, NULL);
+        SetTimer(m_hwnd, TIMER_CONNECT_LATE, 6000, NULL);
+    }
+    UpdateConnectButtons();
+}
+
+/* Re-read Windows' view of every paired device without closing the session or leaving the
+ * current tab. A driver change still rebuilds the list, as the periodic check does. */
+void Panel::FollowConnectionRequest()
+{
+    if (m_demo || m_inPrompt) return;
+    for (size_t i = 0; i < m_devices.size(); ++i) {
+        DeviceEntry &d = m_devices[i];
+        pn::A2dpNode node;
+        bool found = pn::GetA2dpNode(d.node.instanceId, node);
+        if (!found && (d.demo || !d.node.address)) continue; /* demo rows and interface-only entries */
+        /* a driver change, or a receiver Windows no longer has (removed), rebuilds the list */
+        if (!found || (d.node.present && !node.present) ||
+            _wcsicmp(d.node.service.c_str(), node.service.c_str()) || _wcsicmp(d.node.driverInf.c_str(), node.driverInf.c_str())) {
+            if (!m_dirty) RefreshDevices();
+            return;
+        }
+        d.node = node;
+        /* the selected row follows its session (driver events) or its Windows output (LoadWindowsAudio) */
+        if ((int)i == m_sel) continue;
+        std::wstring state = !node.present ? L"not present" : node.connected ? L"connected" : node.started ? L"paired" : L"driver not started";
+        pn::Device tmp;
+        PNA2DP_STATUS st;
+        if (!d.ifacePath.empty() && tmp.Open(d.ifacePath, false) && tmp.GetStatus(st)) {
+            state = pn::StateName(st.State); if (st.Codec) { state += L" "; state += pn::CodecName(st.Codec); }
+        }
+        ListViewSet(m_devList, (int)i, 2, state);
+    }
+    InvalidateRect(m_devList, NULL, FALSE);
+    if (WindowsMode()) LoadWindowsAudio();
+    UpdateOutputSummary();
+    UpdateConnectButtons();
 }
 
 void Panel::CloseSession()
@@ -1372,6 +1552,7 @@ void Panel::SelectDevice(int index)
     EnableConfigPages(m_s.open);
     LoadAll();
     if (generation != m_sessionGen) return;
+    UpdateConnectButtons();
     SetDirty(false);
     if (m_s.open) SetStatusText(L"Connected to the PN-A2DP driver instance for " + (d.node.name.empty() ? pn::BtAddressText(d.node.address) : d.node.name) + L".");
     else if (!m_s.open) {
@@ -1447,6 +1628,7 @@ void Panel::OnDriverEvent(ULONG mask)
         if (mask & PNA2DP_EVENT_ERROR) SetStatusText(L"Driver reported an error: " + pn::NtStatusText(m_s.status.LastError));
     }
     UpdateOutputSummary();
+    UpdateConnectButtons();
 }
 
 /* ---- apply / revert ------------------------------------------------------ */
@@ -1937,6 +2119,7 @@ void Panel::LoadSbc()
     SetUInt(d, IDC_SBC_MIN_EDIT, s.MinBitpool ? s.MinBitpool : 2);
     Check(d, IDC_SBC_OVERRIDE, s.AllowBitpoolOverride != 0);
     Check(d, IDC_SBC_DUAL, (m_s.config.Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) != 0);
+    Check(d, IDC_SBC_XQ, (m_s.config.Flags & PNA2DP_CFG_SBC_XQ) != 0);
     Check(d, IDC_SBC_R16, (s.RateMask & PNA2DP_SBC_FREQ_16000) != 0); Check(d, IDC_SBC_R32, (s.RateMask & PNA2DP_SBC_FREQ_32000) != 0);
     Check(d, IDC_SBC_R44, (s.RateMask & PNA2DP_SBC_FREQ_44100) != 0); Check(d, IDC_SBC_R48, (s.RateMask & PNA2DP_SBC_FREQ_48000) != 0);
     Check(d, IDC_SBC_CMONO, (s.ChannelModeMask & PNA2DP_SBC_CH_MONO) != 0); Check(d, IDC_SBC_CDUAL, (s.ChannelModeMask & PNA2DP_SBC_CH_DUAL) != 0);
@@ -1958,6 +2141,7 @@ void Panel::SaveSbc(PNA2DP_CONFIG &c)
     s.MinBitpool = (UCHAR)min(250u, max(2u, GetUInt(d, IDC_SBC_MIN_EDIT)));
     s.AllowBitpoolOverride = Checked(d, IDC_SBC_OVERRIDE) ? 1 : 0;
     if (Checked(d, IDC_SBC_DUAL)) c.Flags |= PNA2DP_CFG_DUAL_CHANNEL_PREFER; else c.Flags &= ~PNA2DP_CFG_DUAL_CHANNEL_PREFER;
+    if (Checked(d, IDC_SBC_XQ)) c.Flags |= PNA2DP_CFG_SBC_XQ; else c.Flags &= ~PNA2DP_CFG_SBC_XQ;
     s.RateMask = (Checked(d, IDC_SBC_R16) ? PNA2DP_SBC_FREQ_16000 : 0) | (Checked(d, IDC_SBC_R32) ? PNA2DP_SBC_FREQ_32000 : 0) | (Checked(d, IDC_SBC_R44) ? PNA2DP_SBC_FREQ_44100 : 0) | (Checked(d, IDC_SBC_R48) ? PNA2DP_SBC_FREQ_48000 : 0);
     s.ChannelModeMask = (Checked(d, IDC_SBC_CMONO) ? PNA2DP_SBC_CH_MONO : 0) | (Checked(d, IDC_SBC_CDUAL) ? PNA2DP_SBC_CH_DUAL : 0) | (Checked(d, IDC_SBC_CSTEREO) ? PNA2DP_SBC_CH_STEREO : 0) | (Checked(d, IDC_SBC_CJOINT) ? PNA2DP_SBC_CH_JOINT : 0);
     s.BlockMask = (Checked(d, IDC_SBC_B4) ? PNA2DP_SBC_BLOCKS_4 : 0) | (Checked(d, IDC_SBC_B8) ? PNA2DP_SBC_BLOCKS_8 : 0) | (Checked(d, IDC_SBC_B12) ? PNA2DP_SBC_BLOCKS_12 : 0) | (Checked(d, IDC_SBC_B16) ? PNA2DP_SBC_BLOCKS_16 : 0);
@@ -1979,14 +2163,17 @@ void Panel::UpdateSbcBitrate()
         }
     }
     if (!bp) { SetText(d, IDC_SBC_BITRATE, L"Receiver maximum: unknown until SBC capabilities are available. No bitrate is assumed."); return; }
-    ULONG blocks = Checked(d, IDC_SBC_B16) || !(Checked(d, IDC_SBC_B4) || Checked(d, IDC_SBC_B8) || Checked(d, IDC_SBC_B12)) ? 16 : Checked(d, IDC_SBC_B12) ? 12 : Checked(d, IDC_SBC_B8) ? 8 : 4;
-    ULONG subs = Checked(d, IDC_SBC_S4) && !Checked(d, IDC_SBC_S8) ? 4 : 8;
-    bool dual = Checked(d, IDC_SBC_DUAL) || (Checked(d, IDC_SBC_CDUAL) && !Checked(d, IDC_SBC_CJOINT) && !Checked(d, IDC_SBC_CSTEREO));
+    /* SBC XQ overrides the mode, blocks and subbands; its bitpool is the one plain dual channel
+     * gets, as the driver does for a receiver that supports it */
+    bool xq = Checked(d, IDC_SBC_XQ);
+    ULONG blocks = xq || Checked(d, IDC_SBC_B16) || !(Checked(d, IDC_SBC_B4) || Checked(d, IDC_SBC_B8) || Checked(d, IDC_SBC_B12)) ? 16 : Checked(d, IDC_SBC_B12) ? 12 : Checked(d, IDC_SBC_B8) ? 8 : 4;
+    ULONG subs = !xq && Checked(d, IDC_SBC_S4) && !Checked(d, IDC_SBC_S8) ? 4 : 8;
+    bool dual = xq || Checked(d, IDC_SBC_DUAL) || (Checked(d, IDC_SBC_CDUAL) && !Checked(d, IDC_SBC_CJOINT) && !Checked(d, IDC_SBC_CSTEREO));
     ULONG mode = dual ? PNA2DP_SBC_CH_DUAL : Checked(d, IDC_SBC_CJOINT) || Checked(d, IDC_SBC_CAUTO) ? PNA2DP_SBC_CH_JOINT : Checked(d, IDC_SBC_CSTEREO) ? PNA2DP_SBC_CH_STEREO : PNA2DP_SBC_CH_MONO;
     const wchar_t *modeName = mode == PNA2DP_SBC_CH_DUAL ? L"dual channel" : mode == PNA2DP_SBC_CH_JOINT ? L"joint stereo" : mode == PNA2DP_SBC_CH_STEREO ? L"stereo" : L"mono";
     SetTextF(d, IDC_SBC_BITRATE, L"Estimated bitrate at bitpool %u, %u blocks, %u subbands, %s: %u kbps at 44.1 kHz, %u kbps at 48 kHz%s.", bp, blocks, subs,
              modeName, (pn::SbcBitrateBps(44100, subs, blocks, mode, bp) + 500) / 1000, (pn::SbcBitrateBps(48000, subs, blocks, mode, bp) + 500) / 1000,
-             Checked(d, IDC_SBC_MAX_SINK) ? L" (receiver-advertised bitpool)" : L"");
+             xq ? L" (SBC XQ, packed to the radio's EDR packets)" : Checked(d, IDC_SBC_MAX_SINK) ? L" (receiver-advertised bitpool)" : L"");
 }
 
 void Panel::LoadAac()

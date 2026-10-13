@@ -1,5 +1,7 @@
 /* Explicit-device regression tests. --pins requires other audio clients to be closed.
- * Never starts playback or changes the selected endpoint. SPDX-License-Identifier: MIT */
+ * Never starts playback or changes the selected endpoint. Run it both unelevated and
+ * elevated: trace and audio capture need an elevated caller, and the codec host role
+ * belongs to the LocalSystem service only. SPDX-License-Identifier: MIT */
 #include "../common/pnctl.h"
 #include <mmreg.h>
 #include <ks.h>
@@ -12,6 +14,21 @@
 struct Handle { HANDLE value = INVALID_HANDLE_VALUE; ~Handle() { if (value != INVALID_HANDLE_VALUE && value) CloseHandle(value); } };
 static unsigned failures = 0, checks = 0;
 static bool Check(bool ok, const char *what) { ++checks; printf("%s: %s (error %lu)\n", ok ? "PASS" : "FAIL", what, ok ? 0 : GetLastError()); if (!ok) ++failures; return ok; }
+// Matches the driver's role check: BUILTIN\Administrators enabled (not UAC deny-only).
+static bool IsElevatedAdministrator()
+{
+    BYTE sid[SECURITY_MAX_SID_SIZE]; DWORD size = sizeof(sid); BOOL member = FALSE;
+    return CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, sid, &size) && CheckTokenMembership(nullptr, sid, &member) && member;
+}
+static bool IsLocalSystem()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    union { TOKEN_USER user; BYTE bytes[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]; } buffer; DWORD size = 0;
+    bool system = GetTokenInformation(token, TokenUser, &buffer, sizeof(buffer), &size) && IsWellKnownSid(buffer.user.User.Sid, WinLocalSystemSid);
+    CloseHandle(token);
+    return system;
+}
 static bool Ioctl(HANDLE h, DWORD code, void *in, DWORD inSize, void *out, DWORD outSize, DWORD *bytes = nullptr)
 {
     DWORD got = 0;
@@ -34,8 +51,39 @@ int main(int argc, char **argv)
     control.value = CreateFileW(device.path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     reader.value = CreateFileW(device.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (!Check(control.value != INVALID_HANDLE_VALUE && reader.value != INVALID_HANDLE_VALUE, "normal-user control handles")) return 1;
+    const bool system = IsLocalSystem(), elevated = system || IsElevatedAdministrator();
+    printf("Caller: %s\n", system ? "LocalSystem" : elevated ? "elevated administrator" : "standard user (run elevated too)");
+    // Only the LocalSystem codec host service may register. The probe can never register
+    // anything: its Size is 0, which every driver refuses. A driver with control roles
+    // refuses it before looking at it (ACCESS_DENIED); one that predates them (0.1.0.18
+    // and older) parses it (INVALID_PARAMETER), and the role checks below are skipped for
+    // it instead of failing. Never attempted as LocalSystem, where the role is allowed.
+    bool roles = true;
+    if (!system) {
+        PNA2DP_CODEC_REGISTER reg = {};
+        reg.Size = 0; reg.AbiVersion = PNA2DP_ABI_VERSION; reg.CodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);
+        reg.MaxPcmBytes = 65536; reg.MaxEncodedBytes = 8192; reg.HostPid = GetCurrentProcessId();
+        bool registered = Ioctl(control.value, IOCTL_PNA2DP_CODEC_REGISTER, &reg, sizeof(reg), nullptr, 0);
+        DWORD error = GetLastError();
+        if (registered) Ioctl(control.value, IOCTL_PNA2DP_CODEC_UNREGISTER, nullptr, 0, nullptr, 0);
+        SetLastError(error);
+        if (!registered && error == ERROR_INVALID_PARAMETER) {
+            roles = false;
+            puts("SKIP: the driver predates the control roles (0.1.0.18 or older): role checks skipped");
+        } else {
+            Check(!registered && error == ERROR_ACCESS_DENIED, "only the LocalSystem codec host can register");
+        }
+    }
     PNA2DP_TRACE trace = {}; DWORD bytes = 0;
-    if (Check(Ioctl(reader.value, IOCTL_PNA2DP_GET_TRACE, nullptr, 0, &trace, sizeof(trace), &bytes), "read-only trace snapshot")) {
+    ULONG action = 2;
+    if (!elevated) {
+        if (roles) {
+            Check(!Ioctl(reader.value, IOCTL_PNA2DP_GET_TRACE, nullptr, 0, &trace, sizeof(trace), &bytes) && GetLastError() == ERROR_ACCESS_DENIED,
+                  "standard user cannot read the trace");
+            Check(!Ioctl(control.value, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0) && GetLastError() == ERROR_ACCESS_DENIED,
+                  "standard user cannot capture audio");
+        }
+    } else if (Check(Ioctl(reader.value, IOCTL_PNA2DP_GET_TRACE, nullptr, 0, &trace, sizeof(trace), &bytes), "read-only trace snapshot")) {
         bool valid = bytes == sizeof(trace) && trace.Size == sizeof(trace) && trace.Count <= PNA2DP_TRACE_ENTRIES;
         for (ULONG i = 0; valid && i < trace.Count; ++i) {
             valid = memchr(trace.Entries[i].Text, 0, sizeof(trace.Entries[i].Text)) != nullptr;
@@ -43,17 +91,20 @@ int main(int argc, char **argv)
         }
         Check(valid, "bounded, terminated, ordered trace entries");
     }
-    Check(!Ioctl(reader.value, IOCTL_PNA2DP_GET_TRACE, nullptr, 0, &trace, sizeof(trace) - 1) && GetLastError() == ERROR_INSUFFICIENT_BUFFER, "short trace output rejected");
-    ULONG action = 2;
+    if (elevated) {
+        Check(!Ioctl(reader.value, IOCTL_PNA2DP_GET_TRACE, nullptr, 0, &trace, sizeof(trace) - 1) && GetLastError() == ERROR_INSUFFICIENT_BUFFER, "short trace output rejected");
+    }
     Check(!Ioctl(reader.value, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0) && GetLastError() == ERROR_ACCESS_DENIED,
           "read-only handle cannot capture audio");
-    Check(Ioctl(control.value, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0), "diagnostic capture cancellation");
-    action = 3;
-    Check(!Ioctl(control.value, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0) && GetLastError() == ERROR_INVALID_PARAMETER,
-          "invalid capture action rejected");
-    action = 0;
-    Check(!Ioctl(control.value, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0) && GetLastError() == ERROR_INSUFFICIENT_BUFFER,
-          "short capture output rejected");
+    if (elevated) {
+        Check(Ioctl(control.value, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0), "diagnostic capture cancellation");
+        action = 3;
+        Check(!Ioctl(control.value, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0) && GetLastError() == ERROR_INVALID_PARAMETER,
+              "invalid capture action rejected");
+        action = 0;
+        Check(!Ioctl(control.value, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0) && GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+              "short capture output rejected");
+    }
     PNA2DP_CONFIG config = {};
     if (Check(Ioctl(control.value, IOCTL_PNA2DP_GET_CONFIG, nullptr, 0, &config, sizeof(config)), "read settings")) {
         Check(!Ioctl(reader.value, IOCTL_PNA2DP_SET_CONFIG, &config, sizeof(config), nullptr, 0) && GetLastError() == ERROR_ACCESS_DENIED, "read-only handle cannot change settings");

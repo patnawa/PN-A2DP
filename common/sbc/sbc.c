@@ -2,7 +2,8 @@
  * sbc.c - SBC encoder/decoder written from the A2DP specification (Appendix B).
  *
  * Fixed point layout:
- *   PCM input            S16
+ *   PCM input            S16, or S32 of which the top 24 bits are used
+ *   analysis delay line  Q8 relative to the 16-bit PCM domain (S16 input << 8)
  *   prototype filter C   Q30
  *   cosine matrices      Q30
  *   subband samples      Q15 relative to the 16-bit PCM domain (|x| < 2^(sf+16))
@@ -364,18 +365,27 @@ void sbc_encoder_set_bitpool(sbc_encoder *e, sbc_u8 bitpool)
     e->frame_length = sbc_frame_length(&e->p);
 }
 
-/* Analysis filterbank (12.6.2): processes `subbands` new samples of one channel. */
-static void sbc_analyze(sbc_s32 *x, const sbc_s16 *in, int stride, int subbands, sbc_s32 *out)
+/* One input sample in the Q8 delay-line format: S16 << 8, or S32 rounded to 24 bits. */
+static sbc_s32 sbc_input(const sbc_s16 *in16, const sbc_s32 *in32, int index)
+{
+    if (in16) return (sbc_s32)in16[index] * 256;
+    return (sbc_s32)(((sbc_s64)in32[index] + 128) >> 8);
+}
+
+/* Analysis filterbank (12.6.2): processes `subbands` new samples of one channel.
+ * Exactly one of in16/in32 is set. x is Q8, so Q8*Q30 >> 23 = Q15; for S16 input
+ * ((v << 8) * c) >> 23 == (v * c) >> 15, i.e. bit-exact with a 16-bit delay line. */
+static void sbc_analyze(sbc_s32 *x, const sbc_s16 *in16, const sbc_s32 *in32, int stride, int subbands, sbc_s32 *out)
 {
     sbc_s64 z[16];
     int i, k;
     if (subbands == 4) {
         for (i = 39; i >= 4; i--) x[i] = x[i - 4];
-        for (i = 3; i >= 0; i--) x[i] = in[(3 - i) * stride];
+        for (i = 3; i >= 0; i--) x[i] = sbc_input(in16, in32, (3 - i) * stride);
         for (i = 0; i < 8; i++) {
             sbc_s64 acc = 0;
             for (k = 0; k < 5; k++) acc += (sbc_s64)x[i + 8 * k] * sbc_proto4[i + 8 * k];
-            z[i] = acc >> 15;                         /* Q30*Q0 -> Q15 */
+            z[i] = acc >> 23;                         /* Q8*Q30 -> Q15 */
         }
         for (i = 0; i < 4; i++) {
             sbc_s64 acc = 0;
@@ -384,11 +394,11 @@ static void sbc_analyze(sbc_s32 *x, const sbc_s16 *in, int stride, int subbands,
         }
     } else {
         for (i = 79; i >= 8; i--) x[i] = x[i - 8];
-        for (i = 7; i >= 0; i--) x[i] = in[(7 - i) * stride];
+        for (i = 7; i >= 0; i--) x[i] = sbc_input(in16, in32, (7 - i) * stride);
         for (i = 0; i < 16; i++) {
             sbc_s64 acc = 0;
             for (k = 0; k < 5; k++) acc += (sbc_s64)x[i + 16 * k] * sbc_proto8[i + 16 * k];
-            z[i] = acc >> 15;
+            z[i] = acc >> 23;
         }
         for (i = 0; i < 8; i++) {
             sbc_s64 acc = 0;
@@ -429,7 +439,7 @@ static void bw_put(sbc_bitwriter *w, sbc_u32 value, sbc_u32 nbits)
     }
 }
 
-sbc_u32 sbc_encode_frame(sbc_encoder *e, const sbc_s16 *pcm, sbc_u8 *out, sbc_u32 out_cap)
+static sbc_u32 sbc_encode(sbc_encoder *e, const sbc_s16 *pcm16, const sbc_s32 *pcm32, sbc_u8 *out, sbc_u32 out_cap)
 {
     const sbc_params *p = &e->p;
     int blk, ch, sb;
@@ -444,7 +454,8 @@ sbc_u32 sbc_encode_frame(sbc_encoder *e, const sbc_s16 *pcm, sbc_u8 *out, sbc_u3
     /* 1. analysis */
     for (blk = 0; blk < blocks; blk++) {
         for (ch = 0; ch < nch; ch++) {
-            sbc_analyze(e->x[ch], pcm + ((sbc_u32)blk * subbands) * nch + ch, nch, subbands, e->sb[blk][ch]);
+            sbc_u32 at = ((sbc_u32)blk * subbands) * nch + ch;
+            sbc_analyze(e->x[ch], pcm16 ? pcm16 + at : 0, pcm32 ? pcm32 + at : 0, nch, subbands, e->sb[blk][ch]);
         }
     }
 
@@ -545,6 +556,16 @@ sbc_u32 sbc_encode_frame(sbc_encoder *e, const sbc_s16 *pcm, sbc_u8 *out, sbc_u3
     /* 6. pad to byte boundary */
     if (w.pos & 7) bw_put(&w, 0, 8 - (w.pos & 7));
     return (w.pos >> 3) == e->frame_length ? e->frame_length : (w.pos >> 3);
+}
+
+sbc_u32 sbc_encode_frame(sbc_encoder *e, const sbc_s16 *pcm, sbc_u8 *out, sbc_u32 out_cap)
+{
+    return sbc_encode(e, pcm, 0, out, out_cap);
+}
+
+sbc_u32 sbc_encode_frame_s32(sbc_encoder *e, const sbc_s32 *pcm, sbc_u8 *out, sbc_u32 out_cap)
+{
+    return sbc_encode(e, 0, pcm, out, out_cap);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -654,14 +675,20 @@ sbc_u32 sbc_decode_frame(sbc_decoder *d, const sbc_u8 *in, sbc_u32 in_len, sbc_s
     subbands = p.subbands; blocks = p.blocks; nch = (p.channel_mode == SBC_MODE_MONO) ? 1 : 2;
     if (pcm_cap_samples < (sbc_u32)subbands * blocks * nch) return 0;
 
-    if (memcmp(&d->p, &p, sizeof(p)) != 0) {
-        /* new stream parameters: reset filter state */
+    /* new stream parameters: reset the filter state. The bitpool only changes the bit
+     * allocation: an in-band change (ABR, a live change) keeps the synthesis history, as real
+     * sinks do; compared field by field, not with the struct's padding (finding #9) */
+    if (d->p.sample_rate != p.sample_rate || d->p.channel_mode != p.channel_mode || d->p.subbands != p.subbands ||
+        d->p.blocks != p.blocks) {
         memset(d->v, 0, sizeof(d->v));
         d->p = p;
         d->freq_index = (sbc_u8)sbc_freq_index(p.sample_rate);
         d->channels = (sbc_u8)nch;
         d->frame_length = len;
     }
+    d->p.allocation = p.allocation;
+    d->p.bitpool = p.bitpool;
+    d->frame_length = len;
 
     r.buf = in; r.len_bits = len * 8; r.pos = 32;
     memset(crc_buf, 0, sizeof(crc_buf));

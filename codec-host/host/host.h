@@ -49,12 +49,14 @@ private:
     void Open(const PNA2DP_CODEC_WORK *w);
     void Encode(const PNA2DP_CODEC_WORK *w, const uint8_t *pcm);
     void CloseEncoder();
-    void PutResult(uint32_t seq, uint32_t gen, int status, const PnCodecOutput *out);
+    void PrepareResult(uint32_t seq, uint32_t gen, int status, const PnCodecOutput *out);
+    void SendResult();
 
     std::wstring m_path;
     PluginRegistry &m_plugins;
     HANDLE m_device = INVALID_HANDLE_VALUE;
     HANDLE m_stopEvent = NULL;
+    HANDLE m_resultEvent = NULL;      /* reused by every PUT_RESULT */
     std::thread m_thread;
     std::atomic<bool> m_stop{false};
     std::atomic<bool> m_alive{false};
@@ -65,8 +67,13 @@ private:
     uint32_t m_generation = 0;
     std::vector<uint8_t> m_outBuf;
     std::vector<uint8_t> m_resultBuf;
+    bool m_resultReady = false;       /* m_resultBuf holds a result not yet sent */
     uint32_t m_lastQuality = 0;
     uint32_t m_lastBitrate = 0;
+    /* last quality change the plugin refused: not retried until the driver asks for another */
+    bool m_rejectedValid = false;
+    uint32_t m_rejectedQuality = 0;
+    uint32_t m_rejectedBitrate = 0;
 };
 
 /* built-in reference plugin (SBC via common/sbc) */

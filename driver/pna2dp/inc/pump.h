@@ -7,22 +7,32 @@
  *                                                         --> RTP packetiser --> L2CAP media channel
  *
  * The WaveRT side is the clock. The pump drains whatever PCM is available, converts it to
- * the encoder's input format, encodes, and keeps a bounded number of L2CAP writes in
- * flight. A latency guard drops PCM when the ring exceeds MaxLatencyMs; the adaptive
- * bitrate controller (ABR) watches write completion latency and queue depth.
+ * the encoder's input format (2:1 half-band decimation when the engine runs at twice the
+ * codec rate; ring, trims and PcmFramesConsumed stay in engine frames), encodes, and
+ * keeps a bounded number of L2CAP writes in flight. A latency guard drops PCM (with a
+ * short crossfade) when the ring exceeds MaxLatencyMs; the adaptive bitrate controller
+ * (ABR) watches each write's own send time, the media time the link delivers and the TX
+ * queue (audio_policy.h).
  *
  * SPDX-License-Identifier: MIT
  */
 #pragma once
 #include "audio_policy.h"
+#include "pcm.h"
 
 #define PN_PUMP_RING_MS            600     /* PCM ring capacity */
 #define PN_PUMP_MAX_PACKET         2048    /* staging buffer per RTP packet */
-#define PN_PUMP_MAX_PCM_BLOCK      16384   /* bytes handed to an encoder at once */
-#define PN_PUMP_HOST_WINDOW        4       /* outstanding encode blocks at the host */
-#define PN_PUMP_HOST_TIMEOUT_MS    200
+#define PN_PUMP_MAX_PCM_BLOCK      32768   /* ring bytes handed to an encoder at once (15 SBC frames from 96 kHz S32) */
+#define PN_PUMP_HOST_WINDOW        4       /* outstanding encode blocks at the host (<= PN_HOST_LEDGER_SLOTS) */
+#define PN_PUMP_HOST_TIMEOUT_MS    200     /* an unanswered request is written off after this */
+#define PN_PUMP_HOST_BLOCKS        (2 * PN_PUMP_HOST_WINDOW)   /* preallocated result blocks */
 #define PN_PUMP_DEFAULT_TARGET_MS  60
 #define PN_PUMP_DEFAULT_MAX_MS     250
+#define PN_PUMP_TICK_MS            4       /* safety tick while streaming (latency guard, host watchdog); work
+                                              * is event driven. bthlink frees the write slot before it reports
+                                              * the completion (T14), so this could grow; kept until heard on hardware */
+#define PN_PUMP_FADE_BYTES         8192    /* outgoing side of a trim crossfade (4 ms at 192 kHz stereo S32 = 6144) */
+#define PN_PUMP_CAN_DECIMATE_2     1       /* an engine rate of exactly twice the codec rate is accepted (contract C8) */
 
 typedef enum _PN_ENCODER_OWNER {
     PnEncoderNone = 0,
@@ -54,6 +64,7 @@ typedef struct _PN_ENCODED_BLOCK {
     ULONG       PcmFrames;
     ULONG       PayloadHeaderByte;
     ULONG       ActualBitrate;
+    ULONG       SkipPcmFrames;     /* RTP time of dropped blocks before this one */
     LONGLONG    SubmitTimeHns;
     UCHAR       Payload[PN_PUMP_MAX_PACKET];
 } PN_ENCODED_BLOCK, *PPN_ENCODED_BLOCK;
@@ -68,7 +79,9 @@ typedef struct _PN_ABR {
     volatile LONG Slow;
     volatile LONG Failed;
     volatile LONG Pressure;
-    ULONG       BacklogPeakUs;
+    volatile LONG QueueFull;       /* steps that found the TX queue full */
+    ULONG       Trims;             /* latency trims since the last observation (pump thread) */
+    ULONG       BacklogPeakUs;     /* ring latency while the TX queue was full */
     ULONG       FloorBps;
     ULONG       Downgrades;
     ULONG       Upgrades;
@@ -89,6 +102,7 @@ typedef struct _PN_PUMP {
     LONG                Running;           /* thread alive */
     LONG                StreamActive;      /* encoding/sending enabled */
     LONG                Generation;        /* increments per OPEN/CLOSE; tags host work */
+    LONG                LatencyEpoch;      /* increments after each start / stop flushed the ring (PumpLatencyEpoch) */
 
     /* live changes requested by other threads, applied by the pump thread between steps */
     LONG                PendingBitpool;    /* 0 = none */
@@ -103,7 +117,10 @@ typedef struct _PN_PUMP {
     ULONG               SbcBitpoolCeiling;    /* negotiated maximum, limited by the transport MTU */
     ULONG               LdacBaseQuality;     /* configured ceiling; ABR only reduces from it */
     ULONG               CodecFramesPerPacket;
+    ULONG               SbcSduBytes;          /* baseband SDU SBC packets are sized to (A2DP_SBC_STREAM_PLAN) */
+    ULONG               PayloadRoom;          /* media MTU less the RTP and payload headers */
     ULONG               EncoderPcmFormat;     /* PNA2DP_FMT_* expected by the encoder */
+    ULONG               Decimation;           /* engine frames per codec frame: 1, or 2 (half-band 2:1) */
     PUCHAR              ConvBuffer;           /* PCM converted to encoder format */
     ULONG               ConvCapacity;
 
@@ -114,16 +131,30 @@ typedef struct _PN_PUMP {
     BOOLEAN             UseRtpHeader;
     BOOLEAN             UsePayloadHeader;     /* 1-byte frame count header */
     ULONG               TargetLatencyMs;
-    ULONG               MaxLatencyMs;
+    ULONG               MaxLatencyMs;         /* as configured; clamped below the ring size where used */
     ULONG               MaxWritesInFlight;
+    ULONG               TxHeaderBytes;        /* RTP + media payload header per write */
+    KSPIN_LOCK          TxLock;
+    PN_TX_LEDGER        TxLedger;             /* outstanding media writes, under TxLock */
+    LONGLONG            TxStreamStartHns;     /* completions of writes submitted earlier are stale */
+    ULONG               TxSendAvgUs;          /* smoothed per-write send time, under TxLock */
+    volatile ULONG      WakeBytes;            /* one encoder input block: PCM writes wake the thread at this level */
+    volatile LONG       ResumeFade;           /* PumpFinishStream faded the stream out (PumpTakeResumeFade) */
+    BOOLEAN             Finished;             /* under Ring.Lock: PumpFinishStream padded, nothing written since */
 
     /* host path */
     ULONG               HostNextSequence;
-    LONG                HostOutstanding;
+    LONG                HostOutstanding;      /* HostLedger.Count, readable without the lock */
+    PN_HOST_LEDGER      HostLedger;           /* outstanding ENCODE requests, under HostLock */
+    ULONG               HostPendingSkip;      /* PCM frames of dropped blocks not yet queued, under HostLock */
     LIST_ENTRY          HostResults;          /* PN_ENCODED_BLOCK ordered by sequence */
     ULONG               HostResultCount;      /* under HostLock */
+    ULONG               HostQueuedPcmFrames;  /* PCM frames of HostResults, under HostLock */
+    volatile LONG       HostWaitingForWork;   /* a block waits for the host to pend GET_WORK */
+    LIST_ENTRY          HostFreeBlocks;       /* preallocated PN_ENCODED_BLOCKs, under HostLock */
     KSPIN_LOCK          HostLock;
     ULONG               HostTimeouts;
+    PN_HOST_STALL       HostStall;            /* one failure per stall episode (finding #19), under HostLock */
     ULONG               HostRoundTripAvgUs;
     LONGLONG            HostLastSubmitHns;
 
@@ -131,8 +162,11 @@ typedef struct _PN_PUMP {
     LONG                VolumeDb16;           /* 16.16 dB, 0 = unity */
     ULONG               VolumeGainQ15;        /* linear gain, Q15 (32768 = unity) */
     BOOLEAN             Muted;
+    PN_PCM_STATE        PcmState;             /* gain ramp + trim crossfade, pump thread only */
+    PUCHAR              FadeBuffer;           /* PN_PUMP_FADE_BYTES */
 
     PN_ABR              Abr;
+    BOOLEAN             StallReported;  /* C4: this stall episode was reported to the device (pump thread) */
     PNA2DP_QUALITY      Quality;        /* published snapshot, protected by Lock */
     PNA2DP_STATS        Stats;
     ULONG               TxAvgUs;
@@ -152,6 +186,17 @@ VOID     PumpReleaseInput(_Inout_ PPN_PUMP P);
 /* DISPATCH: copy bytes from the WaveRT buffer into the ring. */
 VOID     PumpWritePcm(_Inout_ PPN_PUMP P, _In_reads_bytes_(Length) const UCHAR *Data, _In_ ULONG Length);
 VOID     PumpFlush(_Inout_ PPN_PUMP P);
+/* <= DISPATCH, when the engine stops feeding the ring (KS pause, its end of stream; findings
+ * #15/#26): Tail (the WaveRT stream's held-back frames, may be NULL) is appended and, while a
+ * stream runs, the PCM waiting for a whole encoder block ends with a short fade and is padded
+ * with silence, plus enough silence to drain the encoder's delay, so the receiver hears the
+ * sound end instead of an underrun mid-waveform and a later start carries no stale fragment.
+ * All under one ring-lock hold: the pump thread cannot encode the tail unfaded in between
+ * (findings #1/#7). An empty ring is padded too; once per run of written audio. */
+VOID     PumpFinishStream(_Inout_ PPN_PUMP P, _In_reads_bytes_opt_(TailBytes) const UCHAR *Tail, _In_ ULONG TailBytes);
+/* <= DISPATCH, at the next KS run: TRUE once after PumpFinishStream faded the stream out, so
+ * the resumed audio fades in from that silence. */
+BOOLEAN  PumpTakeResumeFade(_Inout_ PPN_PUMP P);
 
 /* Start/stop encoding and transmission on a connected media channel (PASSIVE). */
 NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, _In_ PPN_L2CAP_CHANNEL Media,
@@ -170,10 +215,22 @@ VOID     PumpOnWriteDone(_Inout_ PPN_PUMP P, _In_ NTSTATUS Status, _In_ ULONG By
 /* Codec host results (PASSIVE, from IOCTL) */
 NTSTATUS PumpHostResult(_Inout_ PPN_PUMP P, _In_ const PNA2DP_CODEC_RESULT *R, _In_reads_bytes_(R->PayloadBytes) const UCHAR *Payload);
 VOID     PumpHostLost(_Inout_ PPN_PUMP P);
+/* <= DISPATCH: the host pended a GET_WORK request; wakes the pump if a block waits for one. */
+VOID     PumpHostWorkPended(_Inout_ PPN_PUMP P);
 
 VOID     PumpGetStats(_In_ PPN_PUMP P, _Out_ PPNA2DP_STATS Stats);
 VOID     PumpGetQuality(_In_ PPN_PUMP P, _Out_ PNA2DP_QUALITY *Quality);
 VOID     PumpResetStats(_Inout_ PPN_PUMP P);
 NTSTATUS PumpSbcSample(_Inout_ PPN_PUMP P, _In_ ULONG Action, _Out_opt_ PNA2DP_SBC_SAMPLE *Sample);
 ULONG    PumpCurrentBitrate(_In_ PPN_PUMP P);
-ULONG    PumpEstimatedLatencyUs(_In_ PPN_PUMP P);
+/* <= DISPATCH: the stream's effective bitrate ceiling (ABR level 0 after the MTU caps), 0 when not streaming. */
+ULONG    PumpCeilingBitrate(_In_ PPN_PUMP P);
+/* <= DISPATCH: the WaveRT side found no new data for `Packets` packets (contract C5). */
+VOID     PumpNoteWaveStarvation(_Inout_ PPN_PUMP P, _In_ ULONG Packets);
+/* <= DISPATCH (contract C3): PCM in the ring + held by the codec host + encoded and
+ * queued + in L2CAP writes, plus the measured send time of one write. Sink delay excluded. */
+ULONG    PumpPipelineLatencyUs(_In_ PPN_PUMP P);
+ULONG    PumpEstimatedLatencyUs(_In_ PPN_PUMP P);   /* = PumpPipelineLatencyUs */
+ULONG    PumpLatencyEpoch(_In_ PPN_PUMP P);         /* changes whenever a stream starts or stops (ring flushed) */
+/* <= DISPATCH (contract C4): streaming, media writes outstanding and none completed for ThresholdMs. */
+BOOLEAN  PumpMediaStalled(_In_ PPN_PUMP P, _In_ ULONG ThresholdMs);

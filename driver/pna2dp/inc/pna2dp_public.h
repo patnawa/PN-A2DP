@@ -33,6 +33,13 @@ DEFINE_GUID(GUID_DEVINTERFACE_PNA2DP,
 
 #define PNA2DP_CTL(code, access)    CTL_CODE(PNA2DP_DEVICE_TYPE, (code), METHOD_BUFFERED, (access))
 
+/* Besides the FILE_*_ACCESS bits, the driver checks the caller role recorded when the control
+ * handle was opened and fails other callers with ERROR_ACCESS_DENIED:
+ *   GET_TRACE, SBC_SAMPLE  - elevated administrator or LocalSystem;
+ *   CODEC_*                - LocalSystem only (the codec host service), and
+ *                            CODEC_REGISTER.HostPid must be the calling process;
+ *   everything else        - any caller (the control panel runs unelevated). */
+
 /* ---- Status / configuration (control tools) ---------------------------------- */
 #define IOCTL_PNA2DP_GET_VERSION        PNA2DP_CTL(0x800, FILE_READ_ACCESS)
 #define IOCTL_PNA2DP_GET_STATUS         PNA2DP_CTL(0x801, FILE_READ_ACCESS)
@@ -199,6 +206,9 @@ typedef struct _PNA2DP_STATUS {
 #define PNA2DP_STATUS_FLAG_AUDIO_ACTIVE      0x00000040  /* WaveRT pin in RUN */
 #define PNA2DP_STATUS_FLAG_RADIO_IN_RANGE    0x00000080
 #define PNA2DP_STATUS_FLAG_REMOTE_VOLUME     0x00000100  /* Windows confirmed receiver volume */
+#define PNA2DP_STATUS_FLAG_REMOTE_SUSPENDED  0x00000200  /* the receiver suspended the stream */
+#define PNA2DP_STATUS_FLAG_UNREACHABLE       0x00000400  /* link lost or media stalled; retrying */
+#define PNA2DP_STATUS_FLAG_HALF_RATE         0x00000800  /* engine at twice SampleRate: 2:1 decimation */
 
 /* One remote stream endpoint (SEP) as reported by AVDTP GET_(ALL_)CAPABILITIES. */
 typedef struct _PNA2DP_REMOTE_SEP {
@@ -304,6 +314,9 @@ typedef struct _PNA2DP_CONFIG {
 #define PNA2DP_CFG_DUAL_CHANNEL_PREFER   0x00000080  /* SBC: prefer dual channel over joint */
 #define PNA2DP_CFG_HOST_CODECS_ONLY      0x00000100  /* never fall back to kernel SBC */
 #define PNA2DP_CFG_AUTO_QUALITY          0x00000200  /* adapter-aware limits + live ABR */
+#define PNA2DP_CFG_SBC_XQ                0x00000400  /* SBC: dual channel, 16 blocks, 8 subbands at the bitpool
+                                                        plain dual channel gets, packed to the EDR packets
+                                                        both ends take; default off */
 
 /* Optional read-only extension: older ABI-1 drivers may reject GET_QUALITY. */
 #define PNA2DP_QUALITY_RADIO_VALID       0x00000001
@@ -366,13 +379,14 @@ typedef struct _PNA2DP_QUALITY {
 
 typedef struct _PNA2DP_STATS {
     ULONG      Size;
-    ULONGLONG  PcmFramesConsumed;
+    ULONGLONG  PcmFramesConsumed;   /* PCM frames taken from the WaveRT ring (engine rate) */
     ULONGLONG  EncodedFrames;
     ULONGLONG  PacketsSent;
     ULONGLONG  BytesSent;
     ULONGLONG  PacketsDropped;      /* dropped by ABR / latency guard */
     ULONGLONG  WriteFailures;
-    ULONGLONG  Underruns;           /* WaveRT buffer had no new data */
+    ULONGLONG  Underruns;           /* latency-guard trims: buffered PCM discarded to bound latency
+                                       (historical name; WaveRT starvation is WaveStarvedPackets) */
     ULONG      QueueDepthPackets;   /* outstanding L2CAP writes */
     ULONG      QueueDepthMaxPackets;
     ULONG      TxCompletionAvgUs;   /* moving average L2CAP write completion time */
@@ -385,7 +399,11 @@ typedef struct _PNA2DP_STATS {
     ULONG      TransportWaits;      /* retained PCM/results while TX queue was full */
     ULONG      WaveLateTicks;       /* timer callbacks later than a notification period */
     ULONG      WaveMaxTickUs;
-    ULONG      Reserved[4];
+    /* Former Reserved[4]: size and offsets unchanged; older drivers report 0. */
+    ULONG      WaveStarvedPackets;  /* packets the WaveRT side had no new PCM for */
+    ULONG      RingOverflowEvents;  /* PCM ring overruns: oldest audio discarded (events, not bytes) */
+    ULONG      FragmentedPackets;   /* AAC access units that needed more than one RTP packet */
+    ULONG      HostDroppedBlocks;   /* encode blocks lost at the codec host (bad, invalid or unanswered) */
 } PNA2DP_STATS, *PPNA2DP_STATS;
 
 /* ---- Codec host protocol ----------------------------------------------------- */

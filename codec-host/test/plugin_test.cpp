@@ -46,6 +46,17 @@ static void FillParams(PNA2DP_STREAM_PARAMS &p, uint32_t codec)
 
 static uint32_t BytesPerSample(uint32_t fmt) { return fmt == PNA2DP_FMT_S16 ? 2 : fmt == PNA2DP_FMT_S24 ? 3 : 4; }
 
+/* The driver's aptX packet (audio_policy.h PnAptxBlocksPerPacket): 4-byte (HD: 6-byte)
+ * codewords filling the payload room in multiples of 8, at most 160 (LL: 112). */
+static uint32_t AptxBlocks(uint32_t codec, uint32_t room)
+{
+    uint32_t n = room / (codec == PNA2DP_CODEC_APTX_HD ? 6u : 4u);
+    uint32_t cap = codec == PNA2DP_CODEC_APTX_LL ? 112u : 160u;
+    if (n > cap) n = cap;
+    if (n >= 8) n -= n % 8;
+    return n ? n : 1;
+}
+
 static void TestOpenContract(const PnCodecPlugin *api, uint32_t codec)
 {
     for (unsigned variant = 0; variant < 5; ++variant) {
@@ -116,7 +127,7 @@ static void TestCodec(const PnCodecPlugin *api, const PNA2DP_STREAM_PARAMS &p, u
         o.buffer = out.data() + 16; o.capacity = cap;
         int rc = api->encode(e, pcm.data(), (uint32_t)pcm.size(), framesPerBlock, &o);
         if (rc != 0) { printf("  codec %u: encode FAILED (%d) at block %u\n", codec, rc, b); failures++; break; }
-        bool valid = o.written <= cap && (codec == PNA2DP_CODEC_AAC || o.written <= p.MediaMtu);
+        bool valid = o.written <= cap && o.written <= p.MediaMtu;   /* AAC too: one access unit per packet */
         for (unsigned k = 0; k < 16; ++k) valid = valid && out[k] == 0xcd && out[cap + 16 + k] == 0xcd;
         if (o.written && (!o.frame_count || !o.pcm_frames_consumed)) valid = false;
         if (!valid) { printf("  invalid output metadata/bounds for codec %u\n", codec); ++failures; break; }
@@ -155,7 +166,7 @@ static void TestCodec(const PnCodecPlugin *api, const PNA2DP_STREAM_PARAMS &p, u
         PnCodecOutput next = {};
         next.buffer = out.data() + 16; next.capacity = cap;
         int rc = api->encode(e, pcm.data(), (uint32_t)pcm.size(), framesPerBlock, &next);
-        bool valid = !rc && next.written <= cap && (codec == PNA2DP_CODEC_AAC || next.written <= p.MediaMtu);
+        bool valid = !rc && next.written <= cap && next.written <= p.MediaMtu;
         for (unsigned k = 0; k < 16; ++k) valid = valid && out[k] == 0xcd && out[cap + 16 + k] == 0xcd;
         if (next.written && (!next.frame_count || !next.pcm_frames_consumed)) valid = false;
         if (!valid) { puts("  encoding after live reconfiguration failed"); ++failures; break; }
@@ -175,7 +186,7 @@ static void TestCodec(const PnCodecPlugin *api, const PNA2DP_STREAM_PARAMS &p, u
         for (unsigned block=0; block<64; ++block) {
             PnCodecOutput output{}; output.buffer = out.data()+16; output.capacity = cap;
             int rc = api->encode(e, pcm.data(), (uint32_t)pcm.size(), framesPerBlock, &output);
-            bool valid = !rc && output.written <= cap && (codec == PNA2DP_CODEC_AAC || output.written <= p.MediaMtu);
+            bool valid = !rc && output.written <= cap && output.written <= p.MediaMtu;
             for (unsigned k=0; k<16; ++k) valid = valid && out[k] == 0xcd && out[cap+16+k] == 0xcd;
             if (!valid) { puts("  output invalid after flush/reconfiguration"); ++failures; break; }
             emitted += output.written;
@@ -185,6 +196,129 @@ static void TestCodec(const PnCodecPlugin *api, const PNA2DP_STREAM_PARAMS &p, u
     api->close(e);
     if (encoded && fclose(encoded)) ++failures;
     if (reference && fclose(reference)) ++failures;
+}
+
+/* AAC: every access unit plus LATM must fit the payload room of one RTP packet, at the
+ * sink's 320 kbps ceiling, for worst-case (uncorrelated full-scale noise) input, in CBR
+ * and VBR, before and after live bitrate changes. MTU 895 (Sony CMT-SBT40D class):
+ * 883 bytes of payload after the 12-byte RTP header. */
+static void TestAacPacketFit(const PnCodecPlugin *api)
+{
+    for (uint32_t rate : {44100u, 48000u}) for (int vbr = 0; vbr < 2; ++vbr) for (uint32_t room : {883u, 600u}) {
+        PNA2DP_STREAM_PARAMS p; FillParams(p, PNA2DP_CODEC_AAC);
+        p.SampleRate = rate; p.MediaMtu = room; p.BitrateBps = 320000;
+        p.CodecInfo[3] = (uint8_t)(vbr ? (p.CodecInfo[3] | 0x80) : (p.CodecInfo[3] & 0x7f));
+        PnCodecEncoder *e = api->open(&p);
+        if (!e) { printf("  AAC fit: open failed at %u Hz\n", rate); ++failures; continue; }
+        std::vector<int16_t> pcm(1024 * 2);
+        std::vector<uint8_t> out(8192);
+        uint32_t seed = 12345, largest = 0, over = 0, blocks = 0;
+        for (unsigned phase = 0; phase < 3; ++phase) {
+            if (phase == 1 && api->reconfigure && api->reconfigure(e, 0, 128000)) { puts("  AAC fit: reconfigure failed"); ++failures; }
+            if (phase == 2 && api->reconfigure && api->reconfigure(e, 0, 320000)) { puts("  AAC fit: reconfigure failed"); ++failures; }
+            for (unsigned b = 0; b < (phase == 0 ? 150u : 60u); ++b) {
+                for (size_t i = 0; i < pcm.size(); ++i) { seed = seed * 1664525u + 1013904223u; pcm[i] = (int16_t)(seed >> 16); }
+                PnCodecOutput o = {}; o.buffer = out.data(); o.capacity = (uint32_t)out.size();
+                if (api->encode(e, (const uint8_t *)pcm.data(), (uint32_t)(pcm.size() * 2), 1024, &o)) { puts("  AAC fit: encode failed"); ++failures; break; }
+                if (o.written > largest) largest = o.written;
+                if (o.written > room) ++over;
+                ++blocks;
+            }
+        }
+        api->close(e);
+        printf("  AAC fit %u Hz %s room %u: largest AU %u bytes, %u of %u over\n", rate, vbr ? "VBR" : "CBR", room, largest, over, blocks);
+        if (over) { printf("  FAIL: AAC access units exceed one packet\n"); ++failures; }
+    }
+}
+
+/* Dense stereo noise blocks for bitrate checks. */
+static void NoiseBlock(std::vector<int16_t> &pcm, uint32_t &seed)
+{
+    for (size_t i = 0; i < pcm.size(); ++i) { seed = seed * 1664525u + 1013904223u; pcm[i] = (int16_t)((int32_t)(seed >> 16) / 2); }
+}
+
+/* Average bytes per AU over Blocks blocks, and the largest. */
+static double AacRun(const PnCodecPlugin *api, PnCodecEncoder *e, unsigned Blocks, uint32_t &seed, uint32_t &largest)
+{
+    std::vector<int16_t> pcm(1024 * 2);
+    std::vector<uint8_t> out(8192);
+    uint64_t total = 0;
+    largest = 0;
+    for (unsigned b = 0; b < Blocks; ++b) {
+        NoiseBlock(pcm, seed);
+        PnCodecOutput o = {}; o.buffer = out.data(); o.capacity = (uint32_t)out.size();
+        if (api->encode(e, (const uint8_t *)pcm.data(), (uint32_t)(pcm.size() * 2), 1024, &o)) { puts("  AAC: encode failed"); ++failures; return 0; }
+        total += o.written;
+        if (o.written > largest) largest = o.written;
+    }
+    return (double)total / Blocks;
+}
+
+/* Sound-quality review. AAC #10: every ABR step below the configured VBR quality is a real
+ * reduction to (about) the rung's bitrate; #12: VBR access units stay within the bitrate the
+ * sink was configured with. */
+static void TestAacQualityReview(const PnCodecPlugin *api)
+{
+    const uint32_t rate = 48000, room = 883;
+    {
+        PNA2DP_STREAM_PARAMS p; FillParams(p, PNA2DP_CODEC_AAC);
+        p.SampleRate = rate; p.MediaMtu = room; p.BitrateBps = 320000; p.CodecInfo[3] |= 0x80;   /* VBR, 320 kbps declared */
+        PnCodecEncoder *e = api->open(&p);
+        if (!e) { puts("  AAC review: open failed"); ++failures; return; }
+        uint32_t seed = 777, largest = 0;
+        double top = AacRun(api, e, 200, seed, largest);
+        double kbpsTop = top * 8 * rate / 1024 / 1000;
+        static const uint32_t ladder[] = { 256000, 192000, 128000 };
+        double prev = kbpsTop;
+        for (uint32_t level = 1; level <= 3; ++level) {
+            if (!api->reconfigure || api->reconfigure(e, level, ladder[level - 1])) { puts("  AAC review: reconfigure failed"); ++failures; break; }
+            double kbps = AacRun(api, e, 200, seed, largest) * 8 * rate / 1024 / 1000;
+            printf("  AAC VBR ladder: level %u (%u kbps) -> %.1f kbps (level 0: %.1f)\n", level, ladder[level - 1] / 1000, kbps, kbpsTop);
+            if (!(kbps < prev * 0.95 && kbps <= ladder[level - 1] / 1000.0 * 1.03)) {
+                printf("  FAIL[Q10]: AAC ABR level %u is not a reduction to its rung\n", level); ++failures;
+            }
+            prev = kbps;
+        }
+        /* back to the configured quality */
+        if (api->reconfigure(e, 0, 320000)) { puts("  AAC review: reconfigure failed"); ++failures; }
+        double back = AacRun(api, e, 200, seed, largest) * 8 * rate / 1024 / 1000;
+        if (back < kbpsTop * 0.9) { printf("  FAIL: AAC level 0 after the ladder: %.1f kbps\n", back); ++failures; }
+        api->close(e);
+    }
+    for (uint32_t declared : { 256000u, 128000u }) {
+        PNA2DP_STREAM_PARAMS p; FillParams(p, PNA2DP_CODEC_AAC);
+        p.SampleRate = rate; p.MediaMtu = room; p.BitrateBps = declared;
+        p.CodecInfo[3] = (uint8_t)(0x80 | ((declared >> 16) & 0x7f)); p.CodecInfo[4] = (uint8_t)(declared >> 8); p.CodecInfo[5] = (uint8_t)declared;
+        PnCodecEncoder *e = api->open(&p);
+        if (!e) { puts("  AAC review: open failed"); ++failures; continue; }
+        uint32_t seed = 99, largest = 0;
+        double avg = AacRun(api, e, 300, seed, largest);
+        double kbps = avg * 8 * rate / 1024 / 1000;
+        uint32_t peakBytes = (uint32_t)((uint64_t)declared * 1024 / rate / 8);
+        printf("  AAC VBR declared %u kbps: average %.1f kbps, largest AU %u bytes (peak %u)\n", declared / 1000, kbps, largest, peakBytes);
+        if (kbps > declared / 1000.0 * 1.02 || largest > peakBytes + 16) { printf("  FAIL[Q12]: AAC VBR exceeds the declared %u kbps\n", declared / 1000); ++failures; }
+        api->close(e);
+    }
+}
+
+/* aptX #16/#33: a packet of 160 codewords (4 bytes, HD 6) fills the MTU; frame_count counts codewords. */
+static void TestAptxQualityReview(const PnCodecPlugin *api)
+{
+    for (uint32_t c : { (uint32_t)PNA2DP_CODEC_APTX, (uint32_t)PNA2DP_CODEC_APTX_HD }) {
+        PNA2DP_STREAM_PARAMS p; FillParams(p, c);
+        p.MediaMtu = c == PNA2DP_CODEC_APTX_HD ? 1011 - 12 : 1011;
+        PnCodecEncoder *e = api->open(&p);
+        if (!e) { puts("  aptX review: open failed"); ++failures; continue; }
+        uint32_t blocks = AptxBlocks(c, p.MediaMtu), cw = c == PNA2DP_CODEC_APTX_HD ? 6 : 4;
+        std::vector<uint8_t> pcm((size_t)blocks * 4 * 2 * 3, 0), out(4096);
+        PnCodecOutput o = {}; o.buffer = out.data(); o.capacity = (uint32_t)out.size();
+        int rc = api->encode(e, pcm.data(), (uint32_t)pcm.size(), blocks * 4, &o);
+        printf("  aptX%s: %u codewords -> %u bytes of %u, frame_count %u\n", c == PNA2DP_CODEC_APTX_HD ? " HD" : "", blocks, o.written, p.MediaMtu, o.frame_count);
+        if (rc || blocks != 160 || o.written != blocks * cw || o.frame_count != blocks || o.pcm_frames_consumed != blocks * 4) {
+            printf("  FAIL[Q16]: aptX packet does not fill the MTU\n"); ++failures;
+        }
+        api->close(e);
+    }
 }
 
 int main(int argc, char **argv)
@@ -205,6 +339,8 @@ int main(int argc, char **argv)
         const PnCodecPlugin *api = fn ? fn() : nullptr;
         if (!api || api->api_version != PNA2DP_PLUGIN_API_VERSION || !api->open || !api->encode || !api->close) { printf("%ls: invalid plugin ABI\n", fd.cFileName); failures++; FreeLibrary(m); continue; }
         printf("%ls: %s %s (%s) codecs 0x%08x\n", fd.cFileName, api->name, api->version, api->license, api->codec_mask);
+        if (api->codec_mask & PNA2DP_CODEC_BIT(PNA2DP_CODEC_AAC)) { TestAacPacketFit(api); TestAacQualityReview(api); }
+        if (api->codec_mask & PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_HD)) TestAptxQualityReview(api);
         for (uint32_t c = 1; c < PNA2DP_CODEC_MAX; c++) {
             if (!(api->codec_mask & PNA2DP_CODEC_BIT(c))) continue;
             TestOpenContract(api, c);
@@ -224,8 +360,8 @@ int main(int argc, char **argv)
                                 p.ChannelMode = mode;
                                 p.MediaMtu = mtu; p.QualityIndex = quality;
                                 if (c == PNA2DP_CODEC_LDAC && mtu < 666) p.MediaMtu = 666; // libldac's documented minimum full MTU is 679
-                                if (c == PNA2DP_CODEC_AAC && mtu == 337) p.CodecInfo[3] &= 0x7f; // CBR frames require RTP fragmentation
-                                uint32_t frames = c == PNA2DP_CODEC_AAC ? 1024 : c == PNA2DP_CODEC_LDAC ? (rate >= 88200 ? 256 : 128) : (mtu / (c == PNA2DP_CODEC_APTX_HD ? 12 : 8)) * 4;
+                                if (c == PNA2DP_CODEC_AAC && mtu == 337) p.CodecInfo[3] &= 0x7f; // CBR must also fit one packet
+                                uint32_t frames = c == PNA2DP_CODEC_AAC ? 1024 : c == PNA2DP_CODEC_LDAC ? (rate >= 88200 ? 256 : 128) : AptxBlocks(c, mtu) * 4;
                                 TestCodec(api, p, frames);
                             }
                         }

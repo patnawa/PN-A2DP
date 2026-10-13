@@ -10,6 +10,8 @@
 
 static unsigned failures, checks;
 #define CHECK(c) do { ++checks; if (!(c)) { ++failures; printf("FAIL line %d: %s\n", __LINE__, #c); } } while (0)
+#include "core_test_S.inl"
+#include "core_test_W.inl"
 
 static void TestCodecNegotiation()
 {
@@ -147,8 +149,9 @@ static void TestPcm()
         CHECK(std::abs(double(attenuated[0]) - 20000.0 * gain / 32768.0) <= 0.5);
         CHECK(std::abs(double(attenuated[1]) + 20000.0 * gain / 32768.0) <= 0.5);
     }
+    /* NaN and +-Inf are silence: an Inf was a full-scale one-sample pop (quality harness) */
     ULONG floats[] = {0, 0x3f800000, 0xbf800000, 0x3f000000, 0xbf000000, 0x7fc00000, 0x7f800000, 0xff800000, 1};
-    LONG expected[] = {0, 2147483647, (-2147483647L - 1), 1073741824, -1073741824, 0, 2147483647, (-2147483647L - 1), 0};
+    LONG expected[] = {0, 2147483647, (-2147483647L - 1), 1073741824, -1073741824, 0, 0, 0, 0};
     LONG out[9] = {};
     CHECK(PnConvertPcm((UCHAR*)floats, sizeof(floats), 1, 32, 32, TRUE, (UCHAR*)out, sizeof(out), PNA2DP_FMT_S32, 1, 32768) == sizeof(out));
     CHECK(memcmp(out, expected, sizeof(out)) == 0);
@@ -291,6 +294,14 @@ static void TestAudioPolicy()
     CHECK(PnLdacAbrQuality(1, 0) == 1 && PnLdacAbrQuality(1, 1) == 2); // SQ must not upgrade on congestion
     CHECK(PnLdacAbrQuality(2, 0) == 2 && PnLdacAbrQuality(2, 1) == 2);
     CHECK(PnLdacAbrQuality(0, 0xffffffff) == 2);
+    /* KSPROPSETID_BtAudio one-shots: Windows' Connect / Disconnect send GET with no value */
+    CHECK(PnBtAudioOneShotVerbAccepted(PN_KS_VERB_GET));
+    CHECK(PnBtAudioOneShotVerbAccepted(PN_KS_VERB_GET | 0x10000000UL));   /* KSPROPERTY_TYPE_TOPOLOGY */
+    CHECK(PnBtAudioOneShotVerbAccepted(PN_KS_VERB_SET));                  /* earlier callers */
+    CHECK(!PnBtAudioOneShotVerbAccepted(PN_KS_VERB_BASICSUPPORT));
+    CHECK(!PnBtAudioOneShotVerbAccepted(0));
+    CHECK(!PnBtAudioOneShotVerbAccepted(0x00000100UL));                   /* KSPROPERTY_TYPE_SETSUPPORT */
+    static_assert((PN_BTAUDIO_ONESHOT_ACCESS & PN_KS_VERB_GET) && (PN_BTAUDIO_ONESHOT_ACCESS & PN_KS_VERB_SET), "basic support advertises GET and SET");
 }
 
 static void TestQualityCodecLimits()
@@ -325,10 +336,19 @@ static void TestQualityCodecLimits()
     }
 }
 
+#include "core_test_P.inl"
+#include "core_test_T.inl"
+#include "core_test_G.inl"
+
 int main()
 {
     TestCodecNegotiation(); TestRtp(); TestPcm(); TestAvdtp(); TestAudioPolicy(); TestQualityCodecLimits();
     TestMalformedPackets();
+    TestLaneP();
+    TestControlAccess();
+    TestLaneW();
+    TestLaneT();
+    TestGlue();
     printf("%s (%u checks, %u failures)\n", failures ? "FAILED" : "PASSED", checks, failures);
     return failures ? 1 : 0;
 }

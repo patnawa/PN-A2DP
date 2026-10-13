@@ -47,7 +47,8 @@ function New-CodecSourceBundle {
     $revision = (git -C (Join-Path $CodecDistributionRoot $spec.Library) rev-parse HEAD).Trim()
     if ($LASTEXITCODE) { throw 'Cannot read upstream revision.' }
     $archivePath = Join-Path $output "sources-$Codec.zip"
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    # Windows PowerShell 5.1 resolves [IO.Compression.ZipArchiveMode] only once System.IO.Compression is loaded.
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
     if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force }
     $archive = [IO.Compression.ZipFile]::Open($archivePath, [IO.Compression.ZipArchiveMode]::Create)
     try {

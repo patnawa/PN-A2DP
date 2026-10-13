@@ -8,6 +8,9 @@
  * SPDX-License-Identifier: MIT
  */
 #pragma once
+#include "wave_math.h"
+#include "wave_formats.h"
+#include "audio_notify.h"
 
 #define PN_WAVE_NAME        L"Wave"
 #define PN_TOPO_NAME        L"Topology"
@@ -65,15 +68,28 @@ class CPnAdapterCommon : public IPnAdapterCommon, public IAdapterPowerManagement
     PPNA2DP_DEVICE      m_Device;
     PUNKNOWN            m_WavePort;
     PUNKNOWN            m_TopoPort;
+    /* Each attached miniport holds a reference from the adapter until RemoveFilters, so a
+     * pointer taken under m_MiniportLock (ReferenceWave/ReferenceTopology) stays valid
+     * while it is used, even if the filters are removed concurrently. */
+    KSPIN_LOCK          m_MiniportLock;
     CPnMiniportWaveRT  *m_Wave;
     CPnMiniportTopology *m_Topology;
     LONG                m_Volume[2];
     BOOL                m_Mute[2];
     DEVICE_POWER_STATE  m_PowerState;
+    /* Contract C6 (audio_notify.h): device notifications are handled by one PASSIVE work
+     * item, which holds a reference on this object while it is queued or running. */
+    PIO_WORKITEM        m_NotifyWorkItem;
+    PN_AUDIO_NOTIFY     m_Notify;
+    volatile LONG       m_JackConnected;    /* KSJACK_DESCRIPTION.IsConnected */
+    volatile LONG       m_Detached;         /* RemoveFilters ran: no more notification work */
 
     NTSTATUS InstallSubdevice(_In_ PIRP Irp, _In_ PRESOURCELIST Resources, _In_ PCWSTR Name, _In_ REFGUID PortClassId,
                               _In_ PUNKNOWN Miniport, _Out_ PUNKNOWN *OutPort);
     NTSTATUS UnregisterSubdevice(_In_opt_ PUNKNOWN Port);
+    VOID DetachMiniports();
+    VOID RunNotify();
+    static IO_WORKITEM_ROUTINE NotifyWorker;
 
 public:
     DECLARE_STD_UNKNOWN();
@@ -96,9 +112,14 @@ public:
 
     WDFDEVICE GetWdfDevice() { return m_WdfDevice; }
     PDEVICE_OBJECT GetPdo() { return m_Pdo; }
-    VOID SetTopologyMiniport(_In_opt_ CPnMiniportTopology *Topology) { m_Topology = Topology; }
+    VOID SetTopologyMiniport(_In_opt_ CPnMiniportTopology *Topology);   /* referenced until RemoveFilters */
+    CPnMiniportTopology *ReferenceTopology();   /* NULL or a referenced miniport: Release it */
+    CPnMiniportWaveRT *ReferenceWave();         /* NULL or a referenced miniport: Release it */
     VOID SetRemoteVolume(_In_ LONG Db16);
     VOID DisableRemoteVolume();
+    VOID RequestNotify(_In_ LONG Bits);                 /* <= DISPATCH, PN_AUDIO_NOTIFY_* */
+    VOID SetJackConnected(_In_ BOOLEAN Connected);      /* <= DISPATCH */
+    BOOLEAN JackConnected() { return m_JackConnected != 0; }
 };
 
 NTSTATUS NewPnAdapterCommon(_Out_ PUNKNOWN *Unknown, _In_ REFCLSID, _In_opt_ PUNKNOWN UnknownOuter, _In_ POOL_FLAGS PoolFlags);
@@ -106,7 +127,7 @@ NTSTATUS NewPnAdapterCommon(_Out_ PUNKNOWN *Unknown, _In_ REFCLSID, _In_opt_ PUN
 /* ------------------------------------------------------------------------- */
 /* WaveRT miniport                                                             */
 /* ------------------------------------------------------------------------- */
-#define PN_MAX_FORMATS   12
+#define PN_MAX_FORMATS   PN_WAVE_MAX_FORMATS
 
 class CPnMiniportWaveRT : public IMiniportWaveRT, public IMiniportAudioSignalProcessing, public CUnknown
 {
@@ -118,14 +139,25 @@ class CPnMiniportWaveRT : public IMiniportWaveRT, public IMiniportAudioSignalPro
     PPNA2DP_DEVICE              m_Device;
     CPnMiniportWaveRTStream    *m_Stream;        /* single render stream */
     KSPIN_LOCK                  m_Lock;
+    /* The format table is rebuilt at PASSIVE (Init, PnAudioFormatsChanged). m_FormatMutex
+     * covers the rebuild and every reader of the table (all PASSIVE). */
+    FAST_MUTEX                  m_FormatMutex;
     ULONG                       m_FormatCount;
+    PN_WAVE_FORMAT              m_FormatList[PN_MAX_FORMATS];
     KSDATAFORMAT_WAVEFORMATEXTENSIBLE m_Formats[PN_MAX_FORMATS];
-    KSDATARANGE_AUDIO           m_DataRange;     /* min/max envelope of m_Formats */
-    PKSDATARANGE                m_DataRangePointers[2];
+    PNA2DP_CAPABILITIES         m_CapsScratch;   /* rebuild input, under m_FormatMutex */
+    /* PortCls copies the pin descriptor (DataRangesCount included) when the filter is
+     * registered but reads the ranges through m_DataRangePointers without our lock. The
+     * envelopes are double buffered: a rebuild writes the idle copy, then swaps pointers. */
+    KSDATARANGE_AUDIO           m_Ranges[2][2];  /* [copy][PCM, IEEE float] */
+    ULONG                       m_RangeCopy;     /* copy the pointers reference */
+    PKSDATARANGE                m_DataRangePointers[4];   /* PCM, modes[, float, modes] */
+    ULONG                       m_DataRangeCount;         /* 2, or 4 with the float range; fixed at Init */
     PCPIN_DESCRIPTOR            m_Pins[2];       /* per-instance copy so each device has its own ranges */
     PCFILTER_DESCRIPTOR         m_Filter;
 
-    NTSTATUS BuildFormatTable();
+    VOID     LoadFormatInput(_Out_ PN_WAVE_FORMAT_INPUT *In);
+    BOOLEAN  BuildFormatTable();     /* TRUE if the table changed */
     NTSTATUS PropertyProposedFormat(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS PropertyProposedFormat2(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS PropertyModes(_In_ PPCPROPERTY_REQUEST Req);
@@ -133,7 +165,7 @@ class CPnMiniportWaveRT : public IMiniportWaveRT, public IMiniportAudioSignalPro
     BOOLEAN  IsFormatSupported(_In_ PKSDATAFORMAT Format);
 
 public:
-    const KSDATAFORMAT_WAVEFORMATEXTENSIBLE *MatchFormat(_In_ PKSDATAFORMAT Format);
+    _Success_(return) BOOLEAN MatchFormat(_In_ PKSDATAFORMAT Format, _Out_opt_ WAVEFORMATEXTENSIBLE *Match);
 
 public:
     DECLARE_STD_UNKNOWN();
@@ -151,6 +183,7 @@ public:
     PPNA2DP_DEVICE Device() { return m_Device; }
     PPNADAPTERCOMMON Adapter() { return m_Adapter; }
     VOID GeneratePinCapsChange();
+    VOID FormatsChanged();           /* PASSIVE: rebuild, and raise FORMATCHANGE if it changed */
 };
 
 NTSTATUS NewPnMiniportWaveRT(_Out_ PUNKNOWN *Unknown, _In_ PPNADAPTERCOMMON Adapter, _In_ POOL_FLAGS PoolFlags);
@@ -158,6 +191,8 @@ NTSTATUS NewPnMiniportWaveRT(_Out_ PUNKNOWN *Unknown, _In_ PPNADAPTERCOMMON Adap
 /* ------------------------------------------------------------------------- */
 /* WaveRT stream                                                               */
 /* ------------------------------------------------------------------------- */
+#define PN_WAVE_FADE_SCRATCH   4096    /* one fade: 2 ms at 192 kHz, 8-byte frames = 3072 */
+
 typedef struct _PN_NOTIFY_ENTRY {
     LIST_ENTRY  Link;
     PKEVENT     Event;
@@ -190,16 +225,38 @@ class CPnMiniportWaveRTStream : public IMiniportWaveRTStreamNotification,
     LONGLONG                m_StartTimeHns;
     LONGLONG                m_LastTickHns;
     ULONGLONG               m_RateNumerator;      /* bytes/sec */
-    ULONGLONG               m_ByteRemainderHns;   /* accumulated fractional */
+    ULONGLONG               m_FrameRemainder;     /* fractional frame, hns*Hz units (PnWaveFramesDue) */
+    ULONGLONG               m_LastTickQpc;        /* QPC of the last tick, for presentation interpolation */
+    ULONG                   m_TickPeriodHns;
     LONGLONG                m_NotifyAccumHns;
     LONGLONG                m_PacketCounter;
     ULONG                   m_LastOsWritePacket;
     ULONG                   m_CurrentWritePosition;
+    PN_WAVE_STARVATION      m_Starvation;         /* packets played as silence (missed engine deadline) */
+    ULONG                   m_StarvedReported;
+    PN_WAVE_PRESENTATION    m_Presentation;
+    BOOLEAN                 m_WritePacketUsed;    /* engine reports written packets this run */
     BOOLEAN                 m_Eos;
     BOOLEAN                 m_Registered;
+    BOOLEAN                 m_Holding;            /* the clock holds for a pending stream start (wave_math.h) */
     LARGE_INTEGER           m_QpcFrequency;
+    PN_WAVE_LATE_HOLD       m_LateHold;           /* a late tick stopped at a packet the engine was not asked for */
+    ULONG                   m_OwedBytes;          /* bytes due but not played while held there */
+    /* fades at the edges of substituted silence and on resume (finding #4); under m_Lock */
+    ULONG                   m_FadeFrames;         /* frames per fade, 0 = off */
+    ULONG                   m_FadeInPos;          /* frames of the fade-in written */
+    BOOLEAN                 m_FadeInActive;
+    BOOLEAN                 m_LastSegmentSilent;
+    UCHAR                   m_FadeScratch[PN_WAVE_FADE_SCRATCH];
+    /* the newest m_FadeFrames frames are held back from the pump, so a gap can always fade
+     * the audio before it out (2 ms more latency, counted in the presentation position) */
+    UCHAR                   m_Tail[PN_WAVE_FADE_SCRATCH];
+    ULONG                   m_TailFrames;
 
     VOID Tick();
+    VOID WriteSegment(_In_ ULONG Offset, _In_ ULONG Bytes, _In_ BOOLEAN Silent);
+    VOID EmitPcm(_In_reads_bytes_(Bytes) const UCHAR *Data, _In_ ULONG Bytes);
+    VOID FlushTail(_In_ BOOLEAN FadeOut);
     VOID PublishBuffer(_In_opt_ PMDL Mdl, _In_opt_ PUCHAR Buffer, _In_ ULONG Size, _In_ ULONG Notifications);
 
 public:
@@ -241,8 +298,11 @@ public:
     NTSTATUS HandleVolume(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS HandleMute(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS HandleJack(_In_ PPCPROPERTY_REQUEST Req);
+    NTSTATUS HandleBtAudio(_In_ PPCPROPERTY_REQUEST Req);
+    static NTSTATUS EventHandlerJack(_In_ PPCEVENT_REQUEST Req);
     VOID GenerateVolumeEvent();
     VOID GenerateRemoteVolumeEvent();
+    VOID GenerateJackEvent();
 };
 
 NTSTATUS NewPnMiniportTopology(_Out_ PUNKNOWN *Unknown, _In_ PPNADAPTERCOMMON Adapter, _In_ POOL_FLAGS PoolFlags);

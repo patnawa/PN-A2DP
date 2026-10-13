@@ -1,0 +1,143 @@
+# Software verification on a hosted Windows runner: builds the unsigned driver, codec
+# host, tools and unit tests, then runs the pure unit tests, InfVerif and ApiValidator.
+# It never signs, installs or loads a driver and never talks to a Bluetooth device;
+# hardware playback is tested by hand (docs/06-testing-plan.md).
+name: verify
+
+# Manual runs only until the workflow has passed once on a hosted runner; then add
+# pull_request and push (master) triggers back.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      # build\toolchain.ps1 settings: kit 10.0.26100.0, WDK NuGet in %USERPROFILE%\wdk\c
+      PNA2DP_KIT_VER: 10.0.26100.0
+      CI_LOGS: out\ci-logs
+    steps:
+      - name: Check out (with codec submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check the Windows SDK
+        shell: powershell
+        run: |
+          $um = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include\$env:PNA2DP_KIT_VER\um\windows.h"
+          if (-not (Test-Path $um)) { throw "Windows SDK $env:PNA2DP_KIT_VER is not installed on this runner image" }
+          New-Item -ItemType Directory -Force $env:CI_LOGS | Out-Null
+
+      - name: Cache the WDK NuGet package
+        uses: actions/cache@v4
+        with:
+          path: ~/wdk
+          key: wdk-x64-10.0.26100.6584-${{ hashFiles('build/get-wdk.ps1') }}
+
+      - name: Get the WDK
+        shell: powershell
+        run: .\build\get-wdk.ps1
+
+      # Builds run in a child powershell.exe with its output redirected by cmd: PowerShell's
+      # own 2>&1 would turn cl.exe's stderr lines into terminating errors.
+      - name: Build unit tests
+        shell: cmd
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1 -Target tests -Config Release > %CI_LOGS%\build-tests.log 2>&1
+          set status=%ERRORLEVEL%
+          type %CI_LOGS%\build-tests.log
+          exit /b %status%
+
+      - name: Build driver (unsigned; runs InfVerif and ApiValidator)
+        shell: cmd
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1 -Target driver -Config Release > %CI_LOGS%\build-driver.log 2>&1
+          set status=%ERRORLEVEL%
+          type %CI_LOGS%\build-driver.log
+          exit /b %status%
+
+      - name: Build codec host, CLI and control panel
+        shell: cmd
+        run: |
+          for %%t in (host cli gui) do (
+            powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1 -Target %%t -Config Release > %CI_LOGS%\build-%%t.log 2>&1
+            if errorlevel 1 ( type %CI_LOGS%\build-%%t.log & exit /b 1 )
+            type %CI_LOGS%\build-%%t.log
+          )
+
+      - name: Build codec plugins
+        shell: cmd
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1 -Target plugins -Config Release > %CI_LOGS%\build-plugins.log 2>&1
+          set status=%ERRORLEVEL%
+          type %CI_LOGS%\build-plugins.log
+          exit /b %status%
+
+      - name: InfVerif
+        shell: powershell
+        run: |
+          . .\build\toolchain.ps1
+          & $INFVERIF /w /v out\Release\package\pna2dp.inf
+          exit $LASTEXITCODE
+
+      - name: ApiValidator
+        shell: powershell
+        run: |
+          . .\build\toolchain.ps1
+          Test-UniversalDriverApis out\Release\package\pna2dp.sys
+
+      # Pure unit tests only: nothing here opens the driver, an audio endpoint or a device.
+      - name: Unit tests
+        shell: cmd
+        run: |
+          set "failed=0"
+          mkdir out\ci-vectors out\ci-vectors\sbc out\ci-vectors\plugins
+          for %%t in (core_test secure_path_test boot_mode_test pnctl_test service_failure_test process_wait_test health_test) do (
+            echo === %%t
+            out\Release\%%t.exe > %CI_LOGS%\%%t.log 2>&1
+            if errorlevel 1 ( set "failed=1" & echo FAILED: %%t )
+            type %CI_LOGS%\%%t.log
+          )
+          echo === sbc_test
+          out\Release\sbc_test.exe out\ci-vectors\sbc > %CI_LOGS%\sbc_test.log 2>&1
+          if errorlevel 1 ( set "failed=1" & echo FAILED: sbc_test )
+          type %CI_LOGS%\sbc_test.log
+          echo === plugin_test
+          out\Release\plugin_test.exe out\Release out\ci-vectors\plugins > %CI_LOGS%\plugin_test.log 2>&1
+          if errorlevel 1 ( set "failed=1" & echo FAILED: plugin_test )
+          type %CI_LOGS%\plugin_test.log
+          exit /b %failed%
+
+      # Analysis warning counts depend on the MSVC version; this step stays advisory
+      # until build\analyze-baseline.txt is regenerated with the runner's toolset.
+      - name: Code analysis ratchet (Debug -Analyze driver)
+        continue-on-error: true
+        shell: powershell
+        run: .\build\check-analyze.ps1
+
+      - name: Collect the analysis log
+        if: always()
+        shell: powershell
+        run: |
+          foreach ($f in @('out\Debug\analyze-driver.log', 'out\Debug\analyze-driver.stderr.log')) {
+            if (Test-Path $f) { Copy-Item $f $env:CI_LOGS }
+          }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-logs
+          path: |
+            out/ci-logs/
+            out/Release/package/pna2dp.inf
+          if-no-files-found: warn

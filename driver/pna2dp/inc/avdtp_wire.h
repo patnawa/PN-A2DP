@@ -83,7 +83,10 @@
 
 #define AVDTP_MAX_SIGNAL_PAYLOAD      512    /* reassembled command payload */
 #define AVDTP_MAX_SEPS                PNA2DP_MAX_REMOTE_SEPS
-#define AVDTP_RESPONSE_TIMEOUT_MS     4000   /* TGAVDP100 is 100 ms per the spec, but sinks are slow */
+/* Signalling response timeout. GAVDP 1.3 names this timer TGAVDP100 ("100" is its number,
+ * not milliseconds) and gives it a range of 0.5 to 3 s; we use the upper end for slow
+ * sinks. A dead link then costs 3 s per command instead of the 4 s we used to wait. */
+#define AVDTP_RESPONSE_TIMEOUT_MS     3000
 #define AVDTP_LOCAL_SEP_COUNT         8
 
 typedef struct _AVDTP_LOCAL_SEP {
@@ -110,7 +113,16 @@ typedef struct _AVDTP_REMOTE_SEP {
     USHORT  VendorCodecId;
     UCHAR   CodecCaps[32];
     UCHAR   CodecCapsLength;
+    UCHAR   CpTypeMask;      /* AVDTP_CP_MASK_* of the content protection entries */
+    UCHAR   UnknownCategory; /* first service category > 8 seen (skipped), 0 if none */
 } AVDTP_REMOTE_SEP, *PAVDTP_REMOTE_SEP;
+
+/* Content protection types (Bluetooth assigned numbers), recorded as a mask */
+#define AVDTP_CP_TYPE_DTCP            0x0001
+#define AVDTP_CP_TYPE_SCMS_T          0x0002
+#define AVDTP_CP_MASK_DTCP            0x01
+#define AVDTP_CP_MASK_SCMS_T          0x02
+#define AVDTP_CP_MASK_OTHER           0x80
 
 typedef enum _AVDTP_STREAM_STATE {
     AvdtpStateIdle = 0,
@@ -136,3 +148,77 @@ typedef struct _AVDTP_REASSEMBLY {
 enum AVDTP_PARSE_RESULT { AvdtpInvalid, AvdtpMore, AvdtpComplete };
 AVDTP_PARSE_RESULT AvdtpReassemble(AVDTP_REASSEMBLY *R, const UCHAR *Data, ULONG Len);
 BOOLEAN AvdtpParseServiceCapabilities(const UCHAR *P, ULONG Len, PAVDTP_REMOTE_SEP Sep);
+
+/* DISCOVER response -> audio SEPs (non-audio entries are skipped). Returns the count. */
+ULONG AvdtpParseDiscover(const UCHAR *P, ULONG Len, PAVDTP_REMOTE_SEP Seps, ULONG Max);
+
+/* Media Codec service capability: [cat][len][media type][codec type][IEs] */
+ULONG AvdtpBuildMediaCodecCap(_Out_writes_bytes_(Cap) PUCHAR Out, _In_ ULONG Cap, _In_ UCHAR MediaCodecType,
+                              _In_reads_bytes_(Len) const UCHAR *Ies, _In_ ULONG Len);
+
+/* ---- Acceptor (ACP) command handling, without I/O ---------------------------------
+ * AvdtpAcpProcess validates one command against a snapshot of the stream and builds the
+ * response. The caller applies the effects in this order: store words (STORE_*,
+ * MEDIA_EXPECTED, RESET_DELAY), send the response, REMOTE_START / REMOTE_SUSPEND callback,
+ * RELEASE_REMOTE, MidState, media disconnect, NewState, delay callback. A SEP whose
+ * LocalSeps[i].InUse is set is reported in use by DISCOVER (T10); SET_CONFIGURATION and
+ * RECONFIGURE accept only the service categories we implement (T7); DELAYREPORT only for
+ * the SEP of a configured stream (T6). The device's codec decision for SET_CONFIGURATION / RECONFIGURE is a
+ * callback, made at the same point as before (returns an AVDTP/A2DP error, 0 = accept).
+ * The acceptor runs while a command of ours is outstanding (IntSignal, T9): a receiver
+ * SET_CONFIGURATION during ours is refused SEP_IN_USE (one stream per device), a receiver
+ * OPEN during ours BAD_STATE (one side connects the transport); everything else is
+ * answered as usual, at once. The media disconnect runs outside the stream lock. */
+typedef UCHAR (*PFN_AVDTP_ACP_CHECK_CONFIG)(_In_ PVOID Ctx, _In_ PAVDTP_LOCAL_SEP Local, _In_ UCHAR IntSeid,
+                                            _In_reads_bytes_(Len) const UCHAR *Ies, _In_ ULONG Len,
+                                            _In_ ULONG ServiceCaps, _Out_ PUCHAR FailedCategory);
+typedef UCHAR (*PFN_AVDTP_ACP_CHECK_RECONFIG)(_In_ PVOID Ctx, _In_reads_bytes_(Len) const UCHAR *Ies, _In_ ULONG Len,
+                                              _Out_ PUCHAR FailedCategory);
+
+typedef struct _AVDTP_ACP_CONTEXT {
+    PAVDTP_LOCAL_SEP   LocalSeps;     /* Seps[i].InUse: SEP unavailable (codec off / no encoder) */
+    ULONG              LocalSepCount;
+    AVDTP_STREAM_STATE StreamState;
+    UCHAR              LocalSeid;
+    UCHAR              RemoteSeid;
+    const UCHAR       *ConfiguredIes;
+    UCHAR              ConfiguredIesLength;
+    BOOLEAN            DelayReportingNegotiated;
+    UCHAR              IntSignal;     /* our command outstanding right now (T9), 0 = none */
+    PFN_AVDTP_ACP_CHECK_CONFIG   CheckConfiguration;
+    PFN_AVDTP_ACP_CHECK_RECONFIG CheckReconfigure;
+    PVOID              CheckContext;
+} AVDTP_ACP_CONTEXT;
+
+#define AVDTP_ACP_FX_STORE_CONFIG     0x0001  /* LocalSeid/RemoteSeid/Ies/ServiceCaps/DelayReporting */
+#define AVDTP_ACP_FX_STORE_IES        0x0002  /* RECONFIGURE: Ies */
+#define AVDTP_ACP_FX_MEDIA_EXPECTED   0x0004  /* the receiver will open the media channel */
+#define AVDTP_ACP_FX_STORE_DELAY      0x0008  /* SinkDelayTenthsMs = DelayTenthsMs */
+#define AVDTP_ACP_FX_DELAY_CALLBACK   0x0010
+#define AVDTP_ACP_FX_MID_STATE        0x0020  /* after the response */
+#define AVDTP_ACP_FX_DISCONNECT_MEDIA 0x0040  /* after MidState */
+#define AVDTP_ACP_FX_NEW_STATE        0x0080  /* last */
+#define AVDTP_ACP_FX_REMOTE_SUSPEND   0x0100  /* the receiver suspended the stream */
+#define AVDTP_ACP_FX_RELEASE_REMOTE   0x0200  /* the receiver closed/aborted: its SEP is free again */
+#define AVDTP_ACP_FX_RESET_DELAY      0x0400  /* a new configuration invalidates the last delay report */
+#define AVDTP_ACP_FX_REMOTE_START     0x0800  /* the receiver started the stream */
+#define AVDTP_ACP_FX_OPEN_COLLISION   0x1000  /* the receiver's OPEN was refused because ours is outstanding */
+
+typedef struct _AVDTP_ACP_RESULT {
+    UCHAR              MessageType;   /* AVDTP_MSG_RESPONSE_ACCEPT / _REJECT / AVDTP_MSG_GENERAL_REJECT */
+    ULONG              ResponseLength;
+    UCHAR              Response[AVDTP_MAX_SIGNAL_PAYLOAD];
+    ULONG              Effects;       /* AVDTP_ACP_FX_* */
+    AVDTP_STREAM_STATE MidState;
+    AVDTP_STREAM_STATE NewState;
+    UCHAR              ConfigLocalSeid;
+    UCHAR              ConfigRemoteSeid;
+    UCHAR              Ies[32];
+    UCHAR              IesLength;
+    ULONG              ServiceCaps;
+    BOOLEAN            DelayReporting;
+    ULONG              DelayTenthsMs;
+} AVDTP_ACP_RESULT;
+
+VOID AvdtpAcpProcess(_In_ const AVDTP_ACP_CONTEXT *Ctx, _In_ UCHAR SignalId, _In_reads_bytes_(Len) const UCHAR *Payload,
+                     _In_ ULONG Len, _Out_ AVDTP_ACP_RESULT *Out);

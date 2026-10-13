@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "pna2dp.h"
+#include "transport_policy.h"
 
 #define AVDTP_EVT_SIG_DOWN     0x1
 #define AVDTP_EVT_MEDIA_DOWN   0x2
@@ -37,6 +38,13 @@ static const char *SigName(UCHAR id)
     }
 }
 
+/* T1: the receiver's SEP of a stream that ended is free again, whatever DISCOVER said. */
+static VOID AvdtpReleaseRemoteSep(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Seid)
+{
+    for (ULONG i = 0; i < S->RemoteSepCount && i < AVDTP_MAX_SEPS; i++) if (S->RemoteSeps[i].Seid == Seid) S->RemoteSeps[i].InUse = 0;
+}
+
+/* StreamMutex held. */
 static VOID SetStreamState(_Inout_ PAVDTP_SESSION S, _In_ AVDTP_STREAM_STATE New, _In_ BOOLEAN Remote)
 {
     AVDTP_STREAM_STATE old;
@@ -44,7 +52,13 @@ static VOID SetStreamState(_Inout_ PAVDTP_SESSION S, _In_ AVDTP_STREAM_STATE New
     KeAcquireSpinLock(&S->Lock, &irql);
     old = S->StreamState;
     S->StreamState = New;
+    if (New == AvdtpStateIdle) {
+        /* the stream is gone: its delay report and negotiation no longer apply (T6) */
+        S->SinkDelayTenthsMs = 0;
+        S->DelayReportingNegotiated = FALSE;
+    }
     KeReleaseSpinLock(&S->Lock, irql);
+    if (New == AvdtpStateIdle && old != AvdtpStateIdle) AvdtpReleaseRemoteSep(S, S->RemoteSeid);
     if (old != New) {
         PN_INFO("AVDTP stream state %u -> %u (%s)", old, New, Remote ? "remote" : "local");
         if (S->Cb.OnStreamStateChanged) S->Cb.OnStreamStateChanged(S->Cb.Context, old, New, Remote);
@@ -53,19 +67,21 @@ static VOID SetStreamState(_Inout_ PAVDTP_SESSION S, _In_ AVDTP_STREAM_STATE New
 
 AVDTP_STREAM_STATE AvdtpGetState(_In_ PAVDTP_SESSION S) { return S->StreamState; }
 PPN_L2CAP_CHANNEL AvdtpMediaChannel(_In_ PAVDTP_SESSION S) { return &S->Media; }
-USHORT AvdtpMediaMtu(_In_ PAVDTP_SESSION S) { return S->Media.OutMtu ? S->Media.OutMtu : PN_L2CAP_SIG_MTU; }
 
-ULONG AvdtpBuildMediaCodecCap(_Out_writes_bytes_(Cap) PUCHAR Out, _In_ ULONG Cap, _In_ UCHAR MediaCodecType,
-                              _In_reads_bytes_(Len) const UCHAR *Ies, _In_ ULONG Len)
+/* Media MTU limits from the local radio (recovery_policy.h, T12); no link: no cap. */
+static USHORT AvdtpMediaMtuCap(_In_ PAVDTP_SESSION S)
 {
-    if (Cap < 4 + Len) return 0;
-    Out[0] = AVDTP_CAT_MEDIA_CODEC;
-    Out[1] = (UCHAR)(2 + Len);
-    Out[2] = (UCHAR)(AVDTP_MEDIA_TYPE_AUDIO << 4);
-    Out[3] = MediaCodecType;
-    RtlCopyMemory(Out + 4, Ies, Len);
-    return 4 + Len;
+    PPN_BTH_LINK l = S->Link;
+    return l ? PnPumpMediaMtuCap(l->RadioInfoValid, l->RadioInfo.radioInfo.lmpSupportedFeatures) : (USHORT)PN_MEDIA_MTU_NO_CAP;
 }
+
+static USHORT AvdtpPreferredMediaMtu(_In_ PAVDTP_SESSION S)
+{
+    PPN_BTH_LINK l = S->Link;
+    return l ? PnPreferredMediaMtu(l->RadioInfoValid, l->RadioInfo.radioInfo.lmpSupportedFeatures) : (USHORT)PN_L2CAP_MEDIA_MTU_PREF;
+}
+
+USHORT AvdtpMediaMtu(_In_ PAVDTP_SESSION S) { return PnEffectiveMediaMtu(S->Media.OutMtu, AvdtpMediaMtuCap(S), PN_L2CAP_SIG_MTU); }
 
 /* Send one signalling message, fragmenting if it exceeds the channel MTU. */
 static NTSTATUS AvdtpWriteMessage(_Inout_ PAVDTP_SESSION S, _In_ UCHAR MsgType, _In_ UCHAR Label, _In_ UCHAR SignalId,
@@ -116,19 +132,40 @@ static NTSTATUS AvdtpSendResponse(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Label, _I
     return AvdtpWriteMessage(S, Accept ? AVDTP_MSG_RESPONSE_ACCEPT : AVDTP_MSG_RESPONSE_REJECT, Label, SignalId, Payload, Len);
 }
 
-static NTSTATUS AvdtpSendReject(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Label, _In_ UCHAR SignalId, _In_ UCHAR ErrorCode)
+/* The receiver's commands that arrived before our answer are finished before the answer
+ * is judged (PnIntMustWaitForAcp): e.g. its OPEN crossing ours must be refused as the
+ * collision while IntSignal is still OPEN, not accepted after AvdtpTxnEnd. PASSIVE, without
+ * StreamMutex (the acceptor takes it); bounded at 1 s like the opposite wait. */
+static VOID AvdtpWaitAcpBefore(_Inout_ PAVDTP_SESSION S)
 {
-    UCHAR p[1] = { ErrorCode };
-    return AvdtpSendResponse(S, Label, SignalId, FALSE, p, 1);
+    PAGED_CODE();
+    KIRQL irql;
+    KeAcquireSpinLock(&S->Lock, &irql);
+    BOOLEAN answered = S->Txn.MessageType != 0xFF;
+    ULONG before = S->Txn.AcpBefore;
+    KeReleaseSpinLock(&S->Lock, irql);
+    if (!answered) return;   /* woken by a reset or a lost channel: nothing to order against */
+    for (ULONG i = 0; i < 40; i++) {
+        KeClearEvent(&S->AcpProgress);   /* before the check: an advance after it sets the event */
+        if (!PnIntMustWaitForAcp(before, (ULONG)InterlockedCompareExchange(&S->AcpDoneSeq, 0, 0))) return;
+        LARGE_INTEGER t;
+        t.QuadPart = -PN_HNS_PER_MS * 25;
+        KeWaitForSingleObject(&S->AcpProgress, Executive, KernelMode, FALSE, &t);
+    }
+    PN_WARN("AVDTP: receiver commands before the answer still pending; judging it anyway");
 }
 
-/* INT: send a command and wait for the matching response. PASSIVE, under S->Mutex. */
+/* INT: send a command and wait for the matching response. PASSIVE, under S->Mutex and
+ * without StreamMutex, so the acceptor keeps answering the receiver meanwhile (T9).
+ * Returns holding StreamMutex in every case: the caller judges the answer against the
+ * stream as it is now (PnIntOutcome), applies it and calls AvdtpTxnEnd. */
 static NTSTATUS AvdtpTransact(_Inout_ PAVDTP_SESSION S, _In_ UCHAR SignalId, _In_reads_bytes_opt_(Len) const UCHAR *Payload,
                               _In_ ULONG Len, _Out_opt_ PUCHAR ErrorCode)
 {
     KIRQL irql;
     if (ErrorCode) *ErrorCode = 0;
-    if (!S->SignallingUp) return STATUS_CONNECTION_DISCONNECTED;
+    NTSTATUS pre = (NTSTATUS)PnTransactPrecheck(S->SignallingUp, S->ResetPending != 0);
+    if (!NT_SUCCESS(pre)) { PnMutexAcquire(&S->StreamMutex); return pre; }
     if (S->Signalling.State == PnChannelConnecting) {
         /* the remote opened signalling and our accept has not completed yet */
         LARGE_INTEGER t;
@@ -137,6 +174,15 @@ static NTSTATUS AvdtpTransact(_Inout_ PAVDTP_SESSION S, _In_ UCHAR SignalId, _In
     }
 
     KeAcquireSpinLock(&S->Lock, &irql);
+    /* Checked under Lock with the KeClearEvent below: a reset flagged after this point
+     * wakes the wait (AvdtpResetStream) instead of being erased by the clear (review #1). */
+    pre = (NTSTATUS)PnTransactPrecheck(S->SignallingUp, S->ResetPending != 0);
+    if (!NT_SUCCESS(pre)) {
+        KeReleaseSpinLock(&S->Lock, irql);
+        PN_WARN("AVDTP %s not sent: %s", SigName(SignalId), pre == STATUS_CANCELLED ? "a new signalling session resets the stream" : "signalling down");
+        PnMutexAcquire(&S->StreamMutex);
+        return pre;
+    }
     S->NextLabel = (UCHAR)((S->NextLabel + 1) & 0x0F);
     S->Txn.Label = S->NextLabel;
     S->Txn.SignalId = SignalId;
@@ -153,29 +199,49 @@ static NTSTATUS AvdtpTransact(_Inout_ PAVDTP_SESSION S, _In_ UCHAR SignalId, _In
         KeAcquireSpinLock(&S->Lock, &irql);
         S->Txn.Active = FALSE;
         KeReleaseSpinLock(&S->Lock, irql);
+        PnMutexAcquire(&S->StreamMutex);
         return status;
     }
     LARGE_INTEGER timeout;
     timeout.QuadPart = -PN_HNS_PER_MS * AVDTP_RESPONSE_TIMEOUT_MS;
     status = KeWaitForSingleObject(&S->Txn.Done, Executive, KernelMode, FALSE, &timeout);
+    BOOLEAN timedOut = status == STATUS_TIMEOUT;
+    if (!timedOut) AvdtpWaitAcpBefore(S);
+    /* before the answer is judged: the receiver's commands behind it wait for AvdtpTxnEnd */
+    PnMutexAcquire(&S->StreamMutex);
     KeAcquireSpinLock(&S->Lock, &irql);
     S->Txn.Active = FALSE;
     UCHAR type = S->Txn.MessageType;
     UCHAR err = S->Txn.ErrorCode;
     KeReleaseSpinLock(&S->Lock, irql);
-    if (status == STATUS_TIMEOUT) {
+    status = (NTSTATUS)PnTransactStatus(timedOut, S->SignallingUp, type, err);
+    if (timedOut) {
         PN_WARN("AVDTP %s timed out", SigName(SignalId));
-        return STATUS_IO_TIMEOUT;
+    } else if (status == STATUS_CANCELLED) {
+        PN_WARN("AVDTP %s: no answer, a new signalling session took over", SigName(SignalId));
+    } else if (!NT_SUCCESS(status) && S->SignallingUp) {
+        if (ErrorCode) *ErrorCode = err;
+        if (type == AVDTP_MSG_GENERAL_REJECT) PN_WARN("AVDTP %s: general reject", SigName(SignalId));
+        else PN_WARN("AVDTP %s rejected, error 0x%02X", SigName(SignalId), err);
     }
-    if (!S->SignallingUp) return STATUS_CONNECTION_DISCONNECTED;
-    if (type == AVDTP_MSG_RESPONSE_ACCEPT) return STATUS_SUCCESS;
-    if (ErrorCode) *ErrorCode = err;
-    if (type == AVDTP_MSG_GENERAL_REJECT) {
-        PN_WARN("AVDTP %s: general reject", SigName(SignalId));
-        return STATUS_NOT_SUPPORTED;
-    }
-    PN_WARN("AVDTP %s rejected, error 0x%02X", SigName(SignalId), err);
-    return (err == AVDTP_ERR_NOT_SUPPORTED_COMMAND) ? STATUS_NOT_SUPPORTED : STATUS_DEVICE_PROTOCOL_ERROR;
+    return status;
+}
+
+/* Ends the transaction AvdtpTransact left open: its answer is applied, so the receiver's
+ * commands that arrived behind it may run (PnAcpMustWait). Releases StreamMutex.
+ * NextIntSignal: what the acceptor judges the receiver's commands against until our next
+ * command is answered (0: nothing outstanding). */
+static VOID AvdtpTxnEndAs(_Inout_ PAVDTP_SESSION S, _In_ UCHAR NextIntSignal)
+{
+    S->IntSignal = NextIntSignal;
+    S->AppliedSeq = S->ResponseSeq;   /* stable: no answer is matched while Txn.Active is FALSE */
+    KeSetEvent(&S->TxnApplied, 0, FALSE);
+    PnMutexRelease(&S->StreamMutex);
+}
+
+static VOID AvdtpTxnEnd(_Inout_ PAVDTP_SESSION S)
+{
+    AvdtpTxnEndAs(S, 0);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -185,6 +251,16 @@ static NTSTATUS AvdtpTransact(_Inout_ PAVDTP_SESSION S, _In_ UCHAR SignalId, _In
 /* ------------------------------------------------------------------------- */
 /* Receive path (DISPATCH): header parsing, reassembly, routing                 */
 /* ------------------------------------------------------------------------- */
+
+static IO_WORKITEM_ROUTINE AvdtpAcpWorkItem;
+static VOID AvdtpAcpWorkItem(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    PAVDTP_SESSION S = (PAVDTP_SESSION)Context;
+    if (!S) return;
+    AvdtpAcpWorker(S);
+    ExReleaseRundownProtection(&S->WorkRundown);   /* last access */
+}
 
 static VOID AvdtpHandleMessage(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Label, _In_ UCHAR MsgType, _In_ UCHAR SignalId,
                                _In_reads_bytes_(Len) const UCHAR *Payload, _In_ ULONG Len)
@@ -196,6 +272,7 @@ static VOID AvdtpHandleMessage(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Label, _In_ 
         item->Label = Label;
         item->SignalId = SignalId;
         item->Generation = S->Signalling.Generation;
+        item->AfterResponse = S->ResponseSeq;   /* same receive path (ReasmLock) as the answers */
         item->Length = PN_MIN(Len, AVDTP_MAX_SIGNAL_PAYLOAD);
         RtlCopyMemory(item->Payload, Payload, item->Length);
         KeAcquireSpinLock(&S->AcpQueueLock, &irql);
@@ -206,14 +283,11 @@ static VOID AvdtpHandleMessage(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Label, _In_ 
         }
         InsertTailList(&S->AcpQueue, &item->Link);
         S->AcpQueueDepth++;
+        S->AcpQueuedSeq++;                      /* an answer after it waits for it (AvdtpWaitAcpBefore) */
         KeReleaseSpinLock(&S->AcpQueueLock, irql);
         if (InterlockedCompareExchange(&S->AcpWorkQueued, 1, 0) == 0) {
             if (S->AcpWorkItem && ExAcquireRundownProtection(&S->WorkRundown)) {
-                IoQueueWorkItem(S->AcpWorkItem, [](PDEVICE_OBJECT, PVOID Ctx) {
-                    PAVDTP_SESSION s = (PAVDTP_SESSION)Ctx;
-                    AvdtpAcpWorker(s);
-                    ExReleaseRundownProtection(&s->WorkRundown);   /* last access */
-                }, DelayedWorkQueue, S);
+                IoQueueWorkItem(S->AcpWorkItem, AvdtpAcpWorkItem, DelayedWorkQueue, S);
             } else {
                 InterlockedExchange(&S->AcpWorkQueued, 0);   /* shutting down: AvdtpUninitialize frees the queue */
             }
@@ -231,6 +305,9 @@ static VOID AvdtpHandleMessage(_Inout_ PAVDTP_SESSION S, _In_ UCHAR Label, _In_ 
         if (MsgType == AVDTP_MSG_RESPONSE_REJECT && Len >= 2 && (SignalId == AVDTP_SET_CONFIGURATION || SignalId == AVDTP_RECONFIGURE)) {
             S->Txn.ErrorCode = Payload[1];
         }
+        S->ResponseSeq++;                     /* commands behind it wait until it is applied */
+        S->Txn.AcpBefore = S->AcpQueuedSeq;   /* commands before it are finished first */
+        KeClearEvent(&S->TxnApplied);
         KeSetEvent(&S->Txn.Done, 0, FALSE);
         KeReleaseSpinLock(&S->Lock, irql);
     } else {
@@ -316,7 +393,7 @@ static AVDTP_ACCEPT_RESULT AvdtpOnAcceptedChannelReady(_Inout_ PAVDTP_SESSION S,
     if (wait == STATUS_SUCCESS && ch->OpenStatus != STATUS_PENDING && NT_SUCCESS(ch->OpenStatus) && PnChannelIsConnected(ch)) {
         /* a new signalling session: the stream of the previous one is gone. Reset it before
          * the readers run, so no command of the new session sees stale stream state. */
-        if (!Media && S->StreamState != AvdtpStateIdle) AvdtpResetStream(S);
+        if (!Media && (S->StreamState != AvdtpStateIdle || S->ResetPending)) AvdtpResetStream(S);
         /* a stale down handled meanwhile may have cleared the flag of this connection */
         KIRQL irql;
         KeAcquireSpinLock(&ch->Lock, &irql);
@@ -326,6 +403,8 @@ static AVDTP_ACCEPT_RESULT AvdtpOnAcceptedChannelReady(_Inout_ PAVDTP_SESSION S,
         return AcceptReady;
     }
     PN_WARN("accepted %s channel did not open (wait 0x%08x, status 0x%08x)", Media ? "media" : "signalling", wait, ch->OpenStatus);
+    /* no new session after all: commands fail as DISCONNECTED until signalling is up again */
+    if (!Media) InterlockedExchange(&S->ResetPending, 0);
     /* a late open completes into Disconnecting and closes itself instead of being orphaned */
     if (PnChannelDisconnectGen(ch, gen) || ch->Generation == gen) {
         if (Media) S->MediaUp = FALSE; else S->SignallingUp = FALSE;
@@ -334,20 +413,40 @@ static AVDTP_ACCEPT_RESULT AvdtpOnAcceptedChannelReady(_Inout_ PAVDTP_SESSION S,
 }
 
 /* Signalling of an earlier connection went down after the remote had already connected
- * again: the AVDTP stream of the old session is gone, the new signalling channel stays. */
+ * again: the AVDTP stream of the old session is gone, the new signalling channel stays.
+ * No INT procedure of the old session may run on: ResetPending (set when the new session
+ * was accepted, or here) fails every command before it is sent (CANCELLED), the
+ * transaction already waiting is woken (CANCELLED) and the media connect is moot
+ * (cancelled; AvdtpOpen sends no ABORT for it). The command lock then waits for the
+ * procedure to return; the flag is cleared once the stream is reset (review #1). */
 static VOID AvdtpResetStream(_Inout_ PAVDTP_SESSION S)
 {
+    PAGED_CODE();
+    KIRQL irql;
+    InterlockedExchange(&S->ResetPending, 1);
+    /* under Lock: AvdtpTransact either sees the flag or has cleared the event already */
+    KeAcquireSpinLock(&S->Lock, &irql);
+    KeSetEvent(&S->Txn.Done, 0, FALSE);
+    KeReleaseSpinLock(&S->Lock, irql);
+    PnChannelCancelConnect(&S->Media);
     PnMutexAcquire(&S->Mutex);
+    PnMutexAcquire(&S->StreamMutex);
     if (S->StreamState != AvdtpStateIdle) SetStreamState(S, AvdtpStateClosing, TRUE);
+    S->MediaExpected = FALSE;
+    PnMutexRelease(&S->StreamMutex);
     PnChannelDisconnectSync(&S->Media);
+    PnMutexAcquire(&S->StreamMutex);
     S->MediaUp = FALSE;
     S->MediaExpected = FALSE;
     S->RemoteSepsValid = FALSE;
     S->RemoteSepCount = 0;
     if (S->StreamState != AvdtpStateIdle) SetStreamState(S, AvdtpStateIdle, TRUE);
+    InterlockedExchange(&S->ResetPending, 0);   /* the new session's commands may go out */
+    PnMutexRelease(&S->StreamMutex);
     PnMutexRelease(&S->Mutex);
 }
 
+static IO_WORKITEM_ROUTINE AvdtpEventWorker;
 static VOID AvdtpEventWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Context)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
@@ -366,15 +465,15 @@ static VOID AvdtpEventWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Co
         if (bits & AVDTP_EVT_MEDIA_DOWN) {
             ULONG gen = S->MediaDownGen;
             if (gen == S->Media.Generation) {
-                /* the callback takes the device StateMutex, which ranks above S->Mutex, and
-                 * re-checks the generation under it */
+                /* the callback takes the device StateMutex, which ranks above the AVDTP
+                 * locks, and re-checks the generation under it; no AVDTP lock is held */
                 if (S->Cb.OnMediaDown) S->Cb.OnMediaDown(S->Cb.Context, S->DownStatus, gen);
-                PnMutexAcquire(&S->Mutex);
+                PnMutexAcquire(&S->StreamMutex);
                 /* Opening is left to MEDIA_UP / AvdtpOpen, which own the new transport */
                 if ((S->StreamState == AvdtpStateStreaming || S->StreamState == AvdtpStateOpen) && !PnChannelIsConnected(&S->Media)) {
                     SetStreamState(S, S->SignallingUp ? AvdtpStateConfigured : AvdtpStateIdle, TRUE);
                 }
-                PnMutexRelease(&S->Mutex);
+                PnMutexRelease(&S->StreamMutex);
             }
         }
         if (bits & AVDTP_EVT_SIG_DOWN) {
@@ -390,19 +489,35 @@ static VOID AvdtpEventWorker(_In_ PDEVICE_OBJECT DeviceObject, _In_opt_ PVOID Co
             ULONG gen;
             AVDTP_ACCEPT_RESULT r = AvdtpOnAcceptedChannelReady(S, TRUE, &gen);
             if (r != AcceptStale) {
-                PnMutexAcquire(&S->Mutex);
+                PnMutexAcquire(&S->StreamMutex);
                 if (S->Media.Generation == gen) {   /* else a newer transport owns the decision */
-                    if (r == AcceptReady && S->StreamState == AvdtpStateOpening && PnChannelIsConnected(&S->Media)) {
+                    BOOLEAN ready = r == AcceptReady && PnChannelIsConnected(&S->Media);
+                    switch (PnMediaUpAction(ready, S->StreamState, S->OpenSent)) {
+                    case PnMediaUpOpenStream:
                         SetStreamState(S, AvdtpStateOpen, TRUE);
-                    } else {
+                        break;
+                    case PnMediaUpHold:
+                        /* the receiver opened it right behind accepting our OPEN, whose
+                         * answer AvdtpOpen has not applied yet: it adopts the channel (T9) */
+                        S->MediaHeldGen = gen;
+                        break;
+                    default:
                         if (r == AcceptReady && PnChannelDisconnectGen(&S->Media, gen)) {
                             /* the stream was aborted or closed while the transport was opening */
                             S->MediaUp = FALSE;
+                        } else if (r == AcceptReady) {
+                            /* already closing (AvdtpOpen dropped it): its flag goes with it,
+                             * unless a newer connection took the channel (review round 3 #2) */
+                            KIRQL irql;
+                            KeAcquireSpinLock(&S->Media.Lock, &irql);
+                            if (S->Media.Generation == gen && S->Media.State != PnChannelConnected) S->MediaUp = FALSE;
+                            KeReleaseSpinLock(&S->Media.Lock, irql);
                         }
                         if (S->StreamState == AvdtpStateOpening) SetStreamState(S, S->SignallingUp ? AvdtpStateConfigured : AvdtpStateIdle, TRUE);
+                        break;
                     }
                 }
-                PnMutexRelease(&S->Mutex);
+                PnMutexRelease(&S->StreamMutex);
             }
         }
     }
@@ -435,164 +550,77 @@ static PAVDTP_LOCAL_SEP FindLocalSep(_In_ PAVDTP_SESSION S, _In_ UCHAR Seid)
     return NULL;
 }
 
-static ULONG BuildLocalCapabilities(_In_ PAVDTP_SESSION S, _In_ PAVDTP_LOCAL_SEP Sep, _In_ BOOLEAN All, _Out_writes_bytes_(Cap) PUCHAR Out, _In_ ULONG Cap)
+/* Validation and the response come from the pure AvdtpAcpProcess (avdtp_wire.cpp);
+ * this applies its effects to the session in the documented order. StreamMutex held,
+ * never the command lock: answers go out while a command of ours is outstanding (T9).
+ * Returns TRUE when the media channel must be closed before *NewState applies; the
+ * caller does that outside StreamMutex (AvdtpAcpCloseMedia). */
+static BOOLEAN AvdtpProcessCommand(_Inout_ PAVDTP_SESSION S, _In_ PAVDTP_ACP_ITEM C, _Out_ AVDTP_STREAM_STATE *MidState,
+                                   _Out_ AVDTP_STREAM_STATE *NewState)
 {
-    UNREFERENCED_PARAMETER(S);
-    ULONG n = 0;
-    if (Cap < 8) return 0;
-    Out[n++] = AVDTP_CAT_MEDIA_TRANSPORT; Out[n++] = 0;
-    UCHAR mct;
-    UCHAR ies[32];
-    ULONG l = A2dpBuildLocalCaps(Sep->Codec, ies, sizeof(ies), &mct);
-    n += AvdtpBuildMediaCodecCap(Out + n, Cap - n, mct, ies, l);
-    if (All && Sep->DelayReporting && n + 2 <= Cap) { Out[n++] = AVDTP_CAT_DELAY_REPORTING; Out[n++] = 0; }
-    return n;
+    AVDTP_ACP_CONTEXT ctx;
+    AVDTP_ACP_RESULT r;
+    PN_VERB("AVDTP <- %s label %u len %u", SigName(C->SignalId), C->Label, C->Length);
+    ctx.LocalSeps = S->LocalSeps;
+    ctx.LocalSepCount = S->LocalSepCount;
+    ctx.StreamState = S->StreamState;
+    ctx.LocalSeid = S->LocalSeid;
+    ctx.RemoteSeid = S->RemoteSeid;
+    ctx.ConfiguredIes = S->ConfiguredIes;
+    ctx.ConfiguredIesLength = S->ConfiguredIesLength;
+    ctx.DelayReportingNegotiated = S->DelayReportingNegotiated;
+    ctx.IntSignal = S->IntSignal;
+    ctx.CheckConfiguration = S->Cb.OnRemoteSetConfiguration;
+    ctx.CheckReconfigure = S->Cb.OnRemoteReconfigure;
+    ctx.CheckContext = S->Cb.Context;
+    AvdtpAcpProcess(&ctx, C->SignalId, C->Payload, C->Length, &r);
+
+    if (r.Effects & AVDTP_ACP_FX_STORE_CONFIG) {
+        S->LocalSeid = r.ConfigLocalSeid;
+        S->RemoteSeid = r.ConfigRemoteSeid;
+        S->ConfiguredIesLength = r.IesLength;
+        RtlCopyMemory(S->ConfiguredIes, r.Ies, r.IesLength);
+        S->ConfiguredServiceCaps = r.ServiceCaps;
+        S->DelayReportingNegotiated = r.DelayReporting;
+    }
+    if (r.Effects & AVDTP_ACP_FX_STORE_IES) {
+        S->ConfiguredIesLength = r.IesLength;
+        RtlCopyMemory(S->ConfiguredIes, r.Ies, r.IesLength);
+    }
+    if (r.Effects & AVDTP_ACP_FX_MEDIA_EXPECTED) S->MediaExpected = TRUE;
+    if (r.Effects & AVDTP_ACP_FX_OPEN_COLLISION) S->OpenCollided = TRUE;
+    if (r.Effects & AVDTP_ACP_FX_RESET_DELAY) S->SinkDelayTenthsMs = 0;
+    if (r.Effects & AVDTP_ACP_FX_STORE_DELAY) S->SinkDelayTenthsMs = r.DelayTenthsMs;
+    if (r.MessageType == AVDTP_MSG_GENERAL_REJECT) AvdtpWriteMessage(S, AVDTP_MSG_GENERAL_REJECT, C->Label, C->SignalId, NULL, 0);
+    else AvdtpSendResponse(S, C->Label, C->SignalId, r.MessageType == AVDTP_MSG_RESPONSE_ACCEPT, r.Response, r.ResponseLength);
+    if ((r.Effects & (AVDTP_ACP_FX_REMOTE_START | AVDTP_ACP_FX_REMOTE_SUSPEND)) && S->Cb.OnRemoteStreamControl)
+        S->Cb.OnRemoteStreamControl(S->Cb.Context, (r.Effects & AVDTP_ACP_FX_REMOTE_START) != 0);
+    if (r.Effects & AVDTP_ACP_FX_RELEASE_REMOTE) AvdtpReleaseRemoteSep(S, S->RemoteSeid);
+    if (r.Effects & AVDTP_ACP_FX_MID_STATE) SetStreamState(S, r.MidState, TRUE);
+    *MidState = r.MidState;
+    *NewState = r.NewState;
+    /* CLOSE / ABORT: the media channel closes outside StreamMutex, then NewState (no
+     * delay callback goes with these) */
+    if (r.Effects & AVDTP_ACP_FX_DISCONNECT_MEDIA) return TRUE;
+    if (r.Effects & AVDTP_ACP_FX_NEW_STATE) SetStreamState(S, r.NewState, TRUE);
+    if ((r.Effects & AVDTP_ACP_FX_DELAY_CALLBACK) && S->Cb.OnDelayReport) S->Cb.OnDelayReport(S->Cb.Context, r.DelayTenthsMs);
+    return FALSE;
 }
 
-static VOID AvdtpProcessCommand(_Inout_ PAVDTP_SESSION S, _In_ PAVDTP_ACP_ITEM C)
+/* The receiver closed or aborted the stream: drop the media channel (a wait, so without
+ * StreamMutex), then finish the transition unless the stream has moved on meanwhile. */
+static VOID AvdtpAcpCloseMedia(_Inout_ PAVDTP_SESSION S, _In_ AVDTP_STREAM_STATE MidState, _In_ AVDTP_STREAM_STATE NewState)
 {
-    UCHAR rsp[AVDTP_MAX_SIGNAL_PAYLOAD];
-    ULONG n = 0;
-    PN_VERB("AVDTP <- %s label %u len %u", SigName(C->SignalId), C->Label, C->Length);
-
-    switch (C->SignalId) {
-    case AVDTP_DISCOVER:
-        for (ULONG i = 0; i < S->LocalSepCount && n + 2 <= sizeof(rsp); i++) {
-            PAVDTP_LOCAL_SEP sep = &S->LocalSeps[i];
-            BOOLEAN inUse = (S->StreamState != AvdtpStateIdle) && (S->LocalSeid == sep->Seid);
-            rsp[n++] = (UCHAR)((sep->Seid << 2) | (inUse ? 0x02 : 0));
-            rsp[n++] = (UCHAR)((sep->MediaType << 4) | (sep->Tsep << 3));
-        }
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, rsp, n);
-        break;
-
-    case AVDTP_GET_CAPABILITIES:
-    case AVDTP_GET_ALL_CAPABILITIES: {
-        if (C->Length < 1) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        PAVDTP_LOCAL_SEP sep = FindLocalSep(S, (UCHAR)(C->Payload[0] >> 2));
-        if (!sep) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_ACP_SEID); break; }
-        n = BuildLocalCapabilities(S, sep, C->SignalId == AVDTP_GET_ALL_CAPABILITIES, rsp, sizeof(rsp));
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, rsp, n);
-        break;
-    }
-
-    case AVDTP_SET_CONFIGURATION: {
-        if (C->Length < 2) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        UCHAR acpSeid = (UCHAR)(C->Payload[0] >> 2), intSeid = (UCHAR)(C->Payload[1] >> 2);
-        PAVDTP_LOCAL_SEP sep = FindLocalSep(S, acpSeid);
-        if (!sep) { rsp[0] = 0; rsp[1] = AVDTP_ERR_BAD_ACP_SEID; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
-        if (S->StreamState != AvdtpStateIdle) { rsp[0] = 0; rsp[1] = AVDTP_ERR_SEP_IN_USE; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
-        /* parse requested service capabilities */
-        AVDTP_REMOTE_SEP tmp;
-        RtlZeroMemory(&tmp, sizeof(tmp));
-        AvdtpParseServiceCapabilities(C->Payload + 2, C->Length - 2, &tmp);
-        UCHAR failedCat = AVDTP_CAT_MEDIA_CODEC;
-        UCHAR err = AVDTP_ERR_UNSUPPORTED_CONFIGURATION;
-        if (tmp.CapsValid && tmp.Codec == sep->Codec && S->Cb.OnRemoteSetConfiguration) {
-            err = S->Cb.OnRemoteSetConfiguration(S->Cb.Context, sep, intSeid, tmp.CodecCaps, tmp.CodecCapsLength, tmp.ServiceCaps, &failedCat);
-        }
-        if (err) { rsp[0] = failedCat; rsp[1] = err; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
-        S->LocalSeid = acpSeid;
-        S->RemoteSeid = intSeid;
-        S->ConfiguredIesLength = tmp.CodecCapsLength;
-        RtlCopyMemory(S->ConfiguredIes, tmp.CodecCaps, tmp.CodecCapsLength);
-        S->ConfiguredServiceCaps = tmp.ServiceCaps;
-        S->DelayReportingNegotiated = (tmp.ServiceCaps & PNA2DP_SVC_DELAY_REPORTING) != 0;
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, NULL, 0);
-        SetStreamState(S, AvdtpStateConfigured, TRUE);
-        break;
-    }
-
-    case AVDTP_GET_CONFIGURATION: {
-        if (C->Length < 1) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        if (S->StreamState == AvdtpStateIdle || (UCHAR)(C->Payload[0] >> 2) != S->LocalSeid) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_ACP_SEID); break; }
-        PAVDTP_LOCAL_SEP sep = FindLocalSep(S, S->LocalSeid);
-        UCHAR mct = A2DP_CODEC_SBC; UCHAR ies[32];
-        A2dpBuildLocalCaps(sep ? sep->Codec : PNA2DP_CODEC_SBC, ies, sizeof(ies), &mct);
-        rsp[n++] = AVDTP_CAT_MEDIA_TRANSPORT; rsp[n++] = 0;
-        n += AvdtpBuildMediaCodecCap(rsp + n, sizeof(rsp) - n, mct, S->ConfiguredIes, S->ConfiguredIesLength);
-        if (S->DelayReportingNegotiated) { rsp[n++] = AVDTP_CAT_DELAY_REPORTING; rsp[n++] = 0; }
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, rsp, n);
-        break;
-    }
-
-    case AVDTP_RECONFIGURE: {
-        if (C->Length < 1) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        if (S->StreamState != AvdtpStateOpen) { rsp[0] = 0; rsp[1] = AVDTP_ERR_BAD_STATE; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
-        AVDTP_REMOTE_SEP tmp;
-        RtlZeroMemory(&tmp, sizeof(tmp));
-        AvdtpParseServiceCapabilities(C->Payload + 1, C->Length - 1, &tmp);
-        UCHAR failedCat = AVDTP_CAT_MEDIA_CODEC, err = AVDTP_ERR_UNSUPPORTED_CONFIGURATION;
-        PAVDTP_LOCAL_SEP local = FindLocalSep(S, S->LocalSeid);
-        if (tmp.CapsValid && local && tmp.Codec == local->Codec && S->Cb.OnRemoteReconfigure)
-            err = S->Cb.OnRemoteReconfigure(S->Cb.Context, tmp.CodecCaps, tmp.CodecCapsLength, &failedCat);
-        if (err) { rsp[0] = failedCat; rsp[1] = err; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
-        S->ConfiguredIesLength = tmp.CodecCapsLength;
-        RtlCopyMemory(S->ConfiguredIes, tmp.CodecCaps, tmp.CodecCapsLength);
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, NULL, 0);
-        break;
-    }
-
-    case AVDTP_OPEN:
-        if (C->Length < 1) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        if (S->StreamState != AvdtpStateConfigured) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_STATE); break; }
-        S->MediaExpected = TRUE;
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, NULL, 0);
-        SetStreamState(S, AvdtpStateOpening, TRUE);
-        break;
-
-    case AVDTP_START:
-        if (C->Length < 1) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        if (S->StreamState != AvdtpStateOpen) { rsp[0] = C->Payload[0]; rsp[1] = AVDTP_ERR_BAD_STATE; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, NULL, 0);
-        SetStreamState(S, AvdtpStateStreaming, TRUE);
-        break;
-
-    case AVDTP_SUSPEND:
-        if (C->Length < 1) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        if (S->StreamState != AvdtpStateStreaming) { rsp[0] = C->Payload[0]; rsp[1] = AVDTP_ERR_BAD_STATE; AvdtpSendResponse(S, C->Label, C->SignalId, FALSE, rsp, 2); break; }
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, NULL, 0);
-        SetStreamState(S, AvdtpStateOpen, TRUE);
-        break;
-
-    case AVDTP_CLOSE:
-        if (C->Length < 1) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        if (S->StreamState != AvdtpStateOpen && S->StreamState != AvdtpStateStreaming) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_STATE); break; }
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, NULL, 0);
-        SetStreamState(S, AvdtpStateClosing, TRUE);
-        PnChannelDisconnectSync(&S->Media);
+    PAGED_CODE();
+    ULONG gen = S->Media.Generation;
+    PnChannelDisconnectSync(&S->Media);
+    PnMutexAcquire(&S->StreamMutex);
+    if (S->Media.Generation == gen) {   /* else a newer transport was accepted meanwhile */
         S->MediaUp = FALSE;
-        SetStreamState(S, AvdtpStateIdle, TRUE);
-        break;
-
-    case AVDTP_ABORT:
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, NULL, 0);
-        if (S->StreamState != AvdtpStateIdle) {
-            SetStreamState(S, AvdtpStateAborting, TRUE);
-            PnChannelDisconnectSync(&S->Media);
-            S->MediaUp = FALSE;
-            SetStreamState(S, AvdtpStateIdle, TRUE);
-        }
-        break;
-
-    case AVDTP_DELAYREPORT: {
-        if (C->Length < 3) { AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_BAD_LENGTH); break; }
-        ULONG delay = ((ULONG)C->Payload[1] << 8) | C->Payload[2];
-        S->SinkDelayTenthsMs = delay;
-        AvdtpSendResponse(S, C->Label, C->SignalId, TRUE, NULL, 0);
-        if (S->Cb.OnDelayReport) S->Cb.OnDelayReport(S->Cb.Context, delay);
-        break;
+        S->MediaExpected = FALSE;
     }
-
-    case AVDTP_SECURITY_CONTROL:
-        AvdtpSendReject(S, C->Label, C->SignalId, AVDTP_ERR_NOT_SUPPORTED_COMMAND);
-        break;
-
-    default:
-        /* general reject for unknown signal identifiers */
-        AvdtpWriteMessage(S, AVDTP_MSG_GENERAL_REJECT, C->Label, C->SignalId, NULL, 0);
-        break;
-    }
+    if (S->StreamState == MidState) SetStreamState(S, NewState, TRUE);
+    PnMutexRelease(&S->StreamMutex);
 }
 
 static VOID AvdtpAcpWorker(_In_ PAVDTP_SESSION S)
@@ -611,10 +639,32 @@ static VOID AvdtpAcpWorker(_In_ PAVDTP_SESSION S)
         }
         KeReleaseSpinLock(&S->AcpQueueLock, irql);
         if (!item) break;
-        PnMutexAcquire(&S->Mutex);
-        if (S->SignallingUp && item->Generation == S->Signalling.Generation) AvdtpProcessCommand(S, item);
-        PnMutexRelease(&S->Mutex);
+        /* A command that arrived behind the answer to ours must see that answer applied
+         * (e.g. the receiver's OPEN right behind accepting our SET_CONFIGURATION). Only
+         * scheduling separates the two (our INT thread takes StreamMutex as it wakes), so
+         * the wait is short; bounded at 1 s all the same. */
+        for (ULONG i = 0; i < 40 && PnAcpMustWait(item->AfterResponse, S->AppliedSeq); i++) {
+            LARGE_INTEGER t;
+            t.QuadPart = -PN_HNS_PER_MS * 25;
+            KeWaitForSingleObject(&S->TxnApplied, Executive, KernelMode, FALSE, &t);
+        }
+        /* Our OPEN's media connect or the disconnect after our CLOSE / ABORT is running: a
+         * command whose answer depends on the stream state is judged once that settled
+         * (Open / Idle), not against Opening / Closing; bounded at 1 s (review round 4 #2). */
+        if (PnAcpWaitsForTransport(item->SignalId, KeReadStateEvent(&S->TransportIdle) == 0)) {
+            LARGE_INTEGER t;
+            t.QuadPart = -PN_HNS_PER_MS * 1000;
+            KeWaitForSingleObject(&S->TransportIdle, Executive, KernelMode, FALSE, &t);
+        }
+        AVDTP_STREAM_STATE mid = AvdtpStateIdle, next = AvdtpStateIdle;
+        BOOLEAN closeMedia = FALSE;
+        PnMutexAcquire(&S->StreamMutex);
+        if (S->SignallingUp && item->Generation == S->Signalling.Generation) closeMedia = AvdtpProcessCommand(S, item, &mid, &next);
+        PnMutexRelease(&S->StreamMutex);
+        if (closeMedia) AvdtpAcpCloseMedia(S, mid, next);
         PnFree(item, PNA2DP_TAG_AVDTP);
+        InterlockedIncrement(&S->AcpDoneSeq);
+        KeSetEvent(&S->AcpProgress, 0, FALSE);
     }
 }
 
@@ -632,6 +682,10 @@ NTSTATUS AvdtpInitialize(_Out_ PAVDTP_SESSION S, _In_ PPN_BTH_LINK Link, _In_ PD
     S->Cb = *Cb;
     S->DeviceObject = DeviceObject;
     ExInitializeFastMutex(&S->Mutex);
+    ExInitializeFastMutex(&S->StreamMutex);
+    KeInitializeEvent(&S->TxnApplied, NotificationEvent, TRUE);
+    KeInitializeEvent(&S->TransportIdle, NotificationEvent, TRUE);
+    KeInitializeEvent(&S->AcpProgress, NotificationEvent, FALSE);
     KeInitializeSpinLock(&S->Lock);
     KeInitializeSpinLock(&S->ReasmLock);
     KeInitializeSpinLock(&S->AcpQueueLock);
@@ -700,6 +754,13 @@ VOID AvdtpSetLocalSeps(_Inout_ PAVDTP_SESSION S, _In_reads_(Count) const AVDTP_L
     S->LocalSepCount = Count;
 }
 
+/* A single byte store: the acceptor reads it under StreamMutex and cannot see a torn value. */
+VOID AvdtpSetLocalSepAvailable(_Inout_ PAVDTP_SESSION S, _In_ ULONG Codec, _In_ BOOLEAN Available)
+{
+    for (ULONG i = 0; i < S->LocalSepCount && i < AVDTP_LOCAL_SEP_COUNT; i++)
+        if (S->LocalSeps[i].Codec == Codec) S->LocalSeps[i].InUse = Available ? 0 : 1;
+}
+
 NTSTATUS AvdtpConnectSignalling(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
@@ -710,7 +771,7 @@ NTSTATUS AvdtpConnectSignalling(_Inout_ PAVDTP_SESSION S)
         return status;
     }
     /* a new signalling session: the stream of the previous one is gone */
-    if (S->StreamState != AvdtpStateIdle) AvdtpResetStream(S);
+    if (S->StreamState != AvdtpStateIdle || S->ResetPending) AvdtpResetStream(S);
     S->SignallingUp = TRUE;
     S->RemoteSignallingInitiated = FALSE;
     S->Reasm.Active = FALSE;
@@ -718,16 +779,22 @@ NTSTATUS AvdtpConnectSignalling(_Inout_ PAVDTP_SESSION S)
     return STATUS_SUCCESS;
 }
 
-NTSTATUS AvdtpAcceptIncoming(_Inout_ PAVDTP_SESSION S, _In_ PINDICATION_PARAMETERS Params)
+NTSTATUS AvdtpAcceptIncoming(_Inout_ PAVDTP_SESSION S, _In_ PINDICATION_PARAMETERS Params, _Out_ PBOOLEAN Signalling)
 {
     NTSTATUS status;
-    if (!S->SignallingUp && S->Signalling.State != PnChannelConnecting) {
+    PN_INCOMING_KIND kind = PnIncomingKind(S->SignallingUp, S->Signalling.State == PnChannelConnecting, S->MediaUp,
+                                           S->Media.State == PnChannelConnecting, S->MediaExpected || S->OpenSent, S->StreamState);
+    *Signalling = kind == PnIncomingSignalling;
+    if (kind == PnIncomingSignalling) {
         S->RemoteSignallingInitiated = TRUE;
         S->Reasm.Active = FALSE;
         status = PnChannelAccept(&S->Signalling, Params, PN_L2CAP_SIG_MTU);
         if (NT_SUCCESS(status)) {
-            /* mark up optimistically; readers start when the accept completes (event worker) */
+            /* mark up optimistically; readers start when the accept completes (event worker).
+             * A stream of the old session is reset first; until then no command of ours
+             * goes out on the new channel (review #1). */
             S->SigAcceptGen = S->Signalling.Generation;
+            if (S->StreamState != AvdtpStateIdle) InterlockedExchange(&S->ResetPending, 1);
             S->SignallingUp = TRUE;
             AvdtpQueueEvent(S, AVDTP_EVT_SIG_UP);
         } else {
@@ -735,9 +802,8 @@ NTSTATUS AvdtpAcceptIncoming(_Inout_ PAVDTP_SESSION S, _In_ PINDICATION_PARAMETE
         }
         return status;
     }
-    if (S->SignallingUp && !S->MediaUp && S->Media.State != PnChannelConnecting &&
-        (S->MediaExpected || S->StreamState == AvdtpStateConfigured || S->StreamState == AvdtpStateOpening)) {
-        status = PnChannelAccept(&S->Media, Params, PN_L2CAP_MEDIA_MTU_PREF);
+    if (kind == PnIncomingMedia) {
+        status = PnChannelAccept(&S->Media, Params, AvdtpPreferredMediaMtu(S));
         if (NT_SUCCESS(status)) {
             S->MediaAcceptGen = S->Media.Generation;
             S->MediaExpected = FALSE;
@@ -749,34 +815,63 @@ NTSTATUS AvdtpAcceptIncoming(_Inout_ PAVDTP_SESSION S, _In_ PINDICATION_PARAMETE
         return status;
     }
     PN_WARN("unexpected incoming L2CAP connection (sig %u media %u state %u)", S->SignallingUp, S->MediaUp, S->StreamState);
-    return PnLinkRejectIncoming(S->Link, Params);
+    PnLinkRejectIncoming(S->Link, Params);
+    return STATUS_REQUEST_NOT_ACCEPTED;   /* refused: not the receiver connecting (review round 4 #1) */
 }
 
 VOID AvdtpDisconnect(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
     if (!S->Link) return;
-    PnMutexAcquire(&S->Mutex);
+    PnMutexAcquire(&S->Mutex);   /* no INT procedure in flight; the acceptor keeps running */
+    PnMutexAcquire(&S->StreamMutex);
     if (S->StreamState != AvdtpStateIdle) SetStreamState(S, AvdtpStateClosing, FALSE);
     /* clear the up flags only for the connections closed here: a remote reconnect accepted
      * meanwhile (at DISPATCH) owns its own flag */
     ULONG mg = S->Media.Generation, sg = S->Signalling.Generation;
+    PnMutexRelease(&S->StreamMutex);
     PnChannelDisconnectSync(&S->Media);
+    PnChannelDisconnectSync(&S->Signalling);
+    PnMutexAcquire(&S->StreamMutex);
     if (S->Media.Generation == mg) S->MediaUp = FALSE;
     S->MediaExpected = FALSE;
-    PnChannelDisconnectSync(&S->Signalling);
     if (S->Signalling.Generation == sg) S->SignallingUp = FALSE;
     S->RemoteSepsValid = FALSE;
     S->RemoteSepCount = 0;
     S->Reasm.Active = FALSE;
     KeSetEvent(&S->Txn.Done, 0, FALSE);
     if (S->StreamState != AvdtpStateIdle) SetStreamState(S, AvdtpStateIdle, FALSE);
+    InterlockedExchange(&S->ResetPending, 0);   /* nothing of the old session is left to reset */
+    PnMutexRelease(&S->StreamMutex);
     PnMutexRelease(&S->Mutex);
 }
 
 /* ------------------------------------------------------------------------- */
 /* INT procedures                                                               */
 /* ------------------------------------------------------------------------- */
+/* Shape of each (T9): under the command lock, a short StreamMutex section checks the
+ * state and publishes IntSignal; the transaction runs without StreamMutex; AvdtpTransact
+ * returns holding it, the answer is judged against the state as it is now (PnIntOutcome)
+ * and applied; AvdtpTxnEnd releases it. Channel connects and disconnects run outside
+ * StreamMutex. */
+
+/* After CLOSE / ABORT (or locally): drop the media channel and go Idle, unless the
+ * receiver set up a new stream meanwhile. Command lock held, StreamMutex not. The caller
+ * cleared TransportIdle before its transaction ended; the receiver's state-dependent
+ * commands wait for Idle (review round 4 #2). */
+static VOID AvdtpFinishTeardown(_Inout_ PAVDTP_SESSION S, _In_ AVDTP_STREAM_STATE Sent)
+{
+    KeClearEvent(&S->TransportIdle);   /* the local-only close had no transaction */
+    PnChannelDisconnectSync(&S->Media);
+    PnMutexAcquire(&S->StreamMutex);
+    if (PnIntOutcome(AVDTP_CLOSE, STATUS_SUCCESS, Sent, S->StreamState) != PnIntLost) {
+        S->MediaUp = FALSE;
+        S->MediaExpected = FALSE;
+        SetStreamState(S, AvdtpStateIdle, FALSE);
+    }
+    PnMutexRelease(&S->StreamMutex);
+    KeSetEvent(&S->TransportIdle, 0, FALSE);
+}
 
 NTSTATUS AvdtpDiscover(_Inout_ PAVDTP_SESSION S)
 {
@@ -784,54 +879,66 @@ NTSTATUS AvdtpDiscover(_Inout_ PAVDTP_SESSION S)
     NTSTATUS status;
     UCHAR err;
     PnMutexAcquire(&S->Mutex);
+    PnMutexAcquire(&S->StreamMutex);
     S->RemoteSepCount = 0;
     S->RemoteSepsValid = FALSE;
+    PnMutexRelease(&S->StreamMutex);
     status = AvdtpTransact(S, AVDTP_DISCOVER, NULL, 0, &err);
-    if (!NT_SUCCESS(status)) { PnMutexRelease(&S->Mutex); return status; }
-    ULONG count = S->Txn.PayloadLength / 2;
-    for (ULONG i = 0; i < count && S->RemoteSepCount < AVDTP_MAX_SEPS; i++) {
-        PAVDTP_REMOTE_SEP sep = &S->RemoteSeps[S->RemoteSepCount];
-        RtlZeroMemory(sep, sizeof(*sep));
-        sep->Seid = (UCHAR)(S->Txn.Payload[i * 2] >> 2);
-        sep->InUse = (UCHAR)((S->Txn.Payload[i * 2] >> 1) & 1);
-        sep->MediaType = (UCHAR)(S->Txn.Payload[i * 2 + 1] >> 4);
-        sep->Tsep = (UCHAR)((S->Txn.Payload[i * 2 + 1] >> 3) & 1);
-        if (sep->MediaType != AVDTP_MEDIA_TYPE_AUDIO) continue;
-        S->RemoteSepCount++;
-    }
-    PN_INFO("AVDTP discovered %u audio SEPs", S->RemoteSepCount);
-    BOOLEAN useAll = (S->RemoteVersion >= 0x0103);
-    for (ULONG i = 0; i < S->RemoteSepCount; i++) {
+    if (!NT_SUCCESS(status)) { AvdtpTxnEnd(S); PnMutexRelease(&S->Mutex); return status; }
+    ULONG count = AvdtpParseDiscover(S->Txn.Payload, S->Txn.PayloadLength, S->RemoteSeps, AVDTP_MAX_SEPS);
+    S->RemoteSepCount = count;
+    AvdtpTxnEnd(S);
+    PN_INFO("AVDTP discovered %u audio SEPs", count);
+    /* capability fallback policy: transport_policy.h */
+    PN_CAPS_QUERY q;
+    PnCapsQueryStart(&q, S->RemoteVersion, S->CapsBasicOnly);
+    ULONG withCaps = 0;
+    for (ULONG i = 0; i < count; i++) {
         PAVDTP_REMOTE_SEP sep = &S->RemoteSeps[i];
         UCHAR p[1] = { (UCHAR)(sep->Seid << 2) };
-        status = AvdtpTransact(S, useAll ? AVDTP_GET_ALL_CAPABILITIES : AVDTP_GET_CAPABILITIES, p, 1, &err);
-        if (status == STATUS_NOT_SUPPORTED && useAll) {
-            useAll = FALSE;
-            S->RemoteVersion = 0x0102;
-            status = AvdtpTransact(S, AVDTP_GET_CAPABILITIES, p, 1, &err);
+        PN_CAPS_ACTION action = PnCapsNextSep;
+        for (ULONG attempt = 0; attempt < 2; attempt++) {
+            status = AvdtpTransact(S, PnCapsQuerySignal(&q), p, 1, &err);
+            action = PnCapsQueryResult(&q, status);
+            /* parsed under StreamMutex: the acceptor clears in-use bits of this array */
+            if (action == PnCapsParse && AvdtpParseServiceCapabilities(S->Txn.Payload, S->Txn.PayloadLength, sep)) withCaps++;
+            AvdtpTxnEnd(S);
+            if (action != PnCapsRetryBasic) break;
         }
-        if (!NT_SUCCESS(status)) {
+        if (action != PnCapsParse) {
             PN_WARN("GET_CAPABILITIES seid %u failed 0x%08x", sep->Seid, status);
-            if (status == STATUS_IO_TIMEOUT || status == STATUS_CONNECTION_DISCONNECTED) break;
+            if (action == PnCapsStop) break;
             continue;
         }
-        AvdtpParseServiceCapabilities(S->Txn.Payload, S->Txn.PayloadLength, sep);
         PN_INFO("  SEP %u: %s in-use %u codec %s (type 0x%02X vid %08X cid %04X) svc 0x%02X", sep->Seid,
                 sep->Tsep ? "SNK" : "SRC", sep->InUse, A2dpCodecName(sep->Codec), sep->MediaCodecType, sep->VendorId,
                 sep->VendorCodecId, sep->ServiceCaps);
     }
-    S->RemoteSepsValid = NT_SUCCESS(status) || S->RemoteSepCount > 0;
+    if (q.Downgraded) {
+        /* on evidence only (PnCapsQueryResult): remembered for this device */
+        S->RemoteVersion = q.Version;
+        S->CapsBasicOnly = TRUE;
+    }
+    PnMutexAcquire(&S->StreamMutex);
+    /* a new signalling session reset the list meanwhile: this discovery is void */
+    S->RemoteSepsValid = S->RemoteSepCount == count && PnDiscoveryValid(status, count, withCaps);
+    BOOLEAN valid = S->RemoteSepsValid;
+    PnMutexRelease(&S->StreamMutex);
     PnMutexRelease(&S->Mutex);
-    return S->RemoteSepsValid ? STATUS_SUCCESS : status;
+    if (valid) return STATUS_SUCCESS;
+    PN_WARN("AVDTP discovery: no SEP with usable capabilities (%u SEPs)", count);
+    return NT_SUCCESS(status) ? STATUS_NOT_SUPPORTED : status;
 }
 
 NTSTATUS AvdtpSetConfiguration(_Inout_ PAVDTP_SESSION S, _In_ UCHAR LocalSeid, _In_ UCHAR RemoteSeid,
                                _In_reads_bytes_(Len) const UCHAR *CodecIes, _In_ ULONG Len,
-                               _In_ BOOLEAN RequestDelayReporting, _In_ BOOLEAN RequestContentProtection)
+                               _In_ BOOLEAN RequestDelayReporting, _In_ BOOLEAN RequestContentProtection,
+                               _Out_opt_ PUCHAR ErrorCode)
 {
     PAGED_CODE();
     UCHAR p[64];
     ULONG n = 0, err = 0;
+    if (ErrorCode) *ErrorCode = 0;
     UCHAR mct;
     UCHAR dummy[32];
     PAVDTP_LOCAL_SEP local = FindLocalSep(S, LocalSeid);
@@ -839,7 +946,10 @@ NTSTATUS AvdtpSetConfiguration(_Inout_ PAVDTP_SESSION S, _In_ UCHAR LocalSeid, _
     A2dpBuildLocalCaps(local->Codec, dummy, sizeof(dummy), &mct);
 
     PnMutexAcquire(&S->Mutex);
-    if (S->StreamState != AvdtpStateIdle) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    PnMutexAcquire(&S->StreamMutex);
+    if (S->StreamState != AvdtpStateIdle) { PnMutexRelease(&S->StreamMutex); PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    S->IntSignal = AVDTP_SET_CONFIGURATION;   /* a receiver SET_CONFIGURATION now is refused SEP_IN_USE */
+    PnMutexRelease(&S->StreamMutex);
     p[n++] = (UCHAR)(RemoteSeid << 2);
     p[n++] = (UCHAR)(LocalSeid << 2);
     p[n++] = AVDTP_CAT_MEDIA_TRANSPORT; p[n++] = 0;
@@ -849,15 +959,38 @@ NTSTATUS AvdtpSetConfiguration(_Inout_ PAVDTP_SESSION S, _In_ UCHAR LocalSeid, _
     UCHAR ec = 0;
     NTSTATUS status = AvdtpTransact(S, AVDTP_SET_CONFIGURATION, p, n, &ec);
     err = ec;
-    if (NT_SUCCESS(status)) {
+    if (ErrorCode) *ErrorCode = ec;
+    BOOLEAN abortSep = FALSE;
+    switch (PnIntOutcome(AVDTP_SET_CONFIGURATION, status, AvdtpStateIdle, S->StreamState)) {
+    case PnIntApply:
         S->LocalSeid = LocalSeid;
         S->RemoteSeid = RemoteSeid;
         S->ConfiguredIesLength = (UCHAR)PN_MIN(Len, sizeof(S->ConfiguredIes));
         RtlCopyMemory(S->ConfiguredIes, CodecIes, S->ConfiguredIesLength);
         S->DelayReportingNegotiated = RequestDelayReporting;
+        S->SinkDelayTenthsMs = 0;   /* a report of an earlier stream does not apply (T6) */
         SetStreamState(S, AvdtpStateConfigured, FALSE);
-    } else {
+        break;
+    case PnIntLost:
+        /* the stream moved on under our request: a configuration of the receiver's SEP
+         * that we cannot track is aborted below */
+        PN_WARN("SET_CONFIGURATION answered after the stream changed (state %u)", S->StreamState);
+        abortSep = NT_SUCCESS(status);
+        status = STATUS_INVALID_DEVICE_STATE;
+        break;
+    default:
         PN_WARN("SET_CONFIGURATION failed 0x%08x (avdtp error 0x%02X)", status, err);
+        /* the receiver may have configured its SEP without answering: free it (T3) */
+        abortSep = status == STATUS_IO_TIMEOUT;
+        break;
+    }
+    /* the ABORT below names the receiver's SEP: its own SET_CONFIGURATION stays refused
+     * (SEP_IN_USE) until that ABORT is answered, as during ours (review #2) */
+    AvdtpTxnEndAs(S, abortSep ? AVDTP_SET_CONFIGURATION : 0);
+    if (abortSep) {
+        UCHAR a[1] = { (UCHAR)(RemoteSeid << 2) };
+        AvdtpTransact(S, AVDTP_ABORT, a, 1, NULL);
+        AvdtpTxnEnd(S);
     }
     PnMutexRelease(&S->Mutex);
     return status;
@@ -873,58 +1006,198 @@ NTSTATUS AvdtpReconfigure(_Inout_ PAVDTP_SESSION S, _In_reads_bytes_(Len) const 
     if (!local) return STATUS_INVALID_DEVICE_STATE;
     A2dpBuildLocalCaps(local->Codec, dummy, sizeof(dummy), &mct);
     PnMutexAcquire(&S->Mutex);
-    if (S->StreamState != AvdtpStateOpen) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    PnMutexAcquire(&S->StreamMutex);
+    if (S->StreamState != AvdtpStateOpen) { PnMutexRelease(&S->StreamMutex); PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
     p[n++] = (UCHAR)(S->RemoteSeid << 2);
+    S->IntSignal = AVDTP_RECONFIGURE;
+    PnMutexRelease(&S->StreamMutex);
     n += AvdtpBuildMediaCodecCap(p + n, sizeof(p) - n, mct, CodecIes, Len);
     UCHAR ec = 0;
     NTSTATUS status = AvdtpTransact(S, AVDTP_RECONFIGURE, p, n, &ec);
-    if (NT_SUCCESS(status)) {
+    switch (PnIntOutcome(AVDTP_RECONFIGURE, status, AvdtpStateOpen, S->StreamState)) {
+    case PnIntApply:   /* also when the receiver's START crossed an accepted RECONFIGURE (round 5 #2) */
         S->ConfiguredIesLength = (UCHAR)PN_MIN(Len, sizeof(S->ConfiguredIes));
         RtlCopyMemory(S->ConfiguredIes, CodecIes, S->ConfiguredIesLength);
+        break;
+    case PnIntLost:
+        status = STATUS_INVALID_DEVICE_STATE;   /* the receiver closed it, or started it and refused ours, meanwhile */
+        break;
+    default:
+        break;
     }
+    AvdtpTxnEnd(S);
     PnMutexRelease(&S->Mutex);
     return status;
 }
 
-NTSTATUS AvdtpOpen(_Inout_ PAVDTP_SESSION S)
+/* Media channel facts checked under its Lock, so a remote disconnect (DISPATCH, without
+ * StreamMutex) is either seen here or clears MediaUp after us (review round 3 #2).
+ * Own: our connect is the current, connected one. Otherwise: the receiver's accepted
+ * channel is the current one and still connecting or connected. */
+static BOOLEAN AvdtpMediaChannelIs(_Inout_ PAVDTP_SESSION S, _In_ BOOLEAN Own)
+{
+    PPN_L2CAP_CHANNEL ch = &S->Media;
+    KIRQL irql;
+    KeAcquireSpinLock(&ch->Lock, &irql);
+    BOOLEAN r = Own ? PnOwnMediaLive(ch->State == PnChannelConnected, ch->RemoteInitiated)
+                    : PnRemoteMediaCurrent(ch->RemoteInitiated, ch->Generation == S->MediaAcceptGen,
+                                           ch->State == PnChannelConnecting || ch->State == PnChannelConnected);
+    KeReleaseSpinLock(&ch->Lock, irql);
+    return r;
+}
+
+/* AvdtpOpen after an applied OPEN answer: connect the media channel and open the stream.
+ * Command lock held, StreamMutex not; TransportIdle is clear (review round 4 #2). */
+static NTSTATUS AvdtpOpenConnectMedia(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
-    PnMutexAcquire(&S->Mutex);
-    if (S->StreamState != AvdtpStateConfigured) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
-    UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
-    NTSTATUS status = AvdtpTransact(S, AVDTP_OPEN, p, 1, NULL);
-    if (!NT_SUCCESS(status)) { PnMutexRelease(&S->Mutex); return status; }
-    SetStreamState(S, AvdtpStateOpening, FALSE);
-    /* INT opens the transport channel */
-    status = PnChannelConnect(&S->Media, PSM_AVDTP, PN_L2CAP_MEDIA_MTU_PREF, 10000);
+    NTSTATUS status = PnChannelConnect(&S->Media, PSM_AVDTP, AvdtpPreferredMediaMtu(S), 10000);
+    PnMutexAcquire(&S->StreamMutex);
+    BOOLEAN opening = S->StreamState == AvdtpStateOpening;
+    if (NT_SUCCESS(status) && opening) {
+        /* the receiver may have closed it already (its down event cleared MediaUp): a
+         * connect that failed, not a transport (review round 3 #2) */
+        if (AvdtpMediaChannelIs(S, TRUE)) S->MediaUp = TRUE;
+        else status = STATUS_CONNECTION_DISCONNECTED;
+    }
+    PnMutexRelease(&S->StreamMutex);
+    if (NT_SUCCESS(status) && !opening) {
+        /* the receiver aborted or closed the stream while we connected */
+        PnChannelDisconnectSync(&S->Media);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     if (!NT_SUCCESS(status)) {
+        if (!opening) return STATUS_INVALID_DEVICE_STATE;
+        switch (PnMediaConnectFailureAction(status, S->MediaUp && AvdtpMediaChannelIs(S, FALSE), S->ResetPending != 0)) {
+        case PnMediaConnectAdopt:
+            /* the receiver's own media channel completes the open */
+            return STATUS_PENDING;
+        case PnMediaConnectReset:
+            /* cancelled for a new signalling session: no ABORT on its channel (review #1) */
+            return STATUS_CANCELLED;
+        default:
+            break;
+        }
         PN_WARN("media channel connect failed 0x%08x; aborting stream", status);
+        KeSetEvent(&S->TransportIdle, 0, FALSE);   /* nothing left to wait for; our ABORT orders itself */
+        PnMutexAcquire(&S->StreamMutex);
+        BOOLEAN abort = S->StreamState == AvdtpStateOpening;
+        /* left over from a channel that is gone: it would refuse the receiver's next transport */
+        if (S->MediaUp && !AvdtpMediaChannelIs(S, FALSE)) S->MediaUp = FALSE;
         UCHAR a[1] = { (UCHAR)(S->RemoteSeid << 2) };
-        AvdtpTransact(S, AVDTP_ABORT, a, 1, NULL);
-        SetStreamState(S, AvdtpStateIdle, FALSE);
-        PnMutexRelease(&S->Mutex);
+        if (abort) { S->IntSignal = AVDTP_ABORT; SetStreamState(S, AvdtpStateAborting, FALSE); }
+        PnMutexRelease(&S->StreamMutex);
+        if (abort) {
+            NTSTATUS as = AvdtpTransact(S, AVDTP_ABORT, a, 1, NULL);
+            if (PnIntOutcome(AVDTP_ABORT, as, AvdtpStateAborting, S->StreamState) != PnIntLost) SetStreamState(S, AvdtpStateIdle, FALSE);
+            AvdtpTxnEnd(S);
+        }
         return status;
     }
-    S->MediaUp = TRUE;
     PnChannelStartReaders(&S->Media);
-    SetStreamState(S, AvdtpStateOpen, FALSE);
+    PnMutexAcquire(&S->StreamMutex);
+    opening = S->StreamState == AvdtpStateOpening;
+    if (opening) SetStreamState(S, AvdtpStateOpen, FALSE);
+    PnMutexRelease(&S->StreamMutex);
+    /* not Opening any more: the receiver's ABORT / CLOSE closed the channel meanwhile */
+    return opening ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;
+}
+
+NTSTATUS AvdtpOpen(_Inout_ PAVDTP_SESSION S, _Out_opt_ PUCHAR ErrorCode, _Out_opt_ PBOOLEAN ReceiverOpenRefused)
+{
+    PAGED_CODE();
+    if (ErrorCode) *ErrorCode = 0;
+    if (ReceiverOpenRefused) *ReceiverOpenRefused = FALSE;
+    PnMutexAcquire(&S->Mutex);
+    PnMutexAcquire(&S->StreamMutex);
+    if (S->StreamState != AvdtpStateConfigured) { PnMutexRelease(&S->StreamMutex); PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
+    S->IntSignal = AVDTP_OPEN;   /* a receiver OPEN now is refused: one side connects the transport */
+    S->OpenSent = TRUE;          /* a receiver may open the transport before our OPEN's answer arrives */
+    S->OpenCollided = FALSE;
+    PnMutexRelease(&S->StreamMutex);
+    NTSTATUS status = AvdtpTransact(S, AVDTP_OPEN, p, 1, ErrorCode);
+    BOOLEAN connect = FALSE;
+    S->OpenSent = FALSE;
+    if (ReceiverOpenRefused) *ReceiverOpenRefused = S->OpenCollided;   /* StreamMutex held */
+    switch (PnIntOutcome(AVDTP_OPEN, status, AvdtpStateConfigured, S->StreamState)) {
+    case PnIntApply:
+        SetStreamState(S, AvdtpStateOpening, FALSE);
+        /* INT opens the transport channel, unless the receiver already did (T9) */
+        /* a MediaUp left behind by a channel that is gone is no transport (review round 3 #2) */
+        switch (PnOpenTransport(S->MediaUp, AvdtpMediaChannelIs(S, FALSE),
+                                S->MediaHeldGen == S->Media.Generation && PnChannelIsConnected(&S->Media))) {
+        case PnOpenAdoptReady:
+            SetStreamState(S, AvdtpStateOpen, FALSE);   /* its channel is up, readers running */
+            status = STATUS_SUCCESS;
+            break;
+        case PnOpenAdoptPending:
+            status = STATUS_PENDING;                    /* its accept completes and opens the stream */
+            break;
+        default:
+            connect = TRUE;
+            break;
+        }
+        break;
+    case PnIntReached:
+        status = STATUS_SUCCESS;   /* the receiver opened it meanwhile */
+        break;
+    case PnIntPending:
+        status = STATUS_PENDING;   /* the receiver's OPEN: its transport completes it */
+        break;
+    case PnIntLost:
+        status = STATUS_INVALID_DEVICE_STATE;
+        break;
+    default:
+        /* refused or unanswered: a transport the receiver opened for it is not ours */
+        if (S->MediaUp && S->StreamState == AvdtpStateConfigured && PnChannelDisconnectGen(&S->Media, S->Media.Generation)) S->MediaUp = FALSE;
+        break;
+    }
+    /* review round 4 #2: the receiver's state-dependent commands wait for the connect */
+    if (connect) KeClearEvent(&S->TransportIdle);
+    AvdtpTxnEnd(S);
+    if (!connect) { PnMutexRelease(&S->Mutex); return status; }
+    /* a new signalling session took over: AvdtpResetStream ends this stream (review #1) */
+    status = S->ResetPending ? STATUS_CANCELLED : AvdtpOpenConnectMedia(S);
+    KeSetEvent(&S->TransportIdle, 0, FALSE);
     PnMutexRelease(&S->Mutex);
-    return STATUS_SUCCESS;
+    return status;
 }
 
 NTSTATUS AvdtpStart(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
     PnMutexAcquire(&S->Mutex);
-    if (S->StreamState == AvdtpStateStreaming) { PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
-    if (S->StreamState != AvdtpStateOpen) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    PnMutexAcquire(&S->StreamMutex);
+    AVDTP_STREAM_STATE st = S->StreamState;
+    if (st != AvdtpStateOpen) {
+        PnMutexRelease(&S->StreamMutex);
+        PnMutexRelease(&S->Mutex);
+        return st == AvdtpStateStreaming ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;
+    }
     UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
+    S->IntSignal = AVDTP_START;
+    PnMutexRelease(&S->StreamMutex);
     UCHAR ec = 0;
     NTSTATUS status = AvdtpTransact(S, AVDTP_START, p, 1, &ec);
-    if (NT_SUCCESS(status) || (status == STATUS_DEVICE_PROTOCOL_ERROR && ec == AVDTP_ERR_BAD_STATE && S->StreamState == AvdtpStateStreaming)) {
+    switch (PnIntOutcome(AVDTP_START, status, AvdtpStateOpen, S->StreamState)) {
+    case PnIntApply:
         SetStreamState(S, AvdtpStateStreaming, FALSE);
         status = STATUS_SUCCESS;
+        break;
+    case PnIntReached:
+        /* both sides started: the receiver's START got there first (a BAD_STATE answer to
+         * ours is that collision, not a failure) */
+        if (!NT_SUCCESS(status)) PN_INFO("START crossed the receiver's (0x%08x, error 0x%02X)", status, ec);
+        status = STATUS_SUCCESS;
+        break;
+    case PnIntLost:
+        status = STATUS_INVALID_DEVICE_STATE;   /* suspended, closed or aborted meanwhile */
+        break;
+    default:
+        break;
     }
+    AvdtpTxnEnd(S);
     PnMutexRelease(&S->Mutex);
     return status;
 }
@@ -933,13 +1206,25 @@ NTSTATUS AvdtpSuspend(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
     PnMutexAcquire(&S->Mutex);
-    if (S->StreamState != AvdtpStateStreaming) { PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
+    PnMutexAcquire(&S->StreamMutex);
+    if (S->StreamState != AvdtpStateStreaming) { PnMutexRelease(&S->StreamMutex); PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
     UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
+    S->IntSignal = AVDTP_SUSPEND;
+    PnMutexRelease(&S->StreamMutex);
     NTSTATUS status = AvdtpTransact(S, AVDTP_SUSPEND, p, 1, NULL);
-    if (NT_SUCCESS(status) || status == STATUS_DEVICE_PROTOCOL_ERROR) {
+    switch (PnIntOutcome(AVDTP_SUSPEND, status, AvdtpStateStreaming, S->StreamState)) {
+    case PnIntApply:
         SetStreamState(S, AvdtpStateOpen, FALSE);
         status = STATUS_SUCCESS;
+        break;
+    case PnIntReached:
+    case PnIntLost:
+        status = STATUS_SUCCESS;   /* not streaming any more: the receiver suspended or closed it */
+        break;
+    default:
+        break;
     }
+    AvdtpTxnEnd(S);
     PnMutexRelease(&S->Mutex);
     return status;
 }
@@ -948,17 +1233,50 @@ NTSTATUS AvdtpClose(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
     PnMutexAcquire(&S->Mutex);
-    if (S->StreamState == AvdtpStateIdle) { PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
-    NTSTATUS status = STATUS_SUCCESS;
-    if (S->StreamState == AvdtpStateOpen || S->StreamState == AvdtpStateStreaming) {
-        UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
+    PnMutexAcquire(&S->StreamMutex);
+    PN_CLOSE_ACTION action = PnStreamCloseAction(S->StreamState);
+    if (action == PnCloseNothing) { PnMutexRelease(&S->StreamMutex); PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
+    UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
+    UCHAR signal = 0;
+    if (action == PnCloseSendClose) {
         SetStreamState(S, AvdtpStateClosing, FALSE);
-        status = AvdtpTransact(S, AVDTP_CLOSE, p, 1, NULL);
+        signal = AVDTP_CLOSE;
+    } else if (action == PnCloseSendAbort) {
+        /* Configured / Opening: CLOSE is not allowed, but the receiver must learn (T3) */
+        SetStreamState(S, AvdtpStateAborting, FALSE);
+        signal = AVDTP_ABORT;
     }
-    PnChannelDisconnectSync(&S->Media);
-    S->MediaUp = FALSE;
-    S->MediaExpected = FALSE;
-    SetStreamState(S, AvdtpStateIdle, FALSE);
+    AVDTP_STREAM_STATE sent = S->StreamState;   /* Closing / Aborting */
+    S->IntSignal = signal;
+    PnMutexRelease(&S->StreamMutex);
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOLEAN teardown = TRUE;
+    if (signal) {
+        status = AvdtpTransact(S, signal, p, 1, NULL);
+        teardown = PnIntOutcome(signal, status, sent, S->StreamState) != PnIntLost;
+        if (teardown) KeClearEvent(&S->TransportIdle);   /* before the acceptor can judge against Closing */
+        AvdtpTxnEnd(S);
+    }
+    if (teardown) AvdtpFinishTeardown(S, sent);
+    PnMutexRelease(&S->Mutex);
+    return status;
+}
+
+/* C4 (review round 3 #6): a command every sink answers in any stream state, for the
+ * receiver's SEP of our stream. Only whether an answer (accept or reject) came matters;
+ * nothing is parsed and no state changes. */
+NTSTATUS AvdtpProbe(_Inout_ PAVDTP_SESSION S)
+{
+    PAGED_CODE();
+    PnMutexAcquire(&S->Mutex);
+    PnMutexAcquire(&S->StreamMutex);
+    UCHAR seid = S->RemoteSeid;
+    PnMutexRelease(&S->StreamMutex);
+    if (!seid) { PnMutexRelease(&S->Mutex); return STATUS_INVALID_DEVICE_STATE; }
+    UCHAR p[1] = { (UCHAR)(seid << 2) };
+    UCHAR err;
+    NTSTATUS status = AvdtpTransact(S, AVDTP_GET_CAPABILITIES, p, 1, &err);
+    AvdtpTxnEnd(S);
     PnMutexRelease(&S->Mutex);
     return status;
 }
@@ -967,16 +1285,17 @@ NTSTATUS AvdtpAbort(_Inout_ PAVDTP_SESSION S)
 {
     PAGED_CODE();
     PnMutexAcquire(&S->Mutex);
-    NTSTATUS status = STATUS_SUCCESS;
-    if (S->StreamState != AvdtpStateIdle) {
-        UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
-        SetStreamState(S, AvdtpStateAborting, FALSE);
-        status = AvdtpTransact(S, AVDTP_ABORT, p, 1, NULL);
-        PnChannelDisconnectSync(&S->Media);
-        S->MediaUp = FALSE;
-        S->MediaExpected = FALSE;
-        SetStreamState(S, AvdtpStateIdle, FALSE);
-    }
+    PnMutexAcquire(&S->StreamMutex);
+    if (S->StreamState == AvdtpStateIdle) { PnMutexRelease(&S->StreamMutex); PnMutexRelease(&S->Mutex); return STATUS_SUCCESS; }
+    UCHAR p[1] = { (UCHAR)(S->RemoteSeid << 2) };
+    SetStreamState(S, AvdtpStateAborting, FALSE);
+    S->IntSignal = AVDTP_ABORT;
+    PnMutexRelease(&S->StreamMutex);
+    NTSTATUS status = AvdtpTransact(S, AVDTP_ABORT, p, 1, NULL);
+    BOOLEAN teardown = PnIntOutcome(AVDTP_ABORT, status, AvdtpStateAborting, S->StreamState) != PnIntLost;
+    if (teardown) KeClearEvent(&S->TransportIdle);   /* before the acceptor can judge against Aborting */
+    AvdtpTxnEnd(S);
+    if (teardown) AvdtpFinishTeardown(S, AvdtpStateAborting);
     PnMutexRelease(&S->Mutex);
     return status;
 }

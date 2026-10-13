@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "pna2dp.h"
+#include "sdp_policy.h"
 
 /* ------------------------------------------------------------------------- */
 /* Generic BRB submission                                                      */
@@ -53,7 +54,7 @@ static NTSTATUS PnSendBrbAsync(_In_ WDFIOTARGET Target, _In_ WDFREQUEST Request,
     return STATUS_SUCCESS;
 }
 
-NTSTATUS PnLinkSendBrbSync(_In_ PPN_BTH_LINK Link, _In_ PBRB Brb, _In_ ULONG BrbSize)
+NTSTATUS PnLinkSendBrbSync(_In_ PPN_BTH_LINK Link, _Inout_updates_bytes_(BrbSize) PBRB Brb, _In_ ULONG BrbSize)
 {
     PAGED_CODE();
     WDF_REQUEST_REUSE_PARAMS reuse;
@@ -77,14 +78,14 @@ NTSTATUS PnLinkSendBrbSync(_In_ PPN_BTH_LINK Link, _In_ PBRB Brb, _In_ ULONG Brb
 NTSTATUS PnLinkEnsureActive(_Inout_ PPN_BTH_LINK Link)
 {
     PAGED_CODE();
-    struct _BRB_ACL_GET_MODE mode;
+    struct _BRB_ACL_GET_MODE mode = {};
     Link->Ddi.BthInitializeBrb((PBRB)&mode, BRB_ACL_GET_MODE);
     mode.BtAddress = Link->RemoteAddress;
     NTSTATUS status = PnLinkSendBrbSync(Link, (PBRB)&mode, sizeof(mode));
     if (!NT_SUCCESS(status)) { PN_WARN("ACL mode query failed 0x%08x", status); return status; }
     if (mode.AclMode == ACL_MODE_ACTIVE) return STATUS_SUCCESS;
 
-    struct _BRB_ACL_ENTER_ACTIVE_MODE active;
+    struct _BRB_ACL_ENTER_ACTIVE_MODE active = {};
     Link->Ddi.BthInitializeBrb((PBRB)&active, BRB_ACL_ENTER_ACTIVE_MODE);
     active.BtAddress = Link->RemoteAddress;
     status = PnLinkSendBrbSync(Link, (PBRB)&active, sizeof(active));
@@ -92,8 +93,19 @@ NTSTATUS PnLinkEnsureActive(_Inout_ PPN_BTH_LINK Link)
     return status;
 }
 
+/* Whether an ACL to the remote exists right now (BthPort answers the mode query only for
+ * a connected device). */
+static BOOLEAN PnLinkAclExists(_Inout_ PPN_BTH_LINK Link)
+{
+    PAGED_CODE();
+    struct _BRB_ACL_GET_MODE mode = {};
+    Link->Ddi.BthInitializeBrb((PBRB)&mode, BRB_ACL_GET_MODE);
+    mode.BtAddress = Link->RemoteAddress;
+    return NT_SUCCESS(PnLinkSendBrbSync(Link, (PBRB)&mode, sizeof(mode)));
+}
+
 static NTSTATUS PnQueryInterface(_In_ PDEVICE_OBJECT Target, _In_ const GUID *InterfaceType, _In_ USHORT Size,
-                                 _In_ USHORT Version, _Out_ PINTERFACE Interface)
+                                 _In_ USHORT Version, _Inout_updates_bytes_(Size) PINTERFACE Interface)
 {
     PAGED_CODE();
     KEVENT event;
@@ -210,7 +222,7 @@ NTSTATUS PnLinkQueryRemoteInfo(_Inout_ PPN_BTH_LINK Link)
     Link->RemoteCod = info.classOfDevice;
     RtlStringCbCopyA(Link->RemoteName, sizeof(Link->RemoteName), info.name);
     size_t nameBytes = 0;
-    RtlStringCbLengthA(Link->RemoteName, sizeof(Link->RemoteName), &nameBytes);
+    if (!NT_SUCCESS(RtlStringCbLengthA(Link->RemoteName, sizeof(Link->RemoteName), &nameBytes))) nameBytes = 0;
     ULONG written = 0;
     NTSTATUS nameStatus = RtlUTF8ToUnicodeN(Link->RemoteNameW, sizeof(Link->RemoteNameW) - sizeof(WCHAR),
                                            &written, Link->RemoteName, (ULONG)nameBytes);
@@ -223,76 +235,17 @@ NTSTATUS PnLinkQueryRemoteInfo(_Inout_ PPN_BTH_LINK Link)
 /* SDP: read the remote AudioSink / AudioSource record                          */
 /* ------------------------------------------------------------------------- */
 
-/* SDP data element header (Bluetooth Core, Vol 3, Part B, 3.3). The response comes from
- * the remote device, so every length is checked against the bytes that remain. */
-#define PN_SDP_TYPE_UINT      1
-#define PN_SDP_TYPE_UUID      3
-#define PN_SDP_TYPE_SEQUENCE  6
-
-static BOOLEAN PnSdpElement(_In_reads_bytes_(Len) const UCHAR *P, _In_ ULONG Len, _Out_ PUCHAR Type,
-                            _Out_ const UCHAR **Data, _Out_ PULONG DataLen, _Out_ PULONG Total)
-{
-    *Type = 0; *Data = NULL; *DataLen = 0; *Total = 0;
-    if (Len < 1) return FALSE;
-    UCHAR type = (UCHAR)(P[0] >> 3), si = (UCHAR)(P[0] & 7);
-    ULONG hdr = 1, dl;
-    if (type == 0) dl = 0;
-    else if (si <= 4) dl = 1u << si;
-    else if (si == 5) { if (Len < 2) return FALSE; dl = P[1]; hdr = 2; }
-    else if (si == 6) { if (Len < 3) return FALSE; dl = ((ULONG)P[1] << 8) | P[2]; hdr = 3; }
-    else { if (Len < 5) return FALSE; dl = ((ULONG)P[1] << 24) | ((ULONG)P[2] << 16) | ((ULONG)P[3] << 8) | P[4]; hdr = 5; }
-    if (dl > Len - hdr) return FALSE;
-    *Type = type; *Data = P + hdr; *DataLen = dl; *Total = hdr + dl;
-    return TRUE;
-}
-
-static BOOLEAN PnSdpUint16(_In_ UCHAR Type, _In_reads_bytes_(Len) const UCHAR *D, _In_ ULONG Len, _Out_ PUSHORT Value)
-{
-    *Value = 0;
-    if ((Type != PN_SDP_TYPE_UINT && Type != PN_SDP_TYPE_UUID) || Len != 2) return FALSE;
-    *Value = (USHORT)(((USHORT)D[0] << 8) | D[1]);
-    return TRUE;
-}
-
-/* Profile descriptor list: seq( seq( uuid16 0x110D, uint16 version ) ... ) */
-static VOID PnSdpParseProfileList(_In_ PPN_BTH_LINK Link, _In_reads_bytes_(Len) const UCHAR *P, _In_ ULONG Len)
-{
-    while (Len) {
-        UCHAR t; const UCHAR *d; ULONG dl, tot;
-        if (!PnSdpElement(P, Len, &t, &d, &dl, &tot)) return;
-        if (t == PN_SDP_TYPE_SEQUENCE) {
-            UCHAR t1, t2; const UCHAR *d1, *d2; ULONG l1, l2, n1, n2;
-            USHORT uuid, ver;
-            if (PnSdpElement(d, dl, &t1, &d1, &l1, &n1) && PnSdpUint16(t1, d1, l1, &uuid) && uuid == A2DP_UUID_ADVANCED_AUDIO &&
-                PnSdpElement(d + n1, dl - n1, &t2, &d2, &l2, &n2) && PnSdpUint16(t2, d2, l2, &ver)) {
-                Link->RemoteAvdtpVersion = ver;
-                return;
-            }
-        }
-        P += tot; Len -= tot;
-    }
-}
-
+/* The record is parsed by the pure sdp_policy.h helpers (core_test covers them). */
 static NTSTATUS PnSdpParseRecord(_In_ PPN_BTH_LINK Link, _In_reads_bytes_(Len) const UCHAR *P, _In_ ULONG Len)
 {
     PAGED_CODE();
-    UCHAR t; const UCHAR *d; ULONG dl, tot;
-    /* AttributeLists: seq( seq(attribute list of record 1) ... ); accept a bare list too */
-    if (!PnSdpElement(P, Len, &t, &d, &dl, &tot) || t != PN_SDP_TYPE_SEQUENCE) return STATUS_DEVICE_DATA_ERROR;
-    {
-        UCHAR t1; const UCHAR *d1; ULONG l1, n1;
-        if (PnSdpElement(d, dl, &t1, &d1, &l1, &n1) && t1 == PN_SDP_TYPE_SEQUENCE) { d = d1; dl = l1; }
-    }
-    /* attribute list: uint16 id, value, uint16 id, value, ... */
-    while (dl) {
-        UCHAR ti, tv; const UCHAR *di, *dv; ULONG li, lv, ni, nv;
-        USHORT id;
-        if (!PnSdpElement(d, dl, &ti, &di, &li, &ni) || !PnSdpUint16(ti, di, li, &id)) break;
-        if (!PnSdpElement(d + ni, dl - ni, &tv, &dv, &lv, &nv)) break;
-        if (id == SDP_ATTRIB_PROFILE_DESCRIPTOR_LIST && tv == PN_SDP_TYPE_SEQUENCE) PnSdpParseProfileList(Link, dv, lv);
-        else if (id == 0x0311) PnSdpUint16(tv, dv, lv, &Link->RemoteSupportedFeatures);   /* SupportedFeatures */
-        d += ni + nv; dl -= ni + nv;
-    }
+    PN_SDP_A2DP_INFO info;
+    if (!PnSdpParseA2dpRecord(P, Len, &info)) return STATUS_DEVICE_DATA_ERROR;
+    USHORT avdtp = PnSdpAvdtpVersionToUse(&info);
+    if (avdtp) Link->RemoteAvdtpVersion = avdtp;
+    if (info.ProfileVersionFound) Link->RemoteProfileVersion = info.ProfileVersion;
+    if (info.FeaturesSeen) Link->RemoteSupportedFeatures = info.SupportedFeatures;
+    PN_VERB("SDP: A2DP profile version %04X, AVDTP %04X", info.ProfileVersion, info.AvdtpVersion);
     return STATUS_SUCCESS;
 }
 
@@ -365,7 +318,9 @@ NTSTATUS PnLinkQueryRemoteSdp(_Inout_ PPN_BTH_LINK Link, _In_ USHORT ServiceUuid
     WdfRequestReuse(request, &reuse);
     disconnect.hConnection = connect.hConnection;
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&in, &disconnect, sizeof(disconnect));
-    WdfIoTargetSendIoctlSynchronously(Link->IoTarget, request, IOCTL_BTH_SDP_DISCONNECT, &in, NULL, NULL, NULL);
+    NTSTATUS disconnectStatus = WdfIoTargetSendIoctlSynchronously(Link->IoTarget, request, IOCTL_BTH_SDP_DISCONNECT,
+                                                                  &in, NULL, NULL, NULL);
+    if (!NT_SUCCESS(disconnectStatus)) PN_WARN("SDP disconnect failed 0x%08x", disconnectStatus);
     WdfObjectDelete(request);
 
     if (NT_SUCCESS(status)) {
@@ -472,6 +427,7 @@ typedef struct _PN_REJECT_CTX {
 } PN_REJECT_CTX, *PPN_REJECT_CTX;
 WDF_DECLARE_CONTEXT_TYPE(PN_REJECT_CTX);
 
+static EVT_WDF_REQUEST_COMPLETION_ROUTINE PnRejectCompletion;
 static VOID PnRejectCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
                                _In_ WDFCONTEXT Context)
 {
@@ -516,6 +472,7 @@ NTSTATUS PnLinkRejectIncoming(_In_ PPN_BTH_LINK Link, _In_ PINDICATION_PARAMETER
 /* Radio (BthPort) PnP custom notifications: HCI SCO/ACL events                */
 /* ------------------------------------------------------------------------- */
 
+static DRIVER_NOTIFICATION_CALLBACK_ROUTINE PnLinkRadioNotification;
 static NTSTATUS PnLinkRadioNotification(_In_ PVOID NotificationStructure, _Inout_opt_ PVOID Context)
 {
     PPN_BTH_LINK link = (PPN_BTH_LINK)Context;
@@ -534,12 +491,16 @@ static NTSTATUS PnLinkRadioNotification(_In_ PVOID NotificationStructure, _Inout
                         if (link->OnSco) link->OnSco(link->CallbackContext, active);
                     }
                 } else if (e->connectionType == HCI_CONNECTION_TYPE_ACL) {
+                    /* every event is a real connect or disconnect: reported even when it
+                     * matches the stored state, which may be stale (review round 2 #8) */
                     BOOLEAN connected = e->connected != 0;
-                    if (link->AclConnected != connected) {
-                        link->AclConnected = connected;
-                        PN_INFO("ACL %s for %012llX", connected ? "up" : "down", e->bthAddress);
-                        if (link->OnAcl) link->OnAcl(link->CallbackContext, connected);
-                    }
+                    KIRQL irql;
+                    KeAcquireSpinLock(&link->AclLock, &irql);
+                    link->AclConnected = connected;
+                    link->AclEvents++;   /* the start-up seed loses to this event */
+                    KeReleaseSpinLock(&link->AclLock, irql);
+                    PN_INFO("ACL %s for %012llX", connected ? "up" : "down", e->bthAddress);
+                    if (link->OnAcl) link->OnAcl(link->CallbackContext, connected);
                 }
             }
         }
@@ -555,9 +516,12 @@ static NTSTATUS PnLinkRadioNotification(_In_ PVOID NotificationStructure, _Inout
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS PnQueryLocalRadio(PPN_BTH_LINK Link, PUNICODE_STRING Name, BTH_LOCAL_RADIO_INFO *Info)
+/* One IOCTL to the BthPort radio interface Name, on a handle of our own (PASSIVE). */
+static NTSTATUS PnRadioIoctl(PPN_BTH_LINK Link, PUNICODE_STRING Name, ULONG Code, _In_reads_bytes_opt_(InLength) PVOID In,
+                             ULONG InLength, _Out_writes_bytes_(OutLength) PVOID Out, ULONG OutLength)
 {
     WDFIOTARGET target = NULL;
+    RtlZeroMemory(Out, OutLength);
     NTSTATUS status = WdfIoTargetCreate(Link->WdfDevice, WDF_NO_OBJECT_ATTRIBUTES, &target);
     if (!NT_SUCCESS(status)) return status;
     WDF_IO_TARGET_OPEN_PARAMS open;
@@ -565,19 +529,55 @@ static NTSTATUS PnQueryLocalRadio(PPN_BTH_LINK Link, PUNICODE_STRING Name, BTH_L
     open.ShareAccess = FILE_SHARE_READ | FILE_SHARE_WRITE;
     status = WdfIoTargetOpen(target, &open);
     if (NT_SUCCESS(status)) {
-        RtlZeroMemory(Info, sizeof(*Info));
-        WDF_MEMORY_DESCRIPTOR output;
-        WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&output, Info, sizeof(*Info));
+        WDF_MEMORY_DESCRIPTOR input, output;
+        if (In) WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&input, In, InLength);
+        WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&output, Out, OutLength);
         WDF_REQUEST_SEND_OPTIONS options;
         WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
         WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&options, WDF_REL_TIMEOUT_IN_SEC(2));
         ULONG_PTR returned = 0;
-        status = WdfIoTargetSendIoctlSynchronously(target, NULL, IOCTL_BTH_GET_LOCAL_INFO,
-            NULL, &output, &options, &returned);
-        if (NT_SUCCESS(status) && returned < sizeof(*Info)) status = STATUS_INFO_LENGTH_MISMATCH;
+        status = WdfIoTargetSendIoctlSynchronously(target, NULL, Code, In ? &input : NULL, &output, &options, &returned);
+        if (NT_SUCCESS(status) && returned < OutLength) status = STATUS_INFO_LENGTH_MISMATCH;
         WdfIoTargetClose(target);
     }
     WdfObjectDelete(target);
+    return status;
+}
+
+static NTSTATUS PnQueryLocalRadio(PPN_BTH_LINK Link, PUNICODE_STRING Name, BTH_LOCAL_RADIO_INFO *Info)
+{
+    return PnRadioIoctl(Link, Name, IOCTL_BTH_GET_LOCAL_INFO, NULL, 0, Info, sizeof(*Info));
+}
+
+/* The connected receiver's LMP features (IOCTL_BTH_GET_RADIO_INFO on the radio of our local
+ * address), cached in the link on success. PASSIVE; a few short IOCTLs. Unknown features
+ * keep SBC XQ at the 2-DH5 point (review round 4 #5). */
+NTSTATUS PnLinkQueryRemoteFeatures(_Inout_ PPN_BTH_LINK Link)
+{
+    PAGED_CODE();
+    if (Link->RemoteFeaturesValid) return STATUS_SUCCESS;
+    if (!Link->LocalAddress || !Link->RemoteAddress) return STATUS_DEVICE_NOT_CONNECTED;
+    PWSTR list = NULL;
+    NTSTATUS status = IoGetDeviceInterfaces(&GUID_BTHPORT_DEVICE_INTERFACE, NULL, 0, &list);
+    if (!NT_SUCCESS(status) || !list) return NT_SUCCESS(status) ? STATUS_DEVICE_NOT_CONNECTED : status;
+    status = STATUS_DEVICE_NOT_CONNECTED;
+    for (PWSTR item = list; *item; item += wcslen(item) + 1) {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, item);
+        BTH_LOCAL_RADIO_INFO radio;
+        if (!NT_SUCCESS(PnQueryLocalRadio(Link, &name, &radio)) || radio.localInfo.address != Link->LocalAddress) continue;
+        BTH_ADDR addr = Link->RemoteAddress;
+        BTH_RADIO_INFO info;
+        status = PnRadioIoctl(Link, &name, IOCTL_BTH_GET_RADIO_INFO, &addr, sizeof(addr), &info, sizeof(info));
+        if (NT_SUCCESS(status)) {
+            Link->RemoteFeatures = info.lmpSupportedFeatures;
+            Link->RemoteFeaturesValid = TRUE;
+            PN_INFO("remote %012llX: LMP %u features %016llX", Link->RemoteAddress, info.lmpVersion, info.lmpSupportedFeatures);
+        }
+        break;
+    }
+    ExFreePool(list);
+    if (!NT_SUCCESS(status)) PN_VERB("remote LMP features unknown (0x%08x)", status);
     return status;
 }
 
@@ -622,6 +622,9 @@ NTSTATUS PnLinkRegisterRadioEvents(_Inout_ PPN_BTH_LINK Link, _In_ PFN_PN_LINK_S
     Link->OnSco = OnSco;
     Link->OnAcl = OnAcl;
     Link->CallbackContext = Context;
+    KeInitializeSpinLock(&Link->AclLock);   /* nothing is registered yet: no callback holds it */
+    Link->AclEvents = 0;
+    Link->AclConnected = FALSE;
     Link->RadioFileObject = file;
     Link->RadioDeviceObject = dev;
     status = IoRegisterPlugPlayNotification(EventCategoryTargetDeviceChange, 0, file, Link->Fdo->DriverObject,
@@ -631,8 +634,24 @@ NTSTATUS PnLinkRegisterRadioEvents(_Inout_ PPN_BTH_LINK Link, _In_ PFN_PN_LINK_S
         ObDereferenceObject(file);
         Link->RadioFileObject = NULL;
         Link->RadioDeviceObject = NULL;
-        return status;
+        return status;   /* AclConnected stays FALSE: no event will ever correct a seed */
     }
+    /* BthPort reports only changes from here on: an ACL already up when we start (kept by
+     * AVRCP across a driver restart) would otherwise read as down until it cycles, and the
+     * retry after an unanswered stall needs it (review round 2 #8). Queried after the
+     * registration, so no ACL edge is lost, and stored only if no ACL event arrived
+     * meanwhile: a delivered event is never older than the query (review round 3 #1). */
+    KIRQL irql;
+    KeAcquireSpinLock(&Link->AclLock, &irql);
+    ULONG seen = Link->AclEvents;
+    KeReleaseSpinLock(&Link->AclLock, irql);
+    BOOLEAN exists = PnLinkAclExists(Link);
+    KeAcquireSpinLock(&Link->AclLock, &irql);
+    BOOLEAN seeded = Link->AclEvents == seen;
+    if (seeded) Link->AclConnected = exists;
+    BOOLEAN connected = Link->AclConnected;
+    KeReleaseSpinLock(&Link->AclLock, irql);
+    PN_INFO("ACL to %012llX %s at start%s", Link->RemoteAddress, connected ? "up" : "down", seeded ? "" : " (from an event)");
     return STATUS_SUCCESS;
 }
 
@@ -652,12 +671,14 @@ VOID PnLinkUnregisterRadioEvents(_Inout_ PPN_BTH_LINK Link)
 
 static VOID PnReaderSubmit(_In_ PPN_L2CAP_READER R);
 
+static KDEFERRED_ROUTINE PnReaderResubmitDpc;
 static VOID PnReaderResubmitDpc(_In_ PKDPC Dpc, _In_opt_ PVOID Ctx, _In_opt_ PVOID Arg1, _In_opt_ PVOID Arg2)
 {
     UNREFERENCED_PARAMETER(Dpc); UNREFERENCED_PARAMETER(Ctx); UNREFERENCED_PARAMETER(Arg2);
     if (Arg1) PnReaderSubmit((PPN_L2CAP_READER)Arg1);
 }
 
+static EVT_WDF_REQUEST_COMPLETION_ROUTINE PnReaderCompletion;
 static VOID PnReaderCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
                                _In_ WDFCONTEXT Context)
 {
@@ -737,6 +758,7 @@ static VOID PnReaderSubmit(_In_ PPN_L2CAP_READER R)
     KeReleaseSpinLock(&R->SendLock, irql);
 }
 
+static EVT_WDF_REQUEST_COMPLETION_ROUTINE PnWriteCompletion;
 static VOID PnWriteCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
                               _In_ WDFCONTEXT Context)
 {
@@ -747,18 +769,22 @@ static VOID PnWriteCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, 
     ULONG bytes = w->Length;
     LONGLONG submitted = w->SubmitTimeHns;
     KIRQL irql;
-    if (ch->OnWriteDone) ch->OnWriteDone(ch->CallbackContext, ch, status, bytes, submitted);
-    /* PnChannelUninitialize waits for WritesInFlight == 0 before deleting the requests */
+    /* T14: free the slot before the callback, so the pump it wakes sees the room. The
+     * callback still runs under WriteCallbacks, which PnChannelUninitialize also waits
+     * for; it is raised before WritesInFlight drops, so the two are never both 0 early. */
+    InterlockedIncrement(&ch->WriteCallbacks);
     KeAcquireSpinLock(&ch->Lock, &irql);
     RemoveEntryList(&w->Link);
     InsertTailList(&ch->FreeWrites, &w->Link);
     InterlockedExchange(&w->Outstanding, 0);
     InterlockedDecrement(&ch->WritesInFlight);
     KeReleaseSpinLock(&ch->Lock, irql);
+    if (ch->OnWriteDone) ch->OnWriteDone(ch->CallbackContext, ch, status, bytes, submitted);
+    InterlockedDecrement(&ch->WriteCallbacks);   /* last access to ch */
 }
 
-NTSTATUS PnChannelInitialize(_Out_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_BTH_LINK Link, _In_ BOOLEAN IsMedia, _In_ ULONG ReadBufferSize,
-                             _In_ ULONG WriteCapacity, _In_ PFN_PN_L2CAP_RECEIVE OnReceive, _In_ PFN_PN_L2CAP_EVENT OnClosed,
+NTSTATUS PnChannelInitialize(_Out_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_BTH_LINK Link, _In_ BOOLEAN IsMedia, _In_range_(>, 0) ULONG ReadBufferSize,
+                             _In_range_(>, 0) ULONG WriteCapacity, _In_ PFN_PN_L2CAP_RECEIVE OnReceive, _In_ PFN_PN_L2CAP_EVENT OnClosed,
                              _In_opt_ PFN_PN_L2CAP_WRITE_DONE OnWriteDone, _In_ PVOID Context)
 {
     PAGED_CODE();
@@ -837,7 +863,8 @@ VOID PnChannelUninitialize(_Inout_ PPN_L2CAP_CHANNEL Ch)
      * because deleting a request that is still owned by the target is a framework violation. */
     LARGE_INTEGER wait;
     wait.QuadPart = -PN_HNS_PER_MS * 20;
-    for (ULONG round = 0; Ch->WritesInFlight > 0; round++) {
+    for (ULONG round = 0; InterlockedCompareExchange(&Ch->WritesInFlight, 0, 0) > 0 ||
+                          InterlockedCompareExchange(&Ch->WriteCallbacks, 0, 0) > 0; round++) {
         if (round % 50 == 0) {
             for (ULONG i = 0; i < PN_L2CAP_MAX_WRITES; i++) {
                 if (Ch->Writes[i].Outstanding && Ch->Writes[i].Request) WdfRequestCancelSentRequest(Ch->Writes[i].Request);
@@ -904,6 +931,7 @@ static VOID PnFillOpenConfig(_Inout_ struct _BRB_L2CA_OPEN_ENHANCED_CHANNEL *Brb
     Brb->IncomingQueueDepth = 16;
 }
 
+static EVT_WDF_REQUEST_COMPLETION_ROUTINE PnOpenCompletion;
 static VOID PnOpenCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
                              _In_ WDFCONTEXT Context)
 {
@@ -1027,6 +1055,7 @@ NTSTATUS PnChannelAccept(_Inout_ PPN_L2CAP_CHANNEL Ch, _In_ PINDICATION_PARAMETE
     return status;
 }
 
+static EVT_WDF_REQUEST_COMPLETION_ROUTINE PnCloseCompletion;
 static VOID PnCloseCompletion(_In_ WDFREQUEST Request, _In_ WDFIOTARGET Target, _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
                               _In_ WDFCONTEXT Context)
 {

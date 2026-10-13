@@ -4,7 +4,7 @@
  */
 #include "pna2dp.h"
 
-ULONG g_PnDebugLevel = PN_LEVEL_INFO;
+ULONG g_PnDebugLevel = PN_LEVEL_WARN;   /* as the INF writes it; Parameters\DebugLevel overrides */
 static HANDLE g_PersistentState = NULL;
 static HANDLE g_Parameters = NULL;
 
@@ -16,7 +16,8 @@ NTSTATUS RegCfgInitialize(_In_ PDRIVER_OBJECT DriverObject)
     NTSTATUS status = IoOpenDriverRegistryKey(DriverObject, DriverRegKeyPersistentState,
         KEY_READ | KEY_SET_VALUE | KEY_CREATE_SUB_KEY, 0, &g_PersistentState);
     if (!NT_SUCCESS(status)) return status;
-    IoOpenDriverRegistryKey(DriverObject, DriverRegKeyParameters, KEY_READ, 0, &g_Parameters);
+    /* optional: without Parameters the built-in defaults apply */
+    if (!NT_SUCCESS(IoOpenDriverRegistryKey(DriverObject, DriverRegKeyParameters, KEY_READ, 0, &g_Parameters))) g_Parameters = NULL;
     return STATUS_SUCCESS;
 }
 
@@ -61,7 +62,8 @@ BOOLEAN RegCfgValidate(_Inout_ PPNA2DP_CONFIG Cfg)
     if (Cfg->TargetLatencyMs < 20) Cfg->TargetLatencyMs = 20;
     if (Cfg->TargetLatencyMs > 400) Cfg->TargetLatencyMs = 400;
     if (Cfg->MaxLatencyMs < Cfg->TargetLatencyMs + 20) Cfg->MaxLatencyMs = Cfg->TargetLatencyMs + 20;
-    if (Cfg->MaxLatencyMs > 1000) Cfg->MaxLatencyMs = 1000;
+    /* the pump never lets the ring grow beyond this (PnEffectiveLatencyMs): store what applies */
+    if (Cfg->MaxLatencyMs > PN_PUMP_RING_MS - PN_RING_HEADROOM_MS) Cfg->MaxLatencyMs = PN_PUMP_RING_MS - PN_RING_HEADROOM_MS;
     if (Cfg->Sbc.MinBitpool && Cfg->Sbc.MinBitpool < 2) Cfg->Sbc.MinBitpool = 2;
     if (Cfg->Sbc.MaxBitpool > 250) Cfg->Sbc.MaxBitpool = 250;
     if (Cfg->Sbc.MaxBitpool && Cfg->Sbc.MinBitpool > Cfg->Sbc.MaxBitpool) Cfg->Sbc.MinBitpool = Cfg->Sbc.MaxBitpool;
@@ -232,5 +234,20 @@ NTSTATUS RegCfgSaveCapabilities(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR 
     ULONG mask = Caps->CodecMask;
     WriteValue(key, L"CodecMask", REG_DWORD, &mask, sizeof(mask));
     ZwClose(key);
+    return status;
+}
+
+/* Read back by the wave miniport, so the formats a known receiver supports are offered
+ * before the first connection of this boot. */
+NTSTATUS RegCfgLoadCapabilities(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Address, _Out_ PPNA2DP_CAPABILITIES Caps)
+{
+    PAGED_CODE();
+    RtlZeroMemory(Caps, sizeof(*Caps));
+    HANDLE key = NULL;
+    NTSTATUS status = OpenDeviceKey(DriverObject, Address, FALSE, KEY_READ, &key);
+    if (!NT_SUCCESS(status)) return status;
+    status = ReadBinary(key, L"Capabilities", Caps, sizeof(*Caps));   /* exact size only */
+    ZwClose(key);
+    if (!NT_SUCCESS(status)) RtlZeroMemory(Caps, sizeof(*Caps));
     return status;
 }

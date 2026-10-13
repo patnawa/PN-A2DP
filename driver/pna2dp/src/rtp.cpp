@@ -49,7 +49,9 @@ BOOLEAN RtpParseHeader(_In_reads_bytes_(Len) const UCHAR *In, _In_ ULONG Len, _O
     ULONG hdr = RTP_HEADER_SIZE + cc * 4;
     if (Len < hdr) return FALSE;
     if (ext) {
-        if (Len - hdr < 4) return FALSE;
+        if (Len < hdr + 4) return FALSE;   /* hdr <= 72: no overflow */
+        /* C6385 false positive: /analyze does not carry the check above into the index */
+#pragma warning(suppress: 6385)
         ULONG extWords = ((ULONG)In[hdr + 2] << 8) | In[hdr + 3];
         hdr += 4 + extWords * 4;
         if (Len < hdr) return FALSE;

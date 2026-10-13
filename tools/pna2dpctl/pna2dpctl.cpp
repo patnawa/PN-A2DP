@@ -8,11 +8,15 @@
  *   pna2dpctl set     [-d N] key=value  change configuration (applied live when possible)
  *   pna2dpctl watch   [-d N]            print status on every driver event
  *   pna2dpctl stats   [-d N]            transport statistics
- *   pna2dpctl reconnect [-d N]
+ *   pna2dpctl reconnect [-d N]          reset the link (disconnect first, then connect)
+ *   pna2dpctl connect    [-d N]         connect the receiver, as Windows Settings' Connect does
+ *   pna2dpctl disconnect [-d N]         disconnect the receiver, as Windows Settings' Disconnect does
+ *   pna2dpctl windows connect|disconnect [-d N]   the same for any paired A2DP device (any driver)
  *
  * Keys for `set`: codecs=ldac,aptxhd,aac,aptx,aptxll,sbc (priority order)
  *                 enable=<codec>,...   disable=<codec>,...
  *                 sbc.bitpool=N        sbc.minbitpool=N   sbc.override=0|1   sbc.dual=0|1
+ *                 sbc.xq=0|1  (dual channel sized to the radio packets; never below plain dual channel)
  *                 sbc.rates=44100,48000  sbc.subbands=4|8 sbc.blocks=4|8|12|16 sbc.alloc=loudness|snr
  *                 aac.bitrate=N        aac.vbr=0|1
  *                 ldac.quality=hq|sq|mq ldac.abr=0|1  ldac.bits=16|24|32
@@ -22,6 +26,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include <windows.h>
+#include <objbase.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <stdio.h>
@@ -85,7 +90,7 @@ static ULONG CodecFromName(const char *n)
 }
 static const char *StateName(ULONG s)
 {
-    static const char *n[] = { "idle", "connecting", "discovering", "configured", "open", "streaming", "suspended", "closing", "error" };
+    static const char *n[] = { "idle", "connecting", "connected", "configured", "open", "streaming", "suspended", "closing", "error" };
     return s < 9 ? n[s] : "?";
 }
 static std::string RateMaskStr(ULONG m)
@@ -143,11 +148,11 @@ static void PrintConfig(const PNA2DP_CONFIG &c)
     for (int i = 0; i < 8 && c.CodecPriority[i]; i++) printf("%s%s", i ? " > " : "", CodecName(c.CodecPriority[i]));
     printf("\nenabled        :");
     for (ULONG k = 1; k < PNA2DP_CODEC_MAX; k++) if (c.EnabledCodecMask & PNA2DP_CODEC_BIT(k)) printf(" %s", CodecName(k));
-    printf("\nflags          :%s%s%s%s%s%s%s%s%s\n", (c.Flags & PNA2DP_CFG_ABR_ENABLE) ? " abr" : "", (c.Flags & PNA2DP_CFG_APPLY_LIVE) ? " apply-live" : "",
+    printf("\nflags          :%s%s%s%s%s%s%s%s%s%s\n", (c.Flags & PNA2DP_CFG_ABR_ENABLE) ? " abr" : "", (c.Flags & PNA2DP_CFG_APPLY_LIVE) ? " apply-live" : "",
            (c.Flags & PNA2DP_CFG_SUSPEND_ON_SCO) ? " suspend-on-sco" : "", (c.Flags & PNA2DP_CFG_AUTO_START_ON_CONNECT) ? " auto-start" : "",
            (c.Flags & PNA2DP_CFG_EXPOSE_ALL_RATES) ? " all-rates" : "", (c.Flags & PNA2DP_CFG_SOFTWARE_VOLUME) ? " sw-volume" : "",
            (c.Flags & PNA2DP_CFG_DELAY_REPORTING) ? " delay-reporting" : "", (c.Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) ? " prefer-dual" : "",
-           (c.Flags & PNA2DP_CFG_HOST_CODECS_ONLY) ? " host-only" : "");
+           (c.Flags & PNA2DP_CFG_HOST_CODECS_ONLY) ? " host-only" : "", (c.Flags & PNA2DP_CFG_SBC_XQ) ? " sbc-xq" : "");
     printf("auto quality   : %s\n", (c.Flags & PNA2DP_CFG_AUTO_QUALITY) ? "enabled" : "disabled");
     printf("latency        : target %u ms, max %u ms, ABR floor %u kbps\n", c.TargetLatencyMs, c.MaxLatencyMs, c.AbrFloorBps / 1000);
     printf("SBC            : bitpool %u..%u%s, rates %s, modes 0x%02x, blocks 0x%02x, subbands 0x%02x, alloc 0x%02x\n", c.Sbc.MinBitpool, c.Sbc.MaxBitpool,
@@ -168,7 +173,8 @@ static void PrintStats(HANDLE h)
     printf("packets dropped     : %llu   write failures %llu   latency trims %llu\n", s.PacketsDropped, s.WriteFailures, s.Underruns);
     printf("tx queue            : %u now, %u max   completion avg %u us max %u us\n", s.QueueDepthPackets, s.QueueDepthMaxPackets, s.TxCompletionAvgUs, s.TxCompletionMaxUs);
     printf("ABR                 : level %u, %u downgrades, %u upgrades\n", s.AbrLevel, s.AbrDowngrades, s.AbrUpgrades);
-    printf("codec host          : round trip avg %u us, timeouts %u\n", s.HostRoundTripAvgUs, s.HostTimeouts);
+    printf("codec host          : round trip avg %u us, timeouts %u, dropped blocks %u\n", s.HostRoundTripAvgUs, s.HostTimeouts, s.HostDroppedBlocks);
+    printf("pcm ring            : %u overflows, %u starved packets   AAC fragmented sends %u\n", s.RingOverflowEvents, s.WaveStarvedPackets, s.FragmentedPackets);
 }
 
 static bool ParseRates(const char *v, ULONG *mask)
@@ -222,6 +228,7 @@ static int DoSet(HANDLE h, int argc, char **argv, int start)
         else if (!_stricmp(k, "sbc.minbitpool")) c.Sbc.MinBitpool = (UCHAR)atoi(v);
         else if (!_stricmp(k, "sbc.override")) c.Sbc.AllowBitpoolOverride = (UCHAR)atoi(v);
         else if (!_stricmp(k, "sbc.dual")) { if (atoi(v)) c.Flags |= PNA2DP_CFG_DUAL_CHANNEL_PREFER; else c.Flags &= ~PNA2DP_CFG_DUAL_CHANNEL_PREFER; }
+        else if (!_stricmp(k, "sbc.xq")) flag(PNA2DP_CFG_SBC_XQ);
         else if (!_stricmp(k, "sbc.rates")) { ULONG m; if (!ParseRates(v, &m)) return 1; c.Sbc.RateMask = (UCHAR)(((m & PNA2DP_RATE_16000) ? 0x80 : 0) | ((m & PNA2DP_RATE_32000) ? 0x40 : 0) | ((m & PNA2DP_RATE_44100) ? 0x20 : 0) | ((m & PNA2DP_RATE_48000) ? 0x10 : 0)); }
         else if (!_stricmp(k, "sbc.subbands")) c.Sbc.SubbandMask = atoi(v) == 4 ? PNA2DP_SBC_SUBBANDS_4 : PNA2DP_SBC_SUBBANDS_8;
         else if (!_stricmp(k, "sbc.blocks")) c.Sbc.BlockMask = atoi(v) == 4 ? PNA2DP_SBC_BLOCKS_4 : atoi(v) == 8 ? PNA2DP_SBC_BLOCKS_8 : atoi(v) == 12 ? PNA2DP_SBC_BLOCKS_12 : PNA2DP_SBC_BLOCKS_16;
@@ -252,17 +259,54 @@ static int DoSet(HANDLE h, int argc, char **argv, int start)
     return 0;
 }
 
+/* Connect / Disconnect through the documented KSPROPSETID_BtAudio one-shot properties on the
+ * device's audio endpoint: the request Windows' own Connect / Disconnect send. Works for the
+ * PN-A2DP driver (0.1.0.21 or later) and the Windows inbox driver. For a PN-A2DP device without
+ * any Windows audio output, Connect falls back to the driver's reconnect (ifacePath), a link
+ * reset, but only while the driver reports its session down. */
+static int OneShotCommand(const std::wstring &instanceId, bool connect, const std::wstring &ifacePath)
+{
+    pn::A2dpNode node;
+    bool known = pn::GetA2dpNode(instanceId, node);
+    std::wstring name = known && !node.name.empty() ? node.name : instanceId;
+    bool pnDriver = known ? node.usesPnA2dp() : !ifacePath.empty();
+    HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE) { fprintf(stderr, "COM initialization failed: 0x%08lx\n", (unsigned long)com); return 1; }
+    pn::OneShotStage stage = pn::OneShotStage::Lookup;
+    HRESULT hr = pn::BluetoothAudioOneShot(instanceId, connect, &stage);
+    if (SUCCEEDED(com)) CoUninitialize();
+    if (connect && stage == pn::OneShotStage::NoEndpoint && !ifacePath.empty()) {
+        HANDLE h = CreateFileW(ifacePath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        PNA2DP_STATUS st = {};
+        bool statusKnown = h != INVALID_HANDLE_VALUE && Ioctl(h, IOCTL_PNA2DP_GET_STATUS, NULL, 0, &st, sizeof(st));
+        int rc = -1;
+        if (pn::OneShotReconnectFallback(connect, stage, statusKnown, st.State)) {
+            if (Ioctl(h, IOCTL_PNA2DP_RECONNECT, NULL, 0, NULL, 0)) {
+                wprintf(L"%s: no Windows audio output; asked the PN-A2DP driver to reconnect instead.\n", name.c_str()); rc = 0;
+            }
+        } else if (statusKnown) {
+            /* never reset a session that is connecting or connected */
+            wprintf(L"%s: no Windows audio output, but the PN-A2DP session is %hs; nothing was changed.\n", name.c_str(), StateName(st.State));
+            rc = st.State == PNA2DP_STATE_CLOSING ? 1 : 0;
+        }
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (rc >= 0) return rc;
+    }
+    wprintf(L"%s: %s\n", name.c_str(), pn::BluetoothAudioOneShotText(hr, stage, connect, pnDriver).c_str());
+    return SUCCEEDED(hr) ? 0 : 1;
+}
+
 static int WindowsCommand(int argc, char **argv)
 {
     const char *action = argc >= 3 ? argv[2] : "list";
     int index = 0;
     if (argc > 3) {
-        if (argc != 5 || strcmp(argv[3], "-d")) { fprintf(stderr, "Usage: pna2dpctl windows [list|status|spatial] [-d N]\n"); return 1; }
+        if (argc != 5 || strcmp(argv[3], "-d")) { fprintf(stderr, "Usage: pna2dpctl windows [list|status|spatial|connect|disconnect] [-d N]\n"); return 1; }
         char *end = nullptr; long value = strtol(argv[4], &end, 10);
         if (!argv[4][0] || *end || value < 0 || value > INT_MAX) return 1;
         index = (int)value;
     }
-    if (strcmp(action, "list") && strcmp(action, "status") && strcmp(action, "spatial")) return 1;
+    if (strcmp(action, "list") && strcmp(action, "status") && strcmp(action, "spatial") && strcmp(action, "connect") && strcmp(action, "disconnect")) return 1;
     auto nodes = pn::EnumerateA2dpSinkNodes();
     if (!strcmp(action, "list")) {
         for (size_t i = 0; i < nodes.size(); ++i) {
@@ -277,6 +321,10 @@ static int WindowsCommand(int argc, char **argv)
     }
     if (index >= (int)nodes.size()) { fprintf(stderr, "Bluetooth device index unavailable\n"); return 1; }
     const auto &node = nodes[index];
+    if (!strcmp(action, "connect") || !strcmp(action, "disconnect")) {
+        if (!node.present) { fprintf(stderr, "Bluetooth device %d is not present\n", index); return 1; }
+        return OneShotCommand(node.instanceId, !strcmp(action, "connect"), L"");
+    }
     printf("Device: %ls\nDriver: %ls %ls\nInstance: %ls\n", node.name.c_str(), node.driverProvider.c_str(), node.driverVersion.c_str(), node.instanceId.c_str());
     if (!strcmp(action, "spatial")) {
         auto info = pn::QuerySpatialAudio(node.instanceId);
@@ -288,7 +336,13 @@ static int WindowsCommand(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2) { printf("usage: pna2dpctl windows [list|status|spatial] [-d N]\n       pna2dpctl list|status|spatial|quality|caps|config|auto|set|watch|stats|trace|reconnect [-d index] [key=value ...]\n"); return 1; }
+    if (argc < 2) {
+        printf("usage: pna2dpctl windows [list|status|spatial|connect|disconnect] [-d N]\n"
+               "       pna2dpctl list|status|spatial|quality|caps|config|auto|set|watch|stats|trace|reconnect|connect|disconnect [-d index] [key=value ...]\n"
+               "         connect / disconnect: connect or disconnect the receiver, as Windows Settings does\n"
+               "         reconnect: reset the link (disconnect first, then connect)\n");
+        return 1;
+    }
     const char *cmd = argv[1];
     if (!strcmp(cmd, "windows")) return WindowsCommand(argc, argv);
     int dev = 0, first = 2;
@@ -314,6 +368,14 @@ int main(int argc, char **argv)
             wprintf(L"%s", pn::SpatialReport(info).c_str());
             return info.queried ? 0 : 1;
         }
+        fprintf(stderr, "Could not resolve the selected device instance\n"); return 1;
+    }
+    if (!strcmp(cmd, "connect") || !strcmp(cmd, "disconnect")) {
+        const auto paths = EnumerateDevices();
+        if (paths.empty()) { fprintf(stderr, "no PN-A2DP devices found (is the driver installed and the headset paired?)\n"); return 1; }
+        if (dev < 0 || dev >= (int)paths.size()) { fprintf(stderr, "device index out of range (0..%zu)\n", paths.size() - 1); return 1; }
+        for (const auto &iface : pn::EnumerateControlInterfaces())
+            if (!_wcsicmp(iface.path.c_str(), paths[dev].c_str())) return OneShotCommand(iface.instanceId, !strcmp(cmd, "connect"), iface.path);
         fprintf(stderr, "Could not resolve the selected device instance\n"); return 1;
     }
     HANDLE h = OpenDevice(dev);
@@ -346,7 +408,10 @@ int main(int argc, char **argv)
     else if (!strcmp(cmd, "trace")) {
         PNA2DP_TRACE trace = {};
         DWORD bytes = 0;
-        if (!Ioctl(h, IOCTL_PNA2DP_GET_TRACE, NULL, 0, &trace, sizeof(trace), &bytes)) rc = 1;
+        if (!Ioctl(h, IOCTL_PNA2DP_GET_TRACE, NULL, 0, &trace, sizeof(trace), &bytes)) {
+            rc = 1;
+            if (GetLastError() == ERROR_ACCESS_DENIED) fprintf(stderr, "trace requires an elevated (administrator) prompt\n");
+        }
         else if (bytes != sizeof(trace) || trace.Size != sizeof(trace) || trace.Count > PNA2DP_TRACE_ENTRIES) rc = 1;
         else for (ULONG i = 0; i < trace.Count; ++i) {
             const auto &e = trace.Entries[i];

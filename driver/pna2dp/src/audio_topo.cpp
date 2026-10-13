@@ -2,7 +2,9 @@
  * audio_topo.cpp - topology miniport: master volume, mute and receiver endpoint.
  *
  * Windows endpoint volume and mute land here. The Bluetooth service can bridge
- * these controls to AVRCP; otherwise the pump applies the gain locally.
+ * these controls to AVRCP; otherwise the pump applies the gain locally. The jack reports
+ * whether the receiver is connected (PnAudioSetJackConnected) and KSPROPSETID_BtAudio
+ * lets Windows ask for a reconnect, as on the inbox Bluetooth audio driver.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -50,10 +52,18 @@ static PCPROPERTY_ITEM g_TopoFilterProps[] = {
     { &PN_KSPROPSETID_BluetoothVolume, 1, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportTopology::PropertyHandlerTopoFilter },
     { &KSPROPSETID_Jack, KSPROPERTY_JACK_DESCRIPTION, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportTopology::PropertyHandlerTopoFilter },
     { &KSPROPSETID_Jack, KSPROPERTY_JACK_DESCRIPTION2, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportTopology::PropertyHandlerTopoFilter },
+    /* ksmedia.h KSPROPSETID_BtAudio: filter properties with no value. Documented as GET;
+     * SET is kept for callers of the earlier SET-only handler. */
+    { &KSPROPSETID_BtAudio, KSPROPERTY_ONESHOT_RECONNECT, PN_BTAUDIO_ONESHOT_ACCESS, CPnMiniportTopology::PropertyHandlerTopoFilter },
+    { &KSPROPSETID_BtAudio, KSPROPERTY_ONESHOT_DISCONNECT, PN_BTAUDIO_ONESHOT_ACCESS, CPnMiniportTopology::PropertyHandlerTopoFilter },
 };
+C_ASSERT(PN_KS_VERB_GET == KSPROPERTY_TYPE_GET);
+C_ASSERT(PN_KS_VERB_SET == KSPROPERTY_TYPE_SET);
+C_ASSERT(PN_KS_VERB_BASICSUPPORT == KSPROPERTY_TYPE_BASICSUPPORT);
 static PCEVENT_ITEM g_TopoFilterEvents[] = {
     { &PN_KSPROPSETID_BluetoothVolume, 1, KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT, CPnMiniportTopology::EventHandlerControlChange },
     { &KSEVENTSETID_AudioControlChange, KSEVENT_CONTROL_CHANGE, KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT, CPnMiniportTopology::EventHandlerControlChange },
+    { &KSEVENTSETID_PinCapsChange, KSEVENT_PINCAPS_JACKINFOCHANGE, KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT, CPnMiniportTopology::EventHandlerJack },
 };
 DEFINE_PCAUTOMATION_TABLE_PROP_EVENT(g_TopoFilterAutomation, g_TopoFilterProps, g_TopoFilterEvents);
 
@@ -72,7 +82,8 @@ PCFILTER_DESCRIPTOR g_PnTopoFilterDescriptor = {
     SIZEOF_ARRAY(g_TopoCategories), g_TopoCategories
 };
 
-static KSJACK_DESCRIPTION g_JackDesc = {
+/* Template; IsConnected is filled in per device from the adapter's jack state. */
+static const KSJACK_DESCRIPTION g_JackDesc = {
     KSAUDIO_SPEAKER_STEREO, 0x0000FF00 /* green */, eConnTypeOtherDigital, eGeoLocNotApplicable, eGenLocOther, ePortConnJack, TRUE
 };
 
@@ -165,7 +176,7 @@ CPnMiniportTopology::CPnMiniportTopology(_In_opt_ PUNKNOWN UnknownOuter) : CUnkn
 CPnMiniportTopology::~CPnMiniportTopology()
 {
     PAGED_CODE();
-    if (m_Adapter) m_Adapter->GetDevice()->Adapter->SetTopologyMiniport(NULL);
+    /* the adapter held a reference until RemoveFilters detached this miniport */
     if (m_PortEvents) { m_PortEvents->Release(); m_PortEvents = NULL; }
     if (m_Adapter) { m_Adapter->Release(); m_Adapter = NULL; }
 }
@@ -224,17 +235,17 @@ NTSTATUS CPnMiniportTopology::HandleVolume(_In_ PPCPROPERTY_REQUEST Req)
     if (Req->Verb & KSPROPERTY_TYPE_BASICSUPPORT) return PnPropertyBasicSupportVolume(Req);
     if (Req->InstanceSize < sizeof(ULONG)) return STATUS_INVALID_PARAMETER;
     ULONG channel = *(PULONG)Req->Instance;
+    if (!PnKsChannelIsMaster(channel)) return STATUS_INVALID_PARAMETER;   /* one channel advertised */
     if (Req->ValueSize < sizeof(LONG)) { Req->ValueSize = sizeof(LONG); return STATUS_BUFFER_TOO_SMALL; }
     PLONG v = (PLONG)Req->Value;
     if (Req->Verb & KSPROPERTY_TYPE_GET) {
-        *v = m_Adapter->GetVolume(channel == (ULONG)-1 ? 0 : channel);
+        *v = m_Adapter->GetVolume(0);
         Req->ValueSize = sizeof(LONG);
         return STATUS_SUCCESS;
     }
     if (Req->Verb & KSPROPERTY_TYPE_SET) {
-        LONG db = *v;
-        if (db > PN_VOLUME_MAX_DB16) db = PN_VOLUME_MAX_DB16;
-        if (db < PN_VOLUME_MIN_DB16) db = PN_VOLUME_MIN_DB16;
+        /* clamp and snap to the 0.5 dB steps advertised by PnPropertyBasicSupportVolume */
+        LONG db = PnVolumeSnapDb16(*v, PN_VOLUME_MIN_DB16, PN_VOLUME_MAX_DB16, PN_VOLUME_STEP_DB16);
         m_Adapter->SetVolume(channel, db);
         return STATUS_SUCCESS;
     }
@@ -248,10 +259,11 @@ NTSTATUS CPnMiniportTopology::HandleMute(_In_ PPCPROPERTY_REQUEST Req)
     if (Req->Verb & KSPROPERTY_TYPE_BASICSUPPORT) return PnPropertyBasicSupport(Req, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT, VT_BOOL);
     if (Req->InstanceSize < sizeof(ULONG)) return STATUS_INVALID_PARAMETER;
     ULONG channel = *(PULONG)Req->Instance;
+    if (!PnKsChannelIsMaster(channel)) return STATUS_INVALID_PARAMETER;
     if (Req->ValueSize < sizeof(BOOL)) { Req->ValueSize = sizeof(BOOL); return STATUS_BUFFER_TOO_SMALL; }
     PBOOL v = (PBOOL)Req->Value;
     if (Req->Verb & KSPROPERTY_TYPE_GET) {
-        *v = m_Adapter->GetMute(channel == (ULONG)-1 ? 0 : channel);
+        *v = m_Adapter->GetMute(0);
         Req->ValueSize = sizeof(BOOL);
         return STATUS_SUCCESS;
     }
@@ -277,7 +289,9 @@ NTSTATUS CPnMiniportTopology::HandleJack(_In_ PPCPROPERTY_REQUEST Req)
         PKSMULTIPLE_ITEM mi = (PKSMULTIPLE_ITEM)Req->Value;
         mi->Size = need;
         mi->Count = 1;
-        RtlCopyMemory(mi + 1, &g_JackDesc, sizeof(g_JackDesc));
+        PKSJACK_DESCRIPTION d = (PKSJACK_DESCRIPTION)(mi + 1);
+        *d = g_JackDesc;
+        d->IsConnected = m_Adapter->GetDevice()->Adapter->JackConnected();
         Req->ValueSize = need;
         return STATUS_SUCCESS;
     }
@@ -289,8 +303,11 @@ NTSTATUS CPnMiniportTopology::HandleJack(_In_ PPCPROPERTY_REQUEST Req)
         mi->Size = need;
         mi->Count = 1;
         PKSJACK_DESCRIPTION2 d = (PKSJACK_DESCRIPTION2)(mi + 1);
+        /* ksmedia.h defines no DeviceStateInfo values; presence is reported through
+         * KSJACK_DESCRIPTION.IsConnected and KSEVENT_PINCAPS_JACKINFOCHANGE. The wave pin's
+         * formats follow the receiver (KSEVENT_PINCAPS_FORMATCHANGE). */
         d->DeviceStateInfo = 0;
-        d->JackCapabilities = JACKDESC2_PRESENCE_DETECT_CAPABILITY;
+        d->JackCapabilities = JACKDESC2_PRESENCE_DETECT_CAPABILITY | JACKDESC2_DYNAMIC_FORMAT_CHANGE_CAPABILITY;
         Req->ValueSize = need;
         return STATUS_SUCCESS;
     }
@@ -315,7 +332,40 @@ NTSTATUS CPnMiniportTopology::PropertyHandlerTopoFilter(_In_ PPCPROPERTY_REQUEST
     CPnMiniportTopology *t = (CPnMiniportTopology *)Req->MajorTarget;
     if (!t) return STATUS_INVALID_PARAMETER;
     if (IsEqualGUIDAligned(*Req->PropertyItem->Set, PN_KSPROPSETID_BluetoothVolume)) return t->HandleRemoteVolume(Req);
+    if (IsEqualGUIDAligned(*Req->PropertyItem->Set, KSPROPSETID_BtAudio)) return t->HandleBtAudio(Req);
     return t->HandleJack(Req);
+}
+
+/* KSPROPSETID_BtAudio (PASSIVE). Windows sends ONESHOT_RECONNECT when the user connects
+ * the receiver from the Sound or Bluetooth settings, typically while the jack reports it
+ * disconnected: connect if not connected, never a reset of a working session (review #12).
+ * Both one-shots are documented as GET with no value (Windows and user-mode tools send
+ * GET); SET is accepted as well. The value buffer may be NULL and is never touched: success
+ * means the request was recorded, and the jack (KSPROPERTY_JACK_DESCRIPTION) reports the
+ * result. The control rundown keeps the device from being stopped during the call, as for
+ * a control IOCTL. */
+NTSTATUS CPnMiniportTopology::HandleBtAudio(_In_ PPCPROPERTY_REQUEST Req)
+{
+    PAGED_CODE();
+    ULONG id = Req->PropertyItem->Id;
+    if (id != KSPROPERTY_ONESHOT_RECONNECT && id != KSPROPERTY_ONESHOT_DISCONNECT) return STATUS_INVALID_DEVICE_REQUEST;
+    if (Req->Verb & KSPROPERTY_TYPE_BASICSUPPORT) return PnPropertyBasicSupport(Req, PN_BTAUDIO_ONESHOT_ACCESS, VT_ILLEGAL);
+    if (!PnBtAudioOneShotVerbAccepted(Req->Verb)) return STATUS_INVALID_DEVICE_REQUEST;
+    PPNA2DP_DEVICE d = m_Adapter->GetDevice();
+    if (!d || d->Removing || !ExAcquireRundownProtection(&d->ControlRundown)) return STATUS_DEVICE_NOT_READY;
+    NTSTATUS status;
+    if (id == KSPROPERTY_ONESHOT_RECONNECT) {
+        PN_INFO("Windows requested a connect");
+        status = DeviceRequestConnect(d);
+    } else {
+        /* C7: Windows disconnects the receiver (Sound or Bluetooth settings). The device
+         * records it and returns; its worker drops the session and unplugs the jack. */
+        PN_INFO("Windows requested a disconnect");
+        status = DeviceRequestDisconnect(d);
+    }
+    ExReleaseRundownProtection(&d->ControlRundown);
+    Req->ValueSize = 0;   /* no value is returned */
+    return status;
 }
 
 NTSTATUS CPnMiniportTopology::HandleRemoteVolume(_In_ PPCPROPERTY_REQUEST Req)
@@ -344,7 +394,7 @@ NTSTATUS CPnMiniportTopology::EventHandlerControlChange(_In_ PPCEVENT_REQUEST Re
     PAGED_CODE();
     CPnMiniportTopology *t = (CPnMiniportTopology *)Req->MajorTarget;
     if (!t || !t->m_PortEvents) return STATUS_INVALID_PARAMETER;
-    BOOLEAN remote = IsEqualGUIDAligned(*Req->EventItem->Set, PN_KSPROPSETID_BluetoothVolume);
+    BOOLEAN remote = IsEqualGUIDAligned(*Req->EventItem->Set, PN_KSPROPSETID_BluetoothVolume) ? TRUE : FALSE;
     switch (Req->Verb) {
     case PCEVENT_VERB_SUPPORT: return STATUS_SUCCESS;
     case PCEVENT_VERB_ADD:
@@ -361,6 +411,23 @@ NTSTATUS CPnMiniportTopology::EventHandlerControlChange(_In_ PPCEVENT_REQUEST Re
     }
 }
 
+/* KSEVENT_PINCAPS_JACKINFOCHANGE on the bridge (line out) pin. */
+NTSTATUS CPnMiniportTopology::EventHandlerJack(_In_ PPCEVENT_REQUEST Req)
+{
+    PAGED_CODE();
+    CPnMiniportTopology *t = (CPnMiniportTopology *)Req->MajorTarget;
+    if (!t || !t->m_PortEvents || !IsEqualGUIDAligned(*Req->EventItem->Set, KSEVENTSETID_PinCapsChange)) return STATUS_INVALID_PARAMETER;
+    switch (Req->Verb) {
+    case PCEVENT_VERB_SUPPORT: return STATUS_SUCCESS;
+    case PCEVENT_VERB_ADD:
+        if (!Req->EventEntry) return STATUS_INVALID_PARAMETER;
+        t->m_PortEvents->AddEventToEventList(Req->EventEntry);
+        return STATUS_SUCCESS;
+    case PCEVENT_VERB_REMOVE: return STATUS_SUCCESS;
+    default: return STATUS_INVALID_PARAMETER;
+    }
+}
+
 #pragma code_seg("PAGE")
 VOID CPnMiniportTopology::GenerateVolumeEvent()
 {
@@ -373,5 +440,12 @@ VOID CPnMiniportTopology::GenerateRemoteVolumeEvent()
 {
     PAGED_CODE();
     if (m_PortEvents) m_PortEvents->GenerateEventList((GUID *)&PN_KSPROPSETID_BluetoothVolume, 1, FALSE, ULONG(-1), FALSE, ULONG(-1));
+}
+
+/* Contract C6 worker (PASSIVE, adapter work item): the jack state changed. */
+VOID CPnMiniportTopology::GenerateJackEvent()
+{
+    PAGED_CODE();
+    if (m_PortEvents) m_PortEvents->GenerateEventList((GUID *)&KSEVENTSETID_PinCapsChange, KSEVENT_PINCAPS_JACKINFOCHANGE, TRUE, PN_TOPO_PIN_LINEOUT, FALSE, ULONG(-1));
 }
 #pragma code_seg()

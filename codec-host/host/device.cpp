@@ -5,6 +5,9 @@
  */
 #include "host.h"
 #include <stdio.h>
+#include <avrt.h>
+
+#pragma comment(lib, "avrt.lib")
 
 #define WORK_BUFFER_BYTES   (sizeof(PNA2DP_CODEC_WORK) + 65536)
 #define INFLIGHT_REQUESTS   4
@@ -30,10 +33,23 @@ bool DeviceWorker::Start()
     BOOL ok = DeviceIoControl(m_device, IOCTL_PNA2DP_CODEC_REGISTER, &reg, sizeof(reg), NULL, 0, &ret, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) ok = GetOverlappedResult(m_device, &ov, &ret, TRUE);
     CloseHandle(ov.hEvent);
-    if (!ok) { HostLog("register failed %lu", GetLastError()); CloseHandle(m_device); m_device = INVALID_HANDLE_VALUE; return false; }
+    if (!ok) {
+        DWORD e = GetLastError();
+        HostLog("register failed %lu", e);
+        /* the driver accepts a codec host only from LocalSystem: the service, not a console */
+        if (e == ERROR_ACCESS_DENIED)
+            HostLog("codec registration refused: the codec host must run as LocalSystem (the PN-A2DP Codec Host service); "
+                    "until then the driver keeps using its built-in SBC encoder");
+        CloseHandle(m_device); m_device = INVALID_HANDLE_VALUE; return false;
+    }
     HostLog("registered with %ls (codecs 0x%08x)", m_path.c_str(), reg.CodecMask);
     m_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!m_stopEvent) { CloseHandle(m_device); m_device = INVALID_HANDLE_VALUE; return false; }
+    m_resultEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!m_stopEvent || !m_resultEvent) {
+        if (m_stopEvent) { CloseHandle(m_stopEvent); m_stopEvent = NULL; }
+        if (m_resultEvent) { CloseHandle(m_resultEvent); m_resultEvent = NULL; }
+        CloseHandle(m_device); m_device = INVALID_HANDLE_VALUE; return false;
+    }
     m_stop = false;
     m_alive = true;
     m_thread = std::thread(&DeviceWorker::Run, this);
@@ -58,10 +74,24 @@ void DeviceWorker::Stop()
     }
     m_alive = false;
     if (m_stopEvent) { CloseHandle(m_stopEvent); m_stopEvent = NULL; }
+    if (m_resultEvent) { CloseHandle(m_resultEvent); m_resultEvent = NULL; }
 }
 
 void DeviceWorker::Run()
 {
+    /* The driver's watchdog writes off a block after 200 ms: encode at audio priority.
+     * MMCSS "Pro Audio" is preferred; failing that, a raised thread priority. */
+    DWORD taskIndex = 0;
+    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    if (mmcss) {
+        if (!AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_HIGH)) HostLog("MMCSS priority not raised (%lu)", GetLastError());
+        HostLog("encoder thread registered with MMCSS Pro Audio (task %lu)", taskIndex);
+    } else {
+        DWORD e = GetLastError();
+        BOOL raised = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        HostLog("MMCSS registration failed (%lu); thread priority %s", e, raised ? "time critical" : "unchanged");
+    }
+
     /* Keep several GET_WORK requests pended so the driver never waits for a buffer. */
     struct Slot { OVERLAPPED ov; std::vector<uint8_t> buf; bool pending; };
     Slot slots[INFLIGHT_REQUESTS];
@@ -114,12 +144,17 @@ void DeviceWorker::Run()
             }
             HandleWork(work, s.buf.data() + sizeof(PNA2DP_CODEC_WORK));
         }
-        if (!submit(s)) break;
+        /* Re-pend this slot before answering: the driver is woken by the result and must
+         * find a request for its next block. The work buffer is no longer needed. */
+        bool resubmitted = submit(s);
+        if (m_resultReady) SendResult();
+        if (!resubmitted) break;
     }
     for (int i = 0; i < INFLIGHT_REQUESTS; i++) {
         if (slots[i].pending) { CancelIoEx(m_device, &slots[i].ov); DWORD r; GetOverlappedResult(m_device, &slots[i].ov, &r, TRUE); }
         CloseHandle(slots[i].ov.hEvent);
     }
+    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     m_alive = false;
 }
 
@@ -154,6 +189,7 @@ void DeviceWorker::Open(const PNA2DP_CODEC_WORK *w)
     m_resultBuf.resize(sizeof(PNA2DP_CODEC_RESULT) + cap);
     m_lastQuality = m_params.QualityIndex;
     m_lastBitrate = m_params.BitrateBps;
+    m_rejectedValid = false;
     HostLog("%s: encoder open, %u Hz, %u ch, pcm fmt %u, target %u bps, mtu %u", m_plugin->name, m_params.SampleRate, m_params.Channels, m_params.PcmFormat,
             m_params.BitrateBps, m_params.MediaMtu);
 }
@@ -162,23 +198,33 @@ void DeviceWorker::Encode(const PNA2DP_CODEC_WORK *w, const uint8_t *pcm)
 {
     if (!m_encoder || w->StreamGeneration != m_generation) {
         /* the driver may send ENCODE before OPEN arrives after a quick restart: try to open on the fly */
-        if (!m_encoder || w->StreamGeneration != m_generation) { Open(w); if (!m_encoder) { PutResult(w->Sequence, w->StreamGeneration, -1, nullptr); return; } }
+        if (!m_encoder || w->StreamGeneration != m_generation) { Open(w); if (!m_encoder) { PrepareResult(w->Sequence, w->StreamGeneration, -1, nullptr); return; } }
     }
     if (w->Params.QualityIndex != m_lastQuality || w->Params.BitrateBps != m_lastBitrate) {
-        if (!m_plugin->reconfigure || m_plugin->reconfigure(m_encoder, w->Params.QualityIndex, w->Params.BitrateBps) != 0) {
-            HostLog("%s: quality change rejected", m_plugin->name);
-            PutResult(w->Sequence, w->StreamGeneration, -1, nullptr);
-            return;
+        /* A refused quality change keeps the current quality: the block is still encoded
+         * (failing it would cost audio and count against the host). Retry only when the
+         * driver asks for something different. */
+        bool retry = !m_rejectedValid || w->Params.QualityIndex != m_rejectedQuality || w->Params.BitrateBps != m_rejectedBitrate;
+        if (retry) {
+            if (m_plugin->reconfigure && m_plugin->reconfigure(m_encoder, w->Params.QualityIndex, w->Params.BitrateBps) == 0) {
+                m_lastQuality = w->Params.QualityIndex;
+                m_lastBitrate = w->Params.BitrateBps;
+                m_rejectedValid = false;
+            } else {
+                HostLog("%s: quality change to %u / %u bps rejected; keeping %u / %u bps", m_plugin->name,
+                        w->Params.QualityIndex, w->Params.BitrateBps, m_lastQuality, m_lastBitrate);
+                m_rejectedValid = true;
+                m_rejectedQuality = w->Params.QualityIndex;
+                m_rejectedBitrate = w->Params.BitrateBps;
+            }
         }
-        m_lastQuality = w->Params.QualityIndex;
-        m_lastBitrate = w->Params.BitrateBps;
     }
     PnCodecOutput out = {};
     out.buffer = m_outBuf.data();
     out.capacity = (uint32_t)m_outBuf.size();
     int rc = m_plugin->encode(m_encoder, pcm, w->PcmBytes, w->PcmFrames, &out);
     if (out.written > out.capacity || out.buffer != m_outBuf.data()) rc = -1;
-    PutResult(w->Sequence, w->StreamGeneration, rc, rc == 0 ? &out : nullptr);
+    PrepareResult(w->Sequence, w->StreamGeneration, rc, rc == 0 ? &out : nullptr);
 }
 
 void DeviceWorker::CloseEncoder()
@@ -187,7 +233,8 @@ void DeviceWorker::CloseEncoder()
     m_encoder = nullptr;
 }
 
-void DeviceWorker::PutResult(uint32_t seq, uint32_t gen, int status, const PnCodecOutput *out)
+/* Builds the PUT_RESULT for the current work item; Run sends it after re-pending the slot. */
+void DeviceWorker::PrepareResult(uint32_t seq, uint32_t gen, int status, const PnCodecOutput *out)
 {
     uint32_t payload = (out && status == 0) ? out->written : 0;
     if (m_resultBuf.size() < sizeof(PNA2DP_CODEC_RESULT) + payload) m_resultBuf.resize(sizeof(PNA2DP_CODEC_RESULT) + payload);
@@ -205,11 +252,18 @@ void DeviceWorker::PutResult(uint32_t seq, uint32_t gen, int status, const PnCod
         r->ActualBitrateBps = out->actual_bitrate_bps;
         if (payload) memcpy(r + 1, out->buffer, payload);
     }
+    m_resultReady = true;
+}
+
+void DeviceWorker::SendResult()
+{
+    m_resultReady = false;
+    const PNA2DP_CODEC_RESULT *r = (const PNA2DP_CODEC_RESULT *)m_resultBuf.data();
     DWORD ret = 0;
     OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    BOOL ok = DeviceIoControl(m_device, IOCTL_PNA2DP_CODEC_PUT_RESULT, r, r->Size, NULL, 0, &ret, &ov);
+    ov.hEvent = m_resultEvent;
+    ResetEvent(m_resultEvent);
+    BOOL ok = DeviceIoControl(m_device, IOCTL_PNA2DP_CODEC_PUT_RESULT, (LPVOID)r, r->Size, NULL, 0, &ret, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) ok = GetOverlappedResult(m_device, &ov, &ret, TRUE);
-    CloseHandle(ov.hEvent);
     if (!ok) HostLog("PUT_RESULT failed %lu", GetLastError());
 }

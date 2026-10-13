@@ -1,4 +1,4 @@
-"""Verify exported SBC vectors against an independent FFmpeg decoder (stdlib only)."""
+"""Verify exported SBC vectors (16-bit and 24-bit sources) against an independent FFmpeg decoder (stdlib only)."""
 import array
 import math
 from pathlib import Path
@@ -34,7 +34,9 @@ def main():
         error = sum((source[i * channels + c] - actual[(i + delay) * channels + c]) ** 2
                     for i in range(begin, end) for c in range(channels))
         snr = 10 * math.log10(signal / max(error, 1))
-        threshold = 45 if "-p" in vector.stem and not vector.stem.endswith("-p0") else 20
+        # name: rate-mode-alloc-subbands-blocks-bitpool-p<profile>[-s32 = encoded from a 24-bit source]
+        profile = vector.stem.split("-")[6] if len(vector.stem.split("-")) > 6 else "p0"
+        threshold = 20 if profile == "p0" else 45
         ok = len(source) == len(actual) and snr > threshold
         print(f"{'PASS' if ok else 'FAIL'} {vector.name}: {snr:.2f} dB, delay {delay}, {frames} frames")
         failures += not ok

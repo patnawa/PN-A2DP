@@ -81,6 +81,8 @@
 #define IDC_OUTPUT_SUMMARY      1024
 #define IDC_SAVE_HINT           1025
 #define IDC_BRAND_VERSION       1026
+#define IDC_BT_CONNECT          1027
+#define IDC_BT_DISCONNECT       1028
 
 /* status page: value statics */
 #define IDC_ST_DEVICE           1101
@@ -158,6 +160,7 @@
 #define IDC_SBC_BAUTO           1332
 #define IDC_SBC_SAUTO           1333
 #define IDC_SBC_AAUTO           1334
+#define IDC_SBC_XQ              1335
 
 /* aac page */
 #define IDC_AAC_BITRATE         1401

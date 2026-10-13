@@ -14,7 +14,10 @@
 void *__cdecl operator new(size_t Size, POOL_FLAGS PoolFlags, ULONG Tag)
 {
     if (Size == 0) Size = 1;
-    void *p = ExAllocatePool2(PoolFlags, Size, Tag);
+    /* never executable pool, whatever a caller passes; /analyze cannot see through the
+     * mask on a variable POOL_FLAGS, hence the suppression */
+#pragma warning(suppress: 28160)
+    void *p = ExAllocatePool2(PoolFlags & ~POOL_FLAG_NON_PAGED_EXECUTE, Size, Tag);
     return p;
 }
 void *__cdecl operator new(size_t Size, POOL_FLAGS PoolFlags)
@@ -25,15 +28,19 @@ void __cdecl operator delete(void *p, POOL_FLAGS, ULONG)
 {
     if (p) ExFreePool(p);
 }
-void __cdecl operator delete(void *p, POOL_FLAGS)
+/* Sized delete (C++14), used by "delete this" in the COM objects. The unsized global
+ * operator delete(void *) comes from stdunk.lib and also calls ExFreePool. */
+void __cdecl operator delete(void *p, size_t) noexcept
 {
     if (p) ExFreePool(p);
 }
 
-/* pure virtual call handler required by the C++ ABI */
+/* Pure virtual call handler required by the C++ ABI: a corrupted or half-destroyed object.
+ * Fail fast (bugcheck 0x139 KERNEL_SECURITY_CHECK_FAILURE) instead of a private code. */
 extern "C" int __cdecl _purecall(void)
 {
-    KeBugCheckEx(0xDEADC0DE, 0, 0, 0, 0);
+    __fastfail(FAST_FAIL_INVALID_ARG);
+    return 0;   /* not reached */
 }
 
 /* ---- globals ------------------------------------------------------------------- */
@@ -80,13 +87,26 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     WDF_DRIVER_CONFIG_INIT(&config, WDF_NO_EVENT_CALLBACK);
     config.DriverInitFlags |= WdfDriverInitNoDispatchOverride;
     config.DriverPoolTag = PNA2DP_TAG_GENERIC;
+    /* Tracing first: every failure below is traced and written to the System event log,
+     * and each failure path unregisters the ETW provider again. */
+    PnTraceInitialize(DriverObject);
     status = WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
-    if (!NT_SUCCESS(status)) return status;
+    if (!NT_SUCCESS(status)) {
+        PN_ERR("WdfDriverCreate failed 0x%08x", status);
+        PnLogDeviceEvent(NULL, PN_EVENT_LOAD_FAILED, (ULONG)status);
+        PnTraceUninitialize();
+        return status;
+    }
 
     DeviceListInitialize();
-    PnTraceInitialize();
     status = RegCfgInitialize(DriverObject);
-    if (!NT_SUCCESS(status)) { WdfDriverMiniportUnload(WdfGetDriver()); return status; }
+    if (!NT_SUCCESS(status)) {
+        PN_ERR("RegCfgInitialize failed 0x%08x", status);
+        PnLogDeviceEvent(NULL, PN_EVENT_LOAD_FAILED, (ULONG)status);
+        WdfDriverMiniportUnload(WdfGetDriver());
+        PnTraceUninitialize();
+        return status;
+    }
     RegCfgLoadGlobal(DriverObject);
     PN_INFO("pna2dp %u.%u.%u loading", PNA2DP_DRIVER_VERSION >> 24, (PNA2DP_DRIVER_VERSION >> 16) & 0xFF, PNA2DP_DRIVER_VERSION & 0xFFFF);
 
@@ -94,8 +114,10 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     if (!RegCfgCrashGuardEnter(DriverObject, &unclean)) {
         PN_ERR("crash guard: the last %u starts ended without a clean shutdown; not loading. "
                "Delete HKLM\\SYSTEM\\CurrentControlSet\\Services\\pna2dp\\State\\UncleanStarts to try again.", unclean);
+        PnLogDeviceEvent(NULL, PN_EVENT_CRASH_GUARD, unclean);
         RegCfgShutdown();
         WdfDriverMiniportUnload(WdfGetDriver());
+        PnTraceUninitialize();
         return STATUS_UNSUCCESSFUL;
     }
     g_DriverObject = DriverObject;
@@ -118,9 +140,11 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     status = PcInitializeAdapterDriver(DriverObject, RegistryPath, (PDRIVER_ADD_DEVICE)PnAddDevice);
     if (!NT_SUCCESS(status)) {
         PN_ERR("PcInitializeAdapterDriver failed 0x%08x", status);
+        PnLogDeviceEvent(NULL, PN_EVENT_LOAD_FAILED, (ULONG)status);
         PnStopGuardThread();
         RegCfgShutdown();
         WdfDriverMiniportUnload(WdfGetDriver());
+        PnTraceUninitialize();
         return status;
     }
 
@@ -132,6 +156,16 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     DriverObject->MajorFunction[IRP_MJ_CLEANUP] = ControlDispatchCleanup;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = ControlDispatchClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ControlDispatchDeviceControl;
+    /* Every other major PortCls installed sees control handles first: KS must never take a
+     * control handle's FsContext for its object header (review round 4 #6). PNP, POWER and
+     * SYSTEM_CONTROL carry no control file object; a slot PortCls left at the I/O manager
+     * default (that of IRP_MJ_CREATE_MAILSLOT, below) already fails the request. */
+    for (ULONG i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++) {
+        if (i == IRP_MJ_PNP || i == IRP_MJ_CREATE || i == IRP_MJ_CLEANUP || i == IRP_MJ_CLOSE || i == IRP_MJ_DEVICE_CONTROL ||
+            i == IRP_MJ_SHUTDOWN || i == IRP_MJ_POWER || i == IRP_MJ_SYSTEM_CONTROL) continue;
+        if (DriverObject->MajorFunction[i] == DriverObject->MajorFunction[IRP_MJ_CREATE_MAILSLOT]) continue;
+        DriverObject->MajorFunction[i] = ControlDispatchOther;
+    }
     /* IRP_MJ_CREATE_MAILSLOT is never set by PortCls, so it holds the I/O manager default */
     if (DriverObject->MajorFunction[IRP_MJ_SHUTDOWN] != DriverObject->MajorFunction[IRP_MJ_CREATE_MAILSLOT]) g_PcShutdown = DriverObject->MajorFunction[IRP_MJ_SHUTDOWN];
     DriverObject->MajorFunction[IRP_MJ_SHUTDOWN] = PnShutdownHandler;
@@ -188,6 +222,7 @@ extern "C" VOID PnDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     if (g_PcUnload) g_PcUnload(DriverObject);
     RegCfgShutdown();
     if (WdfGetDriver()) WdfDriverMiniportUnload(WdfGetDriver());
+    PnTraceUninitialize();
 }
 
 #pragma code_seg("PAGE")
@@ -218,16 +253,22 @@ static NTSTATUS PnStartDevice(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp, _
     PPN_PORTCLS_EXTENSION ext = (PPN_PORTCLS_EXTENSION)DeviceObject->DeviceExtension;
 
     status = NewPnAdapterCommon(&unknown, GUID_NULL, NULL, POOL_FLAG_NON_PAGED);
-    if (!NT_SUCCESS(status)) return status;
-    status = unknown->QueryInterface(IID_IPnAdapterCommon, (PVOID *)&common);
-    unknown->Release();
-    if (!NT_SUCCESS(status)) return status;
+    if (NT_SUCCESS(status)) {
+        status = unknown->QueryInterface(IID_IPnAdapterCommon, (PVOID *)&common);
+        unknown->Release();
+    }
+    if (!NT_SUCCESS(status)) {
+        PN_ERR("StartDevice: adapter object failed 0x%08x", status);
+        PnLogDeviceEvent(DeviceObject, PN_EVENT_START_FAILED, (ULONG)status);
+        return status;
+    }
 
     status = common->Init(DeviceObject, DeviceObject->DriverObject);
     if (NT_SUCCESS(status)) status = PcRegisterAdapterPowerManagement(PUNKNOWN(common), DeviceObject);
     if (NT_SUCCESS(status)) status = common->InstallFilters(Irp, ResourceList);
     if (!NT_SUCCESS(status)) {
         PN_ERR("StartDevice failed 0x%08x", status);
+        PnLogDeviceEvent(DeviceObject, PN_EVENT_START_FAILED, (ULONG)status);
         common->Cleanup();
         common->Release();
         return status;

@@ -4,6 +4,12 @@
   or select an audio endpoint. -Sign creates/reuses a development signing certificate.
 .EXAMPLE
   .\build\verify.ps1 -Sign -Sanitize -Interop
+
+  -Interop decodes the encoders' output with FFmpeg: the SBC and plugin vectors, and the
+  end-to-end audio quality harness (build\test-audio-quality.py), which fails on any defect
+  flag - clicks, gaps, clipping, packet or PCM accounting errors, SBC XQ below plain dual
+  channel, or a known issue (the dual-channel SBC ABR floor) measuring worse than recorded
+  (thresholds in tools\audio-test\quality_test.cpp).
 #>
 param(
     [ValidateSet('Release','Debug')][string]$Config = 'Release',
@@ -38,9 +44,13 @@ function Invoke-Check([string]$name, [scriptblock]$action) {
 
 try {
     if (-not $SkipBuild) {
+        # Debug -Analyze driver build; fails only when the warning count rises above
+        # build\analyze-baseline.txt. Runs first because it rebuilds out\Debug\package.
+        Invoke-Check 'driver-analysis' { & (Join-Path $PSScriptRoot 'check-analyze.ps1') }
         Invoke-Check 'build-package' { & (Join-Path $PSScriptRoot 'build.ps1') -Target package -Config $Config -Sign:$Sign }
     }
     Invoke-Check 'inf-verification' { & $INFVERIF /w /v (Join-Path $outputDir 'package\pna2dp.inf') }
+    Invoke-Check 'api-validator' { Test-UniversalDriverApis (Join-Path $outputDir 'package\pna2dp.sys') }
     Invoke-Check 'core' { & (Join-Path $outputDir 'core_test.exe') }
     Invoke-Check 'protected-service-paths' { & (Join-Path $outputDir 'secure_path_test.exe') }
     Invoke-Check 'boot-mode' { & (Join-Path $outputDir 'boot_mode_test.exe') }
@@ -62,6 +72,11 @@ try {
         if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { throw '-Interop needs ffmpeg in PATH' }
         Invoke-Check 'sbc-independent-decoder' { & python (Join-Path $PSScriptRoot 'test-interop.py') $vectors }
         Invoke-Check 'plugin-independent-decoder' { & python (Join-Path $PSScriptRoot 'test-plugin-interop.py') $pluginVectors }
+        if (-not $SkipBuild) { Invoke-Check 'build-audio-quality' { & (Join-Path $PSScriptRoot 'build.ps1') -Target quality-tests -Config $Config } }
+        $qualityWork = Join-Path $reportDir 'audio-quality'
+        Invoke-Check 'audio-quality' {
+            & python -I (Join-Path $PSScriptRoot 'test-audio-quality.py') --exe (Join-Path $outputDir 'quality_test.exe') --plugins $outputDir --work $qualityWork
+        }
     }
     if ($Sanitize) {
         Invoke-Check 'build-address-sanitizer' { & (Join-Path $PSScriptRoot 'build.ps1') -Target tests -Config $Config -Sanitize }

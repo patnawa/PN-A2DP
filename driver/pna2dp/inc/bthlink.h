@@ -107,7 +107,8 @@ typedef struct PN_L2CAP_CHANNEL {
     LIST_ENTRY             FreeWrites;
     LIST_ENTRY             BusyWrites;
     PN_L2CAP_WRITE         Writes[PN_L2CAP_MAX_WRITES];
-    LONG                   WritesInFlight;
+    LONG                   WritesInFlight;      /* sent and not yet back on FreeWrites */
+    LONG                   WriteCallbacks;      /* completion callbacks still running (lifetime) */
     ULONG                  WriteCapacity;
 
     PFN_PN_L2CAP_RECEIVE     OnReceive;
@@ -144,6 +145,8 @@ typedef struct _PN_BTH_LINK {
     BTH_LOCAL_RADIO_INFO          RadioInfo;        /* cached for the actual local address */
     NTSTATUS                     RadioQueryStatus;
     BOOLEAN                      RadioInfoValid;
+    ULONGLONG                    RemoteFeatures;  /* the receiver's LMP features (PnLinkQueryRemoteFeatures) */
+    BOOLEAN                      RemoteFeaturesValid;
     WDFREQUEST                   SyncRequest;     /* serialized init-time requests */
     FAST_MUTEX                   SyncRequestMutex;
 
@@ -163,9 +166,12 @@ typedef struct _PN_BTH_LINK {
     PVOID                        PnpNotificationEntry;
     BOOLEAN                      ScoActive;
     BOOLEAN                      AclConnected;
+    KSPIN_LOCK                   AclLock;      /* AclConnected writes vs the start-up seed (review round 3 #1) */
+    ULONG                        AclEvents;    /* ACL events delivered; under AclLock */
 
     /* SDP information about the remote */
-    USHORT                       RemoteAvdtpVersion;   /* from AudioSink profile descriptor */
+    USHORT                       RemoteAvdtpVersion;   /* AVDTP version from the ProtocolDescriptorList, 0 unknown */
+    USHORT                       RemoteProfileVersion; /* A2DP version from the profile descriptor */
     USHORT                       RemoteSupportedFeatures;
     BOOLEAN                      RemoteIsSink;         /* role we talk to */
 } PN_BTH_LINK, *PPN_BTH_LINK;
@@ -182,13 +188,14 @@ BOOLEAN  PnLinkUnregisterServer(_Inout_ PPN_BTH_LINK Link);   /* TRUE: a registe
 NTSTATUS PnLinkRegisterRadioEvents(_Inout_ PPN_BTH_LINK Link, _In_ PFN_PN_LINK_SCO OnSco,
                                    _In_ PFN_PN_LINK_ACL OnAcl, _In_ PVOID Context);
 VOID     PnLinkUnregisterRadioEvents(_Inout_ PPN_BTH_LINK Link);
-NTSTATUS PnLinkSendBrbSync(_In_ PPN_BTH_LINK Link, _In_ PBRB Brb, _In_ ULONG BrbSize);
+NTSTATUS PnLinkSendBrbSync(_In_ PPN_BTH_LINK Link, _Inout_updates_bytes_(BrbSize) PBRB Brb, _In_ ULONG BrbSize);
 NTSTATUS PnLinkEnsureActive(_Inout_ PPN_BTH_LINK Link);   /* PASSIVE: leave sniff/park before streaming */
+NTSTATUS PnLinkQueryRemoteFeatures(_Inout_ PPN_BTH_LINK Link);   /* PASSIVE: the receiver's LMP features, cached */
 
 /* ---- channels ---------------------------------------------------------------- */
 NTSTATUS PnChannelInitialize(_Out_ PPN_L2CAP_CHANNEL Ch, _In_ PPN_BTH_LINK Link,
-                             _In_ BOOLEAN IsMedia, _In_ ULONG ReadBufferSize,
-                             _In_ ULONG WriteCapacity,
+                             _In_ BOOLEAN IsMedia, _In_range_(>, 0) ULONG ReadBufferSize,
+                             _In_range_(>, 0) ULONG WriteCapacity,
                              _In_ PFN_PN_L2CAP_RECEIVE OnReceive, _In_ PFN_PN_L2CAP_EVENT OnClosed,
                              _In_opt_ PFN_PN_L2CAP_WRITE_DONE OnWriteDone, _In_ PVOID Context);
 VOID     PnChannelUninitialize(_Inout_ PPN_L2CAP_CHANNEL Ch);   /* PASSIVE: waits for rundown */

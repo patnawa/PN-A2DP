@@ -52,7 +52,8 @@ typedef struct sbc_encoder {
     sbc_u8  channels;        /* 1 or 2 */
     sbc_u32 frame_length;    /* bytes */
     sbc_u32 pcm_per_frame;   /* PCM frames per SBC frame (subbands*blocks) */
-    /* analysis delay line per channel: 80 samples, newest at index 0 */
+    /* analysis delay line per channel: 80 samples, newest at index 0, Q8 in the 16-bit
+     * domain (24-bit precision; 16-bit input is stored << 8) */
     sbc_s32 x[SBC_MAX_CHANNELS][80];
     /* scratch */
     sbc_s32 sb[SBC_MAX_BLOCKS][SBC_MAX_CHANNELS][SBC_MAX_SUBBANDS];   /* Q15 subband samples */
@@ -89,6 +90,10 @@ void    sbc_encoder_set_bitpool(sbc_encoder *e, sbc_u8 bitpool); /* live change,
 /* Encode exactly e->pcm_per_frame interleaved S16 PCM frames (e->channels channels).
  * Returns bytes written (== e->frame_length) or 0 if out_cap is too small. */
 sbc_u32 sbc_encode_frame(sbc_encoder *e, const sbc_s16 *pcm, sbc_u8 *out, sbc_u32 out_cap);
+/* Same, from interleaved S32 PCM (full scale +-2^31). The top 24 bits reach the analysis
+ * filter, so gain applied before encoding and 24-bit sources keep their precision.
+ * S16 samples passed as (s16 << 16) produce exactly the frames sbc_encode_frame does. */
+sbc_u32 sbc_encode_frame_s32(sbc_encoder *e, const sbc_s32 *pcm, sbc_u8 *out, sbc_u32 out_cap);
 
 /* ---- decoder ---- */
 int     sbc_decoder_init(sbc_decoder *d);

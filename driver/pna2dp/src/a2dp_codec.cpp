@@ -418,6 +418,10 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *RemoteCaps, _In_ const PNA2
     ULONG chmodes = Caps->ChannelModeMask;
     if (!rates || !chmodes) return FALSE;
     BOOLEAN preferDual = (Pref->Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) != 0;
+    /* SBC XQ: dual channel, 8 subbands, 16 blocks; the pump packs it to the radio */
+    BOOLEAN sbcXq = (Pref->Flags & PNA2DP_CFG_SBC_XQ) != 0 && Caps->Codec == PNA2DP_CODEC_SBC &&
+        (Caps->ChannelModeMask & PNA2DP_CHMODE_DUAL) && (Caps->SbcSubbandMask & PNA2DP_SBC_SUBBANDS_8) &&
+        (Caps->SbcBlockMask & PNA2DP_SBC_BLOCKS_16);
 
     switch (Caps->Codec) {
     case PNA2DP_CODEC_SBC: {
@@ -425,10 +429,12 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *RemoteCaps, _In_ const PNA2
         if (Pref->Sbc.ChannelModeMask) chmodes &= SbcChBitsToMask(Pref->Sbc.ChannelModeMask);
         if (!rates) rates = Caps->RateMask;
         if (!chmodes) chmodes = Caps->ChannelModeMask;
+        if (sbcXq) chmodes = PNA2DP_CHMODE_DUAL;
         Cfg->MediaCodecType = A2DP_CODEC_SBC;
         Cfg->SampleRate = PickRate(rates, PreferredRate);
         Cfg->ChannelMode = PickChannelMode(chmodes, preferDual);
         UCHAR blocks = Caps->SbcBlockMask, subs = Caps->SbcSubbandMask, alloc = Caps->SbcAllocMask;
+        if (sbcXq) { blocks = PNA2DP_SBC_BLOCKS_16; subs = PNA2DP_SBC_SUBBANDS_8; }
         if (!blocks || !subs || !alloc || Caps->SbcMinBitpool < 2 || Caps->SbcMinBitpool > Caps->SbcMaxBitpool || Caps->SbcMaxBitpool > 250) return FALSE;
         if (Pref->Sbc.BlockMask && (blocks & Pref->Sbc.BlockMask)) blocks &= Pref->Sbc.BlockMask;
         if (Pref->Sbc.SubbandMask && (subs & Pref->Sbc.SubbandMask)) subs &= Pref->Sbc.SubbandMask;
@@ -442,6 +448,7 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *RemoteCaps, _In_ const PNA2
             if (Pref->Sbc.MaxBitpool <= maxbp || Pref->Sbc.AllowBitpoolOverride) maxbp = Pref->Sbc.MaxBitpool;
         }
         if (Pref->Sbc.MinBitpool && Pref->Sbc.MinBitpool > minbp) minbp = Pref->Sbc.MinBitpool;
+        /* XQ takes the bitpool plain dual channel gets: no fixed 47 cap (known issue, #1/#7) */
         ULONG modeMax = PN_MIN(250u, Cfg->SbcSubbands *
             ((Cfg->ChannelMode == PNA2DP_CHMODE_MONO || Cfg->ChannelMode == PNA2DP_CHMODE_DUAL) ? 16u : 32u));
         maxbp = (UCHAR)PN_MIN(maxbp, modeMax);
@@ -651,14 +658,9 @@ ULONG A2dpQualityAtLevel(_In_ const A2DP_CODEC_CONFIG *Base, ULONG Level, ULONG 
     A2DP_CODEC_CONFIG cfg = *Base;
     switch (cfg.Codec) {
     case PNA2DP_CODEC_SBC: {
-        /* ladder: max bitpool down to min in steps of ~15% */
+        /* ladder: max bitpool down to min in steps of ~15%, plus the "fits 2-DH5" rung */
         ULONG maxbp = cfg.SbcMaxBitpool, minbp = PN_MAX(cfg.SbcMinBitpool, 2u);
-        ULONG bp = maxbp;
-        for (ULONG i = 0; i < Level; i++) {
-            ULONG step = PN_MAX(bp / 7, 2u);
-            if (bp <= minbp + step) { bp = minbp; break; }
-            bp -= step;
-        }
+        ULONG bp = PnSbcLadderBitpool(maxbp, minbp, cfg.SbcFitBitpool, Level);
         if (bp < minbp) bp = minbp;
         if (bp > maxbp) bp = maxbp;
         cfg.SbcBitpool = (UCHAR)bp;
@@ -670,9 +672,15 @@ ULONG A2dpQualityAtLevel(_In_ const A2DP_CODEC_CONFIG *Base, ULONG Level, ULONG 
         while (cfg.LdacEqmid > Base->LdacEqmid && A2dpNominalBitrate(&cfg) < FloorBps) cfg.LdacEqmid--;
         break;
     case PNA2DP_CODEC_AAC: {
-        static const ULONG ladder[] = { 0, 256000, 192000, 128000, 96000 };
+        /* rung n is the n-th step below the ceiling: a ceiling under 256 kbps (the
+         * receiver's, or the MTU fit) does not repeat the top as rung 1 */
+        static const ULONG ladder[] = { 256000, 192000, 128000, 96000 };
         ULONG b = cfg.MaxBitrateBps;
-        if (Level) b = PN_MIN(b, ladder[PN_MIN(Level, PN_ARRAYSIZE(ladder) - 1)]);
+        for (ULONG i = 0, n = 0; n < Level && i < PN_ARRAYSIZE(ladder); i++) {
+            if (ladder[i] >= cfg.MaxBitrateBps) continue;
+            b = ladder[i];
+            n++;
+        }
         cfg.BitrateBps = PnQualityBoundBitrate(b, FloorBps, cfg.MaxBitrateBps);
         break;
     }
@@ -682,4 +690,81 @@ ULONG A2dpQualityAtLevel(_In_ const A2DP_CODEC_CONFIG *Base, ULONG Level, ULONG 
     cfg.BitrateBps = A2dpNominalBitrate(&cfg);
     if (Result) *Result = cfg;
     return cfg.BitrateBps;
+}
+
+static VOID SbcParamsFor(_In_ const A2DP_CODEC_CONFIG *Cfg, ULONG Bitpool, _Out_ sbc_params *P)
+{
+    P->sample_rate = Cfg->SampleRate;
+    P->channel_mode = (sbc_u8)(Cfg->ChannelMode == PNA2DP_CHMODE_MONO ? SBC_MODE_MONO : Cfg->ChannelMode == PNA2DP_CHMODE_DUAL ? SBC_MODE_DUAL :
+                               Cfg->ChannelMode == PNA2DP_CHMODE_STEREO ? SBC_MODE_STEREO : SBC_MODE_JOINT);
+    P->allocation = Cfg->SbcAlloc;
+    P->subbands = Cfg->SbcSubbands;
+    P->blocks = Cfg->SbcBlocks;
+    P->bitpool = (sbc_u8)Bitpool;
+}
+
+ULONG A2dpSbcFramesPerPacket(_In_ const A2DP_CODEC_CONFIG *Cfg, ULONG TargetLatencyMs, ULONG PayloadRoom, ULONG HeaderBytes, ULONG SduBytes)
+{
+    if (Cfg->Codec != PNA2DP_CODEC_SBC || !Cfg->SampleRate) return 0;
+    sbc_params p;
+    SbcParamsFor(Cfg, Cfg->SbcBitpool ? Cfg->SbcBitpool : Cfg->SbcMaxBitpool, &p);
+    ULONG len = sbc_frame_length(&p);
+    if (!len || len > PayloadRoom) return 0;
+    ULONG frameUs = (ULONG)((ULONGLONG)Cfg->SbcSubbands * Cfg->SbcBlocks * 1000000u / Cfg->SampleRate);
+    /* the 2-DH5 rung packs for one 2-DH5 packet, which is why it exists */
+    ULONG sdu = (Cfg->SbcFitBitpool && Cfg->SbcBitpool == Cfg->SbcFitBitpool) ? PN_SDU_2DH5 : SduBytes;
+    return PnSbcPacking(len, frameUs, TargetLatencyMs, PayloadRoom, HeaderBytes, sdu);
+}
+
+BOOLEAN A2dpSbcPlanStream(_In_ const A2DP_CODEC_CONFIG *Cfg, _In_ BOOLEAN Xq, _In_ ULONG LocalSdu, _In_ ULONG XqSdu,
+                          _In_ ULONG PayloadRoom, _In_ ULONG HeaderBytes, _In_ ULONG TargetLatencyMs, _Out_ A2DP_SBC_STREAM_PLAN *Plan)
+{
+    RtlZeroMemory(Plan, sizeof(*Plan));
+    if (Cfg->Codec != PNA2DP_CODEC_SBC) return FALSE;
+    sbc_params p;
+    SbcParamsFor(Cfg, Cfg->SbcMaxBitpool, &p);
+    /* XQ (dual 8/16): the bitpool of plain dual channel; only the packing follows the EDR packet
+     * both ends take (the 2-DH5 point when the sink's features or the radio are unknown) */
+    BOOLEAN xq = Xq && p.channel_mode == SBC_MODE_DUAL && p.subbands == 8 && p.blocks == 16;
+    ULONG sdu = xq ? (XqSdu ? XqSdu : PN_SDU_2DH5) : LocalSdu;
+    /* keep one frame within the MTU */
+    ULONG maxbp = sbc_max_bitpool_for(&p, 0, PayloadRoom);
+    if (maxbp < Cfg->SbcMinBitpool) return FALSE;
+    ULONG ceiling = PN_MIN((ULONG)Cfg->SbcMaxBitpool, maxbp);
+    ULONG start = Cfg->SbcBitpool ? PN_MIN((ULONG)Cfg->SbcBitpool, ceiling) : ceiling;
+    if (start < Cfg->SbcMinBitpool) start = Cfg->SbcMinBitpool;
+    A2DP_CODEC_CONFIG c = *Cfg;
+    c.SbcBitpool = (UCHAR)start;
+    c.SbcMaxBitpool = (UCHAR)start;   /* a lowered live bitpool stays the ABR's top rung (finding #6) */
+    c.SbcFitBitpool = 0;
+    ULONG frames = A2dpSbcFramesPerPacket(&c, TargetLatencyMs, PayloadRoom, HeaderBytes, sdu);
+    if (!frames) return FALSE;
+    /* ABR rung at which these packets fit one 2-DH5 packet, where they might not today */
+    if (sdu == 0 || sdu > PN_SDU_2DH5) {
+        UCHAR fit = A2dpSbcBitpoolForPacket(&c, frames, HeaderBytes, PN_SDU_2DH5);
+        if (fit && fit < start) Plan->FitBitpool = fit;
+    }
+    Plan->StartBitpool = (UCHAR)start;
+    Plan->CeilingBitpool = (UCHAR)ceiling;
+    Plan->SduBytes = sdu;
+    Plan->FramesPerPacket = frames;
+    Plan->Xq = xq;
+    return TRUE;
+}
+
+UCHAR A2dpSbcBitpoolForPacket(_In_ const A2DP_CODEC_CONFIG *Cfg, ULONG Frames, ULONG HeaderBytes, ULONG SduBytes)
+{
+    if (Cfg->Codec != PNA2DP_CODEC_SBC || !Frames || SduBytes <= HeaderBytes) return 0;
+    A2DP_CODEC_CONFIG q = *Cfg;
+    for (ULONG bp = Cfg->SbcMaxBitpool; bp >= PN_MAX((ULONG)Cfg->SbcMinBitpool, 2u) && bp <= 250; bp--) {
+        q.SbcBitpool = (UCHAR)bp;
+        sbc_params p;
+        p.sample_rate = q.SampleRate;
+        p.channel_mode = (sbc_u8)(q.ChannelMode == PNA2DP_CHMODE_MONO ? SBC_MODE_MONO : q.ChannelMode == PNA2DP_CHMODE_DUAL ? SBC_MODE_DUAL :
+                                  q.ChannelMode == PNA2DP_CHMODE_STEREO ? SBC_MODE_STEREO : SBC_MODE_JOINT);
+        p.allocation = q.SbcAlloc; p.subbands = q.SbcSubbands; p.blocks = q.SbcBlocks; p.bitpool = (sbc_u8)bp;
+        ULONG len = sbc_frame_length(&p);
+        if (len && HeaderBytes + (ULONGLONG)Frames * len <= SduBytes) return (UCHAR)bp;
+    }
+    return 0;
 }

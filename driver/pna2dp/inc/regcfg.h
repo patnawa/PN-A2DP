@@ -2,7 +2,9 @@
  * regcfg.h - persistence of global and per-device settings.
  *
  *   HKLM\SYSTEM\CurrentControlSet\Services\pna2dp\Parameters
- *       DebugLevel            REG_DWORD
+ *       DebugLevel            REG_DWORD   debugger output (1 error, 2 warning, 3 info, 4 verbose)
+ *                                         and verbose ring capture; the trace ring always keeps
+ *                                         error, warning and info. Default 2 (code and INF).
  *   HKLM\SYSTEM\CurrentControlSet\Services\pna2dp\State
  *       UncleanStarts         REG_DWORD   crash guard, see below
  *       Devices\<bdaddr>\Config        REG_BINARY  PNA2DP_CONFIG
@@ -22,6 +24,10 @@ NTSTATUS RegCfgSaveDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Addres
                           _In_opt_ PCSTR Name);
 NTSTATUS RegCfgSaveCapabilities(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Address,
                                 _In_ const PNA2DP_CAPABILITIES *Caps);
+/* Capabilities saved at the last connection (zeroed on failure). The caller must still
+ * check them (PnWaveSanitizeCachedCaps): the value may come from another build. */
+NTSTATUS RegCfgLoadCapabilities(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Address,
+                                _Out_ PPNA2DP_CAPABILITIES Caps);
 BOOLEAN  RegCfgValidate(_Inout_ PPNA2DP_CONFIG Cfg);
 
 /* Crash guard (Services\pna2dp\State\UncleanStarts, REG_DWORD). DriverEntry counts every

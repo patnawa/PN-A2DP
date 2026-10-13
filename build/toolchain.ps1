@@ -62,6 +62,10 @@ $script:CERTMGR   = Join-Path $SdkRoot  "bin\$KitVer\x64\certmgr.exe"
 $script:STAMPINF  = Join-Path $WdkRoot  "bin\$KitVer\x64\stampinf.exe"
 $script:INF2CAT   = Join-Path $WdkRoot  "bin\$KitVer\x86\Inf2Cat.exe"
 $script:INFVERIF  = Join-Path $WdkRoot  "tools\$KitVer\x64\infverif.exe"
+# ApiValidator and the universal (DCH) DDI lists the WDK MSBuild ApiValidator target uses
+$script:APIVALIDATOR   = Join-Path $WdkRoot "bin\$KitVer\x64\apivalidator.exe"
+$script:UNIVERSAL_DDIS = Join-Path $WdkRoot "build\$KitVer\universalDDIs\x64\UniversalDDIs.xml"
+$script:UNIVERSAL_DDIS_WHITELIST = Join-Path $WdkRoot "build\$KitVer\universalDDIs\x64\ModuleWhitelist.xml"
 
 # Include / lib directories
 $script:KmIncludes = @(
@@ -90,6 +94,23 @@ $script:UmLibDirs = @(
 )
 
 foreach ($p in @($CL, $LINK, $RC)) { if (-not (Test-Path $p)) { throw "Missing tool: $p" } }
+
+# Fails unless every import of a driver binary is on the WDK universal DDI list.
+# ApiValidator exits -1 when a binary is not universal and -2 when it cannot run.
+function Test-UniversalDriverApis([string]$Binary) {
+    foreach ($tool in @($APIVALIDATOR, $UNIVERSAL_DDIS, $UNIVERSAL_DDIS_WHITELIST)) { if (-not (Test-Path -LiteralPath $tool)) { throw "ApiValidator input missing: $tool" } }
+    $full = (Resolve-Path -LiteralPath $Binary).Path
+    # The violations go to stderr: collect them as text instead of letting
+    # $ErrorActionPreference = 'Stop' turn the first one into an exception.
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $text = @(& $APIVALIDATOR "-DriverPackagePath:$full" "-SupportedApiXmlFiles:$UNIVERSAL_DDIS" "-ModuleWhiteListXmlFiles:$UNIVERSAL_DDIS_WHITELIST" 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $saved }
+    $text | ForEach-Object { Write-Host $_ }
+    if ($code -ne 0 -or -not ($text -match 'All binaries are Universal')) { throw "ApiValidator: $full calls APIs outside the universal driver set (exit code $code)" }
+}
 
 function Write-ToolchainSummary {
     Write-Host "MSVC    : $MsvcRoot"

@@ -1,8 +1,9 @@
 # Builds pna2dp-codec-ldac.dll from third_party/ldacBT (Apache-2.0) + ldac_plugin.c
 #
 # libldac is a single-translation-unit library: ldaclib.c #includes every other
-# encoder source, ldacBT.c #includes the Bluetooth wrapper. Only those two files and
-# the ABR helper are compiled.
+# encoder source, ldacBT.c #includes the Bluetooth wrapper. Only those two files are
+# compiled: bitrate adaptation is the driver's (EQMID through reconfigure), so
+# libldac's ABR helper (ldacBT_abr.c) is not linked.
 param([ValidateSet('Release','Debug')][string]$Config = 'Release', [switch]$FixedPoint, [switch]$SkipSourceBundle)
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
@@ -13,7 +14,7 @@ $out = Join-Path $Root "out\$Config"
 $obj = Join-Path $out 'obj\ldac'
 New-Item -ItemType Directory -Force $out, $obj | Out-Null
 
-$incs = @("/I$PSScriptRoot", "/I$ldac\libldac\inc", "/I$ldac\libldac\src", "/I$ldac\libldac\abr\inc", "/I$ldac\libldac\abr\src",
+$incs = @("/I$PSScriptRoot", "/I$ldac\libldac\inc", "/I$ldac\libldac\src",
           "/I$(Join-Path $Root 'codec-host\include')", "/I$(Join-Path $Root 'driver\pna2dp\inc')")
 $incs += ($UmIncludes | ForEach-Object { "/I$_" })
 $opt = if ($Config -eq 'Debug') { @('/Od','/MTd') } else { @('/O2','/MT','/DNDEBUG','/fp:fast') }
@@ -23,7 +24,6 @@ $flags = @('/nologo','/c','/W3','/Zi','/D_CRT_SECURE_NO_WARNINGS','/DWIN32_LEAN_
 $srcs = @(
     (Join-Path $ldac 'libldac\src\ldaclib.c'),
     (Join-Path $ldac 'libldac\src\ldacBT.c'),
-    (Join-Path $ldac 'libldac\abr\src\ldacBT_abr.c'),
     (Join-Path $PSScriptRoot 'ldac_plugin.c')
 )
 $objs = @()

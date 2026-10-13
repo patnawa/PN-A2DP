@@ -162,12 +162,35 @@ static void TestPresets()
         if ((pn::Preset)i != pn::Preset::Balanced) {
             CHECK(c.ReconnectDelayMs == 5000 && (c.Flags & PNA2DP_CFG_SOFTWARE_VOLUME), "preset %d leaves unrelated settings alone", i);
         }
+        /* only the XQ preset turns SBC XQ on; every other preset turns it off again */
+        PNA2DP_CONFIG xqFirst;
+        pn::ConfigDefaults(xqFirst);
+        pn::ApplyPreset(xqFirst, pn::Preset::SbcXq);
+        pn::ApplyPreset(xqFirst, (pn::Preset)i);
+        CHECK(((xqFirst.Flags & PNA2DP_CFG_SBC_XQ) != 0) == ((pn::Preset)i == pn::Preset::SbcXq), "preset %d sets SBC XQ only for the XQ preset", i);
     }
     PNA2DP_CONFIG x;
     pn::ConfigDefaults(x);
+    CHECK(!(x.Flags & PNA2DP_CFG_SBC_XQ), "SBC XQ is off by default");
     pn::ApplyPreset(x, pn::Preset::SbcXq);
-    ULONG kbps = (pn::SbcBitrateBps(44100, 8, 16, PNA2DP_SBC_CH_DUAL, x.Sbc.MaxBitpool) + 500) / 1000;
-    CHECK(kbps >= 540 && kbps <= 560, "SBC XQ preset is about 550 kbps at 44.1 kHz (got %u)", kbps);
+    /* the driver streams XQ at the bitpool plain dual channel gets, never a fixed 47 / 38 that
+     * cost the Sony 600 or 492 instead of 672 kbps (known issue): the preset leaves the
+     * receiver's maximum and never overrides it */
+    CHECK((x.Flags & (PNA2DP_CFG_SBC_XQ | PNA2DP_CFG_DUAL_CHANNEL_PREFER)) == (PNA2DP_CFG_SBC_XQ | PNA2DP_CFG_DUAL_CHANNEL_PREFER) &&
+          x.Sbc.MaxBitpool == 0 && !x.Sbc.AllowBitpoolOverride && x.Sbc.BlockMask == PNA2DP_SBC_BLOCKS_16 && x.Sbc.SubbandMask == PNA2DP_SBC_SUBBANDS_8,
+          "SBC XQ preset asks the driver for XQ at the receiver's maximum bitpool and never overrides it");
+    ULONG kbps = (pn::SbcBitrateBps(44100, 8, 16, PNA2DP_SBC_CH_DUAL, 53) + 500) / 1000;
+    CHECK(kbps == 617, "SBC XQ at a receiver maximum of 53 is 617 kbps at 44.1 kHz (got %u)", kbps);
+    kbps = (pn::SbcBitrateBps(48000, 8, 16, PNA2DP_SBC_CH_DUAL, 53) + 500) / 1000;
+    CHECK(kbps == 672, "SBC XQ at a receiver maximum of 53 is 672 kbps at 48 kHz (got %u)", kbps);
+    CHECK(13 + 3 * pn::SbcFrameBytes(8, 16, PNA2DP_SBC_CH_DUAL, 53) <= 1021 - 4 && 13 + 3 * pn::SbcFrameBytes(8, 16, PNA2DP_SBC_CH_DUAL, 53) <= 895,
+          "three bitpool-53 dual-channel frames fit MTU 895 and one 3-DH5 baseband packet");
+    PNA2DP_CONFIG back;
+    CHECK(pn::ConfigFromText(pn::ConfigToText(x), back) && (back.Flags & PNA2DP_CFG_SBC_XQ), "SBC XQ survives the text round trip");
+    CHECK(pn::ConfigFromText(pn::ConfigToText(x) + L"sbc.xq=0\r\n", back) && !(back.Flags & PNA2DP_CFG_SBC_XQ), "sbc.xq=0 turns it off");
+    PNA2DP_CONFIG automatic2 = x;
+    pn::UseAutomaticCodecs(automatic2);
+    CHECK(!(automatic2.Flags & PNA2DP_CFG_SBC_XQ), "automatic codecs turn SBC XQ off");
 }
 
 static void TestSbcNumbers()

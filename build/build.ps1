@@ -9,8 +9,11 @@
   .\build\build.ps1 -Target service-tests # focused Windows service failure tests
   .\build\build.ps1 -Target process-tests # helper-process responsiveness tests
   .\build\build.ps1 -Target health-tests # audio diagnostics and quality-history tests
+  .\build\build.ps1 -Target quality-tests # end-to-end audio quality harness (quality_test.exe; run it with
+                                          # build\test-audio-quality.py, needs FFmpeg and the codec plugins)
   .\build\build.ps1 -Target windows  # application-only Windows mode installer + portable
   .\build\build.ps1 -Target gui      # control panel (pna2dp-panel.exe)
+  .\build\build.ps1 -Target plugins  # LDAC/aptX/AAC codec plugins (needs the third_party submodules)
   .\build\build.ps1 -Target setup    # installer (pna2dp-setup.exe) embedding everything found in out\<Config>
   .\build\build.ps1 -Target package  # driver + host + tools + plugins + installer, collected in out\<Config>\dist
   .\build\build.ps1 -Target dist     # repackage existing binaries, preserving their signatures
@@ -21,7 +24,7 @@
   WDK NuGet layout (see get-wdk.ps1 and toolchain.ps1).
 #>
 param(
-    [ValidateSet('all','driver','host','cli','tests','security-tests','core-tests','plugin-tests','service-tests','process-tests','health-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
+    [ValidateSet('all','driver','host','cli','tests','security-tests','core-tests','plugin-tests','quality-tests','plugins','service-tests','process-tests','health-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
     [ValidateSet('Release','Debug')][string]$Config = 'Release',
     [switch]$Sign,
     [switch]$Sanitize,
@@ -77,11 +80,14 @@ function Build-Driver {
               '/DDEPRECATE_DDK_FUNCTIONS=1','/D_NEW_DELETE_OPERATORS_','/DPC_IMPLEMENTATION','/DUNICODE','/D_UNICODE','/DPOOL_NX_OPTIN=1')
     if ($Config -eq 'Debug') { $defs += '/DDBG=1','/D_DEBUG' } else { $defs += '/DNDEBUG' }
     $opt = if ($Config -eq 'Debug') { @('/Od','/Oy-') } else { @('/O2','/Oi') }
-    $common = @('/nologo','/c','/W4','/WX-','/GS','/Gy','/Zi','/kernel','/GR-','/EHs-c-','/Zp8','/FC','/guard:cf',
-                '/wd4201','/wd4214','/wd4127','/wd4324','/wd4100','/wd4457','/wd4456','/Zc:wchar_t','/Zc:forScope','/Zc:inline','/Zc:strictStrings-',
+    # /Qspectre: Spectre variant 1 load barriers. The driver links only WDK libraries
+    # (/NODEFAULTLIB), so no Spectre-mitigated MSVC runtime libraries are needed.
+    $common = @('/nologo','/c','/W4','/WX','/GS','/Gy','/Zi','/kernel','/GR-','/EHs-c-','/Zp8','/FC','/guard:cf','/Qspectre',
+                '/wd4201','/wd4214','/wd4127','/wd4324','/wd4100','/wd4471','/Zc:wchar_t','/Zc:forScope','/Zc:inline','/Zc:strictStrings-',
                 '/std:c++17','/permissive-',"/Fd$objd\pna2dp.pdb") + $opt + $defs
     $incs = @("/I$inc") + ($KmIncludes | ForEach-Object { "/I$_" })
-    if ($Analyze) { $common += '/analyze', '/analyze:external-' }
+    # /analyze:WX- keeps /analyze findings as warnings under /WX; check-analyze.ps1 ratchets them.
+    if ($Analyze) { $common += '/analyze', '/analyze:external-', '/analyze:WX-' }
 
     $cpp = Get-ChildItem (Join-Path $src '*.cpp')
     $objs = @()
@@ -104,12 +110,16 @@ function Build-Driver {
 
     $sys = Join-Path $Out 'pna2dp.sys'
     $libs = $KmLibDirs | ForEach-Object { "/LIBPATH:$_" }
+    # /CETCOMPAT marks the image shadow-stack compatible (kernel-mode hardware-enforced
+    # stack protection loads only drivers that carry this flag).
     $largs = @('/nologo','/DRIVER','/SUBSYSTEM:NATIVE,10.0','/ENTRY:FxDriverEntry','/NODEFAULTLIB','/RELEASE','/INCREMENTAL:NO','/OPT:REF','/OPT:ICF',
-               '/DEBUG','/MACHINE:X64','/NXCOMPAT','/DYNAMICBASE','/guard:cf','/MERGE:_TEXT=.text','/MERGE:_PAGE=PAGE','/SECTION:INIT,d',
+               '/DEBUG','/MACHINE:X64','/NXCOMPAT','/DYNAMICBASE','/guard:cf','/CETCOMPAT','/MERGE:_TEXT=.text','/MERGE:_PAGE=PAGE','/SECTION:INIT,d',
                '/OSVERSION:10.0','/VERSION:10.0','/INTEGRITYCHECK',"/OUT:$sys","/PDB:$Out\pna2dp.pdb","/MAP:$Out\pna2dp.map") + $libs + $objs + @($res) +
              @('portcls.lib','stdunk.lib','ksguid.lib','libcntpr.lib','ntoskrnl.lib','hal.lib','wmilib.lib','wdmsec.lib','BufferOverflowFastFailK.lib','wdfdriverentry.lib','wdfldr.lib')
     Invoke-Tool $LINK $largs
     Write-Host "built $sys ($((Get-Item $sys).Length) bytes)"
+    # Universal (DCH) driver rule: only DDIs on the WDK's universal list may be imported.
+    Test-UniversalDriverApis $sys
 
     # package: INF + sys (+ cat when signing)
     $pkg = Join-Path $Out 'package'
@@ -123,6 +133,10 @@ function Build-Driver {
         # packages can cause Windows to keep an older driver-store package.
         Invoke-Tool $STAMPINF @('-f', (Join-Path $pkg 'pna2dp.inf'), '-d', '*', '-k', $KmdfVer)
     }
+    # Validate every packaged INF, not only -Production ones; /w also applies the
+    # Windows (universal/DCH) driver INF rules.
+    if (-not (Test-Path -LiteralPath $INFVERIF)) { throw "InfVerif not found: $INFVERIF" }
+    Invoke-Tool $INFVERIF @('/w', '/v', (Join-Path $pkg 'pna2dp.inf'))
     if ($Sign) { & (Join-Path $PSScriptRoot 'sign-test.ps1') -Package $pkg }
 }
 
@@ -173,7 +187,7 @@ function Build-Tests {
     Build-UserExe 'signing_test' @((Join-Path $Root 'tools\common\test\signing_test.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp')) @() @() @()
     Build-UserExe 'spatial_test' @((Join-Path $Root 'tools\audio-test\spatial_test.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp'), (Join-Path $Root 'tools\common\pnspatial.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp')) @() @('cfgmgr32.lib','ole32.lib','windowsapp.lib') @()
     Build-UserExe 'sbc_capture' @((Join-Path $Root 'tools\audio-test\sbc_capture.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp')) @() @('cfgmgr32.lib','ole32.lib') @()
-    Build-UserExe 'ks_test' @((Join-Path $Root 'tools\audio-test\ks_test.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp')) @() @('ksuser.lib','cfgmgr32.lib','ole32.lib') @()
+    Build-UserExe 'ks_test' @((Join-Path $Root 'tools\audio-test\ks_test.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp')) @() @('ksuser.lib','cfgmgr32.lib','ole32.lib','advapi32.lib') @()
     Build-UserExe 'audio_test' @((Join-Path $Root 'tools\audio-test\audio_test.cpp')) @() @('ole32.lib','uuid.lib') @()
     Build-UserExe 'core_test' @((Join-Path $Root 'driver\pna2dp\test\core_test.cpp'), (Join-Path $Root 'driver\pna2dp\src\a2dp_codec.cpp'), (Join-Path $Root 'driver\pna2dp\src\rtp.cpp'), (Join-Path $Root 'driver\pna2dp\src\pcm.cpp'), (Join-Path $Root 'driver\pna2dp\src\avdtp_wire.cpp'), (Join-Path $Root 'common\sbc\sbc.c')) @() @() @()
     Build-UserExe 'sbc_test' @((Join-Path $Root 'common\sbc\sbc.c'), (Join-Path $Root 'common\sbc\test\sbc_test.c')) @() @() @()
@@ -188,6 +202,15 @@ function Build-SecurityTests {
 
 function Build-CoreTests {
     Build-UserExe 'core_test' @((Join-Path $Root 'driver\pna2dp\test\core_test.cpp'), (Join-Path $Root 'driver\pna2dp\src\a2dp_codec.cpp'), (Join-Path $Root 'driver\pna2dp\src\rtp.cpp'), (Join-Path $Root 'driver\pna2dp\src\pcm.cpp'), (Join-Path $Root 'driver\pna2dp\src\avdtp_wire.cpp'), (Join-Path $Root 'common\sbc\sbc.c')) @() @() @()
+}
+
+# The audio quality harness: the production PCM conversion, codec selection, SBC packing,
+# RTP writer, kernel SBC encoder and the built-in SBC plugin, with the pump / WaveRT data path
+# emulated around them; codec plugins are loaded from out\<Config> at run time.
+function Build-QualityTests {
+    $srcs = @((Join-Path $Root 'tools\audio-test\quality_test.cpp'), (Join-Path $Root 'driver\pna2dp\src\pcm.cpp'), (Join-Path $Root 'driver\pna2dp\src\a2dp_codec.cpp'),
+              (Join-Path $Root 'driver\pna2dp\src\rtp.cpp'), (Join-Path $Root 'common\sbc\sbc.c'), (Join-Path $Root 'codec-host\plugins\sbc\sbc_plugin.cpp'))
+    Build-UserExe 'quality_test' $srcs @("/I$(Join-Path $Root 'codec-host\include')") @() @()
 }
 
 function Build-Cli {
@@ -375,12 +398,14 @@ switch ($Target) {
     'security-tests' { Build-SecurityTests }
     'core-tests' { Build-CoreTests }
     'plugin-tests' { Build-UserExe 'plugin_test' @((Join-Path $Root 'codec-host\test\plugin_test.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @() @() }
+    'quality-tests' { Build-QualityTests }
     'service-tests' { Build-ServiceTests }
     'process-tests' { Build-ProcessTests }
     'health-tests' { Build-HealthTests }
     'cli'     { Build-Cli }
     'host'    { Build-Host }
     'gui'     { Build-Gui }
+    'plugins' { Build-Plugins }
     'setup'   { Build-Setup }
     'dist'    { Build-Setup; Build-Dist }
     'package' { Build-Tests; Build-Driver; Build-Cli; Build-Host; Build-Gui; Build-Plugins; Build-Setup; Build-Dist }

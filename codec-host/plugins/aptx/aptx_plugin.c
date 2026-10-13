@@ -5,9 +5,10 @@
  * (freeaptx.dll) so the LGPL obligations are met by replaceability.
  *
  * Framing (matches Android/BlueZ/PipeWire):
- *   aptX     : no RTP header, 4 PCM frames -> 8 bytes (6 bytes/frame of 24-bit stereo in)
- *   aptX HD  : RTP header, no payload header, 4 PCM frames -> 12 bytes
- *   aptX LL  : no RTP header, same framing as aptX; the sink expects small packets
+ *   aptX     : no RTP header, 4 PCM frames -> one 4-byte codeword (6 bytes/frame of 24-bit stereo in)
+ *   aptX HD  : RTP header, no payload header, 4 PCM frames -> one 6-byte codeword
+ *   aptX LL  : no RTP header, same framing as aptX; the driver keeps its packets short
+ * The driver sizes packets in multiples of 8 codewords (the parity sync period).
  * The driver already decides RTP header use; the plugin only produces raw codec bytes.
  *
  * SPDX-License-Identifier: MIT (plugin); libfreeaptx is LGPL-2.1-or-later
@@ -22,7 +23,7 @@ struct PnCodecEncoder {
     int hd;
     uint32_t channels;
     uint32_t mtu;
-    uint32_t block_bytes;     /* 8 or 12 */
+    uint32_t block_bytes;     /* codeword: 4 (aptX, LL) or 6 (HD) bytes per 4 PCM frames */
 };
 
 static PnCodecEncoder *AptxOpen(const PNA2DP_STREAM_PARAMS *p)
@@ -31,7 +32,7 @@ static PnCodecEncoder *AptxOpen(const PNA2DP_STREAM_PARAMS *p)
         (p->SampleRate != 16000 && p->SampleRate != 32000 && p->SampleRate != 44100 && p->SampleRate != 48000)) return NULL;
     if (p->Codec != PNA2DP_CODEC_APTX && p->Codec != PNA2DP_CODEC_APTX_HD && p->Codec != PNA2DP_CODEC_APTX_LL) return NULL;
     if (p->PcmFormat != PNA2DP_FMT_S24 || p->Channels != 2) return NULL;   /* libfreeaptx: 24-bit stereo, 3 bytes per sample little endian */
-    if (p->MediaMtu < (p->Codec == PNA2DP_CODEC_APTX_HD ? 12u : 8u)) return NULL;
+    if (p->MediaMtu < (p->Codec == PNA2DP_CODEC_APTX_HD ? 6u : 4u)) return NULL;
     PnCodecEncoder *e = (PnCodecEncoder *)calloc(1, sizeof(*e));
     if (!e) return NULL;
     e->hd = (p->Codec == PNA2DP_CODEC_APTX_HD);
@@ -39,7 +40,7 @@ static PnCodecEncoder *AptxOpen(const PNA2DP_STREAM_PARAMS *p)
     if (!e->ctx) { free(e); return NULL; }
     e->channels = 2;
     e->mtu = p->MediaMtu;
-    e->block_bytes = e->hd ? 12 : 8;
+    e->block_bytes = e->hd ? 6 : 4;   /* libfreeaptx sample_size (findings #16, #33) */
     return e;
 }
 

@@ -1,0 +1,27 @@
+# Unique warnings of the Debug -Analyze driver build (build\check-analyze.ps1).
+# The check fails when the count rises. Regenerate with -UpdateBaseline after
+# removing warnings; never raise it to hide a new one.
+count=23
+kit:10.0.26100.0\km\ntddk.h C28230
+kit:10.0.26100.0\km\ntddk.h C28285
+kit:10.0.26100.0\km\ntstrsafe.h C28196
+kit:10.0.26100.0\km\ntstrsafe.h C28196
+kit:10.0.26100.0\km\wdm.h C28160
+kit:10.0.26100.0\km\wdm.h C28160
+kit:10.0.26100.0\km\wdm.h C28160
+kit:10.0.26100.0\km\wdm.h C28252
+kit:10.0.26100.0\km\wdm.h C28253
+kit:10.0.26100.0\km\wdm.h C28301
+kit:10.0.26100.0\km\wdm.h C6387
+kit:10.0.26100.0\km\wdm.h C6387
+kit:10.0.26100.0\km\wdm.h C6387
+kit:10.0.26100.0\km\wdm.h C6387
+kit:10.0.26100.0\km\wdm.h C6553
+kit:wdf\kmdf\1.31\wdfdevice.h C28193
+kit:wdf\kmdf\1.31\wdfmemory.h C6553
+kit:wdf\kmdf\1.31\wdfmemory.h C6553
+kit:wdf\kmdf\1.31\wdfmemory.h C6553
+kit:wdf\kmdf\1.31\wdfmemory.h C6553
+kit:wdf\kmdf\1.31\wdfpdo.h C28193
+kit:wdf\kmdf\1.31\wdfwmi.h C6553
+kit:wdf\kmdf\1.31\wdfwmi.h C6553

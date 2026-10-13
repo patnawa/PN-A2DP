@@ -1,7 +1,9 @@
 /*
  * main.cpp - PN-A2DP codec host: runs as a Windows service or as a console program.
  *
- *   pna2dp-codechost.exe                 console mode (Ctrl+C to stop)
+ *   pna2dp-codechost.exe                 console mode (Ctrl+C to stop); registers with the driver
+ *                                        only when run as LocalSystem (for example psexec -s),
+ *                                        since the driver accepts CODEC_REGISTER from LocalSystem only
  *   pna2dp-codechost.exe --install       register the service (run elevated)
  *   pna2dp-codechost.exe --uninstall
  *   pna2dp-codechost.exe --service       entry used by the Service Control Manager

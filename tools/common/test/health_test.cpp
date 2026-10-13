@@ -1,5 +1,6 @@
 /* Production diagnostic model and read-only machine integration. SPDX-License-Identifier: MIT */
 #include "pnhealth.h"
+#include <objbase.h>
 #include <stdio.h>
 #include <algorithm>
 
@@ -161,6 +162,47 @@ int wmain(int argc, wchar_t **argv) {
     h.quality.Health = PNA2DP_QUALITY_RECOVERING; h.quality.HealthyMs = 2000; h.quality.RecoveryTargetMs = 5000;
     h.stats.WriteFailures = 0; history.Reset(); history.Observe(0, true, h.status, h.stats, true, h.quality);
     CHECK(history.Summary(0).reason.find(L"3 s") != std::wstring::npos, "countdown uses driver recovery target");
+
+    /* Connect / Disconnect: KSPROPSETID_BtAudio {7FA06C40-B8F6-4C7E-8556-E8C33A12E54D}, a GET as
+     * Windows sends it. No request reaches a real device here: the instance below does not exist. */
+    static const GUID btAudio = {0x7FA06C40, 0xB8F6, 0x4C7E, {0x85, 0x56, 0xE8, 0xC3, 0x3A, 0x12, 0xE5, 0x4D}};
+    auto connect = pn::BluetoothAudioOneShotRequest(true), disconnect = pn::BluetoothAudioOneShotRequest(false);
+    CHECK(IsEqualGUID(connect.set, btAudio) && IsEqualGUID(disconnect.set, btAudio), "one-shot property set is KSPROPSETID_BtAudio");
+    CHECK(connect.id == 0 && disconnect.id == 1, "ONESHOT_RECONNECT is 0, ONESHOT_DISCONNECT is 1");
+    CHECK(connect.flags == 0x1 && disconnect.flags == 0x1, "one-shots are sent as KSPROPERTY_TYPE_GET, as documented");
+    using Stage = pn::OneShotStage;
+    Stage stage = Stage::Driver;
+    CHECK(pn::BluetoothAudioOneShot(L"", true, &stage) == E_INVALIDARG && stage == Stage::Lookup, "no instance, no request");
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+        stage = Stage::Driver;
+        HRESULT missing = pn::BluetoothAudioOneShot(L"BTHENUM\\PN_A2DP_TEST_NO_SUCH_DEVICE\\0", false, &stage);
+        /* read-only enumeration: every active and unplugged endpoint is checked, none matches */
+        CHECK(missing == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) && stage == Stage::NoEndpoint, "an unknown device has no endpoint and nothing is sent");
+        CoUninitialize();
+    } else CHECK(false, "COM initialization for the one-shot lookup");
+    CHECK(pn::BluetoothAudioOneShotText(S_OK, Stage::Driver, true, true).find(L"Connect request sent") == 0, "connect success text");
+    CHECK(pn::BluetoothAudioOneShotText(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), Stage::NoEndpoint, true, true).find(L"no audio output") != std::wstring::npos, "missing endpoint text");
+    /* E_NOTFOUND from an unconnected topology connector is ERROR_NOT_FOUND too: it is never "no output" */
+    std::wstring topology = pn::BluetoothAudioOneShotText(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), Stage::Topology, false, true);
+    CHECK(topology.find(L"could not be reached") != std::wstring::npos && topology.find(L"no audio output") == std::wstring::npos &&
+          topology.find(L"pair it again") == std::wstring::npos, "topology failure is not reported as a missing output");
+    std::wstring lookup = pn::BluetoothAudioOneShotText(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), Stage::Lookup, true, true);
+    CHECK(lookup.find(L"no audio output") == std::wstring::npos && lookup.find(L"Retry") != std::wstring::npos, "endpoint check failure asks for a retry");
+    CHECK(pn::BluetoothAudioOneShotText(HRESULT_FROM_WIN32(ERROR_INVALID_FUNCTION), Stage::Driver, false, true).find(L"0.1.0.21") != std::wstring::npos, "old SET-only PN-A2DP driver text");
+    std::wstring other = pn::BluetoothAudioOneShotText(HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND), Stage::Driver, false, false);
+    CHECK(other.find(L"does not accept") != std::wstring::npos && other.find(L"PN-A2DP") == std::wstring::npos, "another driver's rejection does not blame PN-A2DP");
+    CHECK(pn::BluetoothAudioOneShotText(E_FAIL, Stage::Driver, false, true).find(L"0x80004005") != std::wstring::npos, "error code shown");
+    /* the reconnect fallback resets the link: only for Connect, only without any output, only while the session is down */
+    CHECK(pn::OneShotReconnectFallback(true, Stage::NoEndpoint, true, PNA2DP_STATE_IDLE), "fallback for an idle session without output");
+    CHECK(pn::OneShotReconnectFallback(true, Stage::NoEndpoint, true, PNA2DP_STATE_ERROR), "fallback for a failed session without output");
+    bool resetsLiveSession = false;
+    for (ULONG state = PNA2DP_STATE_CONNECTING; state <= PNA2DP_STATE_CLOSING; ++state)
+        resetsLiveSession |= pn::OneShotReconnectFallback(true, Stage::NoEndpoint, true, state);
+    CHECK(!resetsLiveSession, "never a fallback while connecting, connected, streaming, suspended or closing");
+    CHECK(!pn::OneShotReconnectFallback(true, Stage::NoEndpoint, false, PNA2DP_STATE_IDLE), "no fallback when the session state is unknown");
+    CHECK(!pn::OneShotReconnectFallback(true, Stage::Topology, true, PNA2DP_STATE_IDLE) && !pn::OneShotReconnectFallback(true, Stage::Lookup, true, PNA2DP_STATE_IDLE) &&
+          !pn::OneShotReconnectFallback(true, Stage::Driver, true, PNA2DP_STATE_IDLE), "no fallback unless no endpoint exists");
+    CHECK(!pn::OneShotReconnectFallback(false, Stage::NoEndpoint, true, PNA2DP_STATE_IDLE), "Disconnect never falls back to a reconnect");
     printf("Audio health: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

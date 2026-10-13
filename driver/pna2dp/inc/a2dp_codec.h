@@ -116,6 +116,7 @@ typedef struct _A2DP_CODEC_CONFIG {
     UCHAR   SbcMinBitpool;
     UCHAR   SbcMaxBitpool;
     UCHAR   SbcBitpool;        /* current (ABR) */
+    UCHAR   SbcFitBitpool;     /* extra ABR rung: packets fit one 2-DH5 baseband packet (0 = none) */
     /* AAC */
     UCHAR   AacObjectType;     /* 2 LC, 5 HEv1, 29 HEv2 */
     UCHAR   AacObjectMask;     /* wire object bit; MPEG-2 LC and MPEG-4 LC both use AOT 2 */
@@ -161,3 +162,29 @@ ULONG   A2dpHzToRateMask(_In_ ULONG Hz);
 const char *A2dpCodecName(_In_ ULONG Codec);
 
 ULONG A2dpQualityAtLevel(_In_ const A2DP_CODEC_CONFIG *Base, ULONG Level, ULONG FloorBps, _Out_opt_ A2DP_CODEC_CONFIG *Result);
+
+/* SBC: largest bitpool in [SbcMinBitpool, SbcMaxBitpool] whose packet of Frames frames plus
+ * HeaderBytes fits SduBytes; 0 if even the minimum does not. */
+UCHAR A2dpSbcBitpoolForPacket(_In_ const A2DP_CODEC_CONFIG *Cfg, ULONG Frames, ULONG HeaderBytes, ULONG SduBytes);
+
+/* SBC frames per media packet at Cfg->SbcBitpool (PnSbcPacking for its frame length; the
+ * 2-DH5 rung, Cfg->SbcFitBitpool, packs for one 2-DH5 packet). The pump repacks with it at
+ * every bitpool change, so no ABR rung or live bitpool overflows the MTU and a lower rung
+ * also sends fewer packets (findings #6, #8). 0 = a frame does not fit PayloadRoom. */
+ULONG A2dpSbcFramesPerPacket(_In_ const A2DP_CODEC_CONFIG *Cfg, ULONG TargetLatencyMs, ULONG PayloadRoom, ULONG HeaderBytes, ULONG SduBytes);
+
+/* How an SBC stream starts (PumpStartStream; shared with the tests and the quality harness). */
+typedef struct _A2DP_SBC_STREAM_PLAN {
+    UCHAR   StartBitpool;      /* encoder bitpool now, and the ABR's top rung */
+    UCHAR   CeilingBitpool;    /* highest bitpool a live change may set: the negotiated maximum within the MTU */
+    UCHAR   FitBitpool;        /* ABR rung whose packets fit one 2-DH5 packet (0 = none) */
+    BOOLEAN Xq;                /* SBC XQ applies (dual channel, 8 subbands, 16 blocks) */
+    ULONG   SduBytes;          /* baseband SDU the packets are sized to (0 = the MTU only) */
+    ULONG   FramesPerPacket;   /* at StartBitpool */
+} A2DP_SBC_STREAM_PLAN;
+
+/* Cfg: the stream's configuration (SbcBitpool below SbcMaxBitpool after a live change).
+ * LocalSdu: PnBasebandSduBytes of the adapter; XqSdu: PnSbcXqSduBytes (both ends). XQ never
+ * changes the bitpool, only the packet the frames are packed to. FALSE: no frame fits. */
+BOOLEAN A2dpSbcPlanStream(_In_ const A2DP_CODEC_CONFIG *Cfg, _In_ BOOLEAN Xq, _In_ ULONG LocalSdu, _In_ ULONG XqSdu,
+                          _In_ ULONG PayloadRoom, _In_ ULONG HeaderBytes, _In_ ULONG TargetLatencyMs, _Out_ A2DP_SBC_STREAM_PLAN *Plan);

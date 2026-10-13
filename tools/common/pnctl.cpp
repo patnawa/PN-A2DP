@@ -167,7 +167,9 @@ ULONG CodecFromKey(const wchar_t *k)
 
 const wchar_t *StateName(ULONG s)
 {
-    static const wchar_t *n[] = { L"Idle", L"Connecting", L"Discovering", L"Configured", L"Open", L"Streaming", L"Suspended", L"Closing", L"Error" };
+    /* PNA2DP_STATE_DISCOVERING is reported whenever signalling is up without a configured
+     * stream, i.e. mostly a connected, idle receiver; discovery itself takes well under a second. */
+    static const wchar_t *n[] = { L"Idle", L"Connecting", L"Connected",L"Configured", L"Open", L"Streaming", L"Suspended", L"Closing", L"Error" };
     return s < 9 ? n[s] : L"?";
 }
 
@@ -223,6 +225,9 @@ std::wstring StatusFlagsText(ULONG f)
     if (f & PNA2DP_STATUS_FLAG_HOST_MISSING) add(L"codec host missing");
     if (f & PNA2DP_STATUS_FLAG_FALLBACK_SBC) add(L"SBC fallback");
     if (f & PNA2DP_STATUS_FLAG_RADIO_IN_RANGE) add(L"in range");
+    if (f & PNA2DP_STATUS_FLAG_REMOTE_SUSPENDED) add(L"suspended by receiver");
+    if (f & PNA2DP_STATUS_FLAG_UNREACHABLE) add(L"receiver unreachable");
+    if (f & PNA2DP_STATUS_FLAG_HALF_RATE) add(L"2:1 rate conversion");
     return r.empty() ? L"-" : r;
 }
 
@@ -393,7 +398,7 @@ void UseAutomaticCodecs(PNA2DP_CONFIG &c)
     c.AptxHd = defaults.AptxHd; c.AptxLl = defaults.AptxLl; c.Ldac = defaults.Ldac;
     c.Ldac.Eqmid = PNA2DP_LDAC_EQMID_HQ; // begin at highest quality; ABR handles congestion
     c.Aac.BitrateBps = 320000; c.Aac.Vbr = 0; // bounded by the receiver's advertised maximum
-    c.Flags &= ~(PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_HOST_CODECS_ONLY | PNA2DP_CFG_EXPOSE_ALL_RATES);
+    c.Flags &= ~(PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_HOST_CODECS_ONLY | PNA2DP_CFG_EXPOSE_ALL_RATES | PNA2DP_CFG_SBC_XQ);
     c.Flags |= PNA2DP_CFG_AUTO_QUALITY | PNA2DP_CFG_ABR_ENABLE | PNA2DP_CFG_APPLY_LIVE | PNA2DP_CFG_SOFTWARE_VOLUME;
 }
 
@@ -479,7 +484,7 @@ std::wstring CodecSettingsText(const PNA2DP_CONFIG &c, ULONG codec)
     case PNA2DP_CODEC_SBC:
         return L"Bitpool " + number(c.Sbc.MinBitpool ? c.Sbc.MinBitpool : 2) + L".." +
             (c.Sbc.MaxBitpool ? number(c.Sbc.MaxBitpool) : std::wstring(L"receiver max")) +
-            ((c.Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) ? L"; dual preferred" : L"; auto mode");
+            ((c.Flags & PNA2DP_CFG_SBC_XQ) ? L"; SBC XQ" : (c.Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) ? L"; dual preferred" : L"; auto mode");
     case PNA2DP_CODEC_AAC:
         return (c.Aac.BitrateBps ? number(c.Aac.BitrateBps / 1000) + L" kbps" : std::wstring(L"Receiver limit")) +
             (c.Aac.Vbr ? L"; VBR allowed" : L"; CBR");
@@ -505,7 +510,7 @@ const wchar_t *PresetName(Preset p)
     case Preset::Balanced: return L"Balanced (driver defaults)";
     case Preset::LowLatency: return L"Low latency";
     case Preset::Compatibility: return L"Compatibility (SBC only)";
-    case Preset::SbcXq: return L"SBC XQ (high bitpool, dual channel)";
+    case Preset::SbcXq: return L"SBC XQ (dual channel, radio-sized packets)";
     }
     return L"";
 }
@@ -517,7 +522,7 @@ const wchar_t *PresetDescription(Preset p)
     case Preset::Balanced: return L"LDAC 660 kbps with ABR, then aptX HD, AAC, aptX, aptX LL, SBC. 60 ms buffer.";
     case Preset::LowLatency: return L"aptX Low Latency, aptX, SBC with a 30 ms buffer and ABR; no LDAC/AAC (they buffer more).";
     case Preset::Compatibility: return L"SBC only at the sink's own limits. Use when a headset misbehaves with other codecs.";
-    case Preset::SbcXq: return L"SBC only, bitpool 47 with dual channel preferred (SBC XQ+, about 550 kbps at 44.1 kHz). Needs a sink that accepts it.";
+    case Preset::SbcXq: return L"SBC only, dual channel, 16 blocks, 8 subbands at the receiver's maximum bitpool (617 / 672 kbps at bitpool 53), packed to the radio's EDR packets.";
     }
     return L"";
 }
@@ -542,7 +547,7 @@ void ApplyPreset(PNA2DP_CONFIG &c, Preset p)
         c.Aac.BitrateBps = 320000; c.Aac.Vbr = 0;
         c.Sbc.MaxBitpool = 53; c.Sbc.AllowBitpoolOverride = 0;
         c.TargetLatencyMs = 80; c.MaxLatencyMs = 300;
-        c.Flags |= PNA2DP_CFG_ABR_ENABLE; c.Flags &= ~PNA2DP_CFG_DUAL_CHANNEL_PREFER;
+        c.Flags |= PNA2DP_CFG_ABR_ENABLE; c.Flags &= ~(PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_SBC_XQ);
         break;
     case Preset::Balanced: {
         LONG volume = c.VolumeDb16;
@@ -554,20 +559,24 @@ void ApplyPreset(PNA2DP_CONFIG &c, Preset p)
         order({ PNA2DP_CODEC_APTX_LL, PNA2DP_CODEC_APTX, PNA2DP_CODEC_SBC });
         c.TargetLatencyMs = 30; c.MaxLatencyMs = 120;
         c.Sbc.MaxBitpool = 53; c.Sbc.AllowBitpoolOverride = 0;
-        c.Flags |= PNA2DP_CFG_ABR_ENABLE; c.Flags &= ~PNA2DP_CFG_DUAL_CHANNEL_PREFER;
+        c.Flags |= PNA2DP_CFG_ABR_ENABLE; c.Flags &= ~(PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_SBC_XQ);
         break;
     case Preset::Compatibility:
         order({ PNA2DP_CODEC_SBC });
         c.Sbc = d.Sbc;
-        c.Flags &= ~(PNA2DP_CFG_AUTO_QUALITY | PNA2DP_CFG_ABR_ENABLE | PNA2DP_CFG_DUAL_CHANNEL_PREFER);
+        c.Flags &= ~(PNA2DP_CFG_AUTO_QUALITY | PNA2DP_CFG_ABR_ENABLE | PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_SBC_XQ);
         c.TargetLatencyMs = d.TargetLatencyMs; c.MaxLatencyMs = d.MaxLatencyMs;
         break;
     case Preset::SbcXq:
-        /* dual channel bitpool 47 = 551 kbps at 44.1 kHz (SBC XQ+); joint stereo would need bitpool 94 for the same rate */
+        /* The driver streams dual channel at the bitpool plain dual channel gets (the receiver's
+         * maximum within the MTU: 53 = 617 kbps at 44.1 kHz on most receivers) and packs the
+         * frames to the EDR packets both ends take. The fixed 47 / 38 points cost 11-27% of the
+         * bitrate on such receivers (known issue); joint stereo would need bitpool 106 for it. */
         order({ PNA2DP_CODEC_SBC });
-        c.Sbc.MaxBitpool = 47; c.Sbc.MinBitpool = 2; c.Sbc.AllowBitpoolOverride = 1;
+        c.Sbc = d.Sbc;
+        c.Sbc.MaxBitpool = 0; c.Sbc.AllowBitpoolOverride = 0;
         c.Sbc.BlockMask = PNA2DP_SBC_BLOCKS_16; c.Sbc.SubbandMask = PNA2DP_SBC_SUBBANDS_8;
-        c.Flags |= PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_ABR_ENABLE;
+        c.Flags |= PNA2DP_CFG_SBC_XQ | PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_ABR_ENABLE;
         c.TargetLatencyMs = d.TargetLatencyMs; c.MaxLatencyMs = d.MaxLatencyMs;
         break;
     }
@@ -667,6 +676,7 @@ std::wstring ConfigToText(const PNA2DP_CONFIG &c)
     AppendLine(out, L"sbc.minbitpool=%u", c.Sbc.MinBitpool);
     AppendLine(out, L"sbc.override=%u", c.Sbc.AllowBitpoolOverride);
     AppendLine(out, L"sbc.dual=%u", (c.Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) ? 1 : 0);
+    AppendLine(out, L"sbc.xq=%u", (c.Flags & PNA2DP_CFG_SBC_XQ) ? 1 : 0);
     AppendLine(out, L"aac.bitrate=%u", c.Aac.BitrateBps);
     AppendLine(out, L"aac.vbr=%u", c.Aac.Vbr);
     AppendLine(out, L"ldac.quality=%s", c.Ldac.Eqmid == 0 ? L"hq" : c.Ldac.Eqmid == 1 ? L"sq" : c.Ldac.Eqmid == 2 ? L"mq" : L"abr");
@@ -791,6 +801,7 @@ bool ConfigFromText(const std::wstring &text, PNA2DP_CONFIG &c)
         else if (k == L"sbc.minbitpool") setU8(n.Sbc.MinBitpool, 250);
         else if (k == L"sbc.override") setU8(n.Sbc.AllowBitpoolOverride, 1);
         else if (k == L"sbc.dual") flag(PNA2DP_CFG_DUAL_CHANNEL_PREFER);
+        else if (k == L"sbc.xq") flag(PNA2DP_CFG_SBC_XQ);
         else if (k == L"aac.bitrate") { if (isNum) n.Aac.BitrateBps = num; }
         else if (k == L"aac.vbr") setU8(n.Aac.Vbr, 1);
         else if (k == L"ldac.quality") { if (vl == L"hq") n.Ldac.Eqmid = 0; else if (vl == L"sq") n.Ldac.Eqmid = 1; else if (vl == L"mq") n.Ldac.Eqmid = 2; else if (vl == L"abr") n.Ldac.Eqmid = PNA2DP_LDAC_EQMID_ABR; }

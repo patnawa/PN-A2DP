@@ -12,7 +12,7 @@ Signature   = "$Windows NT$"
 Class       = MEDIA
 ClassGUID   = {4d36e96c-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
-DriverVer   = 10/12/2026,0.1.0.18
+DriverVer   = 10/13/2026,0.1.0.21
 CatalogFile = pna2dp.cat
 PnpLockDown = 1
 
@@ -56,11 +56,17 @@ pna2dp.sys,,,0x100
 [PnA2dp_AddReg]
 HKR,,Driver,,pna2dp.sys
 
+; No [*.Wdf] KmdfService section on purpose. The driver is a PortCls adapter that uses
+; KMDF only in miniport mode (WdfDriverInitNoDispatchOverride + WdfDeviceMiniportCreate),
+; a case the WDF INF documentation does not cover. KMDF 1.31 is in-box on every OS this
+; INF accepts (19041+) and the framework is bound from the binary (wdfdriverentry.lib),
+; not from the INF. InfVerif /w accepts the INF either way; add the section only after an
+; install test on hardware (build.ps1 already runs stampinf -k to stamp its version).
 [PnA2dp_Win10.Services]
-AddService = pna2dp, 0x00000002, PnA2dp_ServiceInstall
+AddService = pna2dp, 0x00000002, PnA2dp_ServiceInstall, PnA2dp_EventLog
 
 [PnA2dp_Win11.Services]
-AddService = pna2dp, 0x00000002, PnA2dp_ServiceInstall
+AddService = pna2dp, 0x00000002, PnA2dp_ServiceInstall, PnA2dp_EventLog
 
 [PnA2dp_ServiceInstall]
 DisplayName    = %PnA2dp.ServiceDesc%
@@ -70,8 +76,19 @@ ErrorControl   = 1       ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %13%\pna2dp.sys
 AddReg         = PnA2dp_ServiceInstall_AddReg
 
+; DebugLevel: debugger output up to 1 error, 2 warning, 3 info, 4 verbose. The trace ring
+; (pna2dpctl trace) keeps information messages at 2; ETW provider PnA2dp.Driver is separate.
 [PnA2dp_ServiceInstall_AddReg]
-HKR, Parameters, DebugLevel, %REG_DWORD%, 3
+HKR, Parameters, DebugLevel, %REG_DWORD%, 2
+
+; System event-log source "pna2dp" (load refused by the crash guard, load and start
+; failures). The driver logs standard IO_ERR_* codes, whose messages are in IoLogMsg.dll.
+[PnA2dp_EventLog]
+AddReg = PnA2dp_EventLog_AddReg
+
+[PnA2dp_EventLog_AddReg]
+HKR,, EventMessageFile, %REG_EXPAND_SZ%, "%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,, TypesSupported,   %REG_DWORD%, 7
 
 ;---------------------------------------------------------------------------
 ; KS interfaces (audio endpoint)
@@ -172,4 +189,5 @@ WMALFXGFXAPO_Context    = "{b13412ee-07af-4c57-b08b-e327f8db085b}"
 AUDIO_SIGNALPROCESSINGMODE_DEFAULT = "{c18e2f7e-933d-4965-b7d1-1eef228d2af3}"
 
 REG_DWORD               = 0x00010001
+REG_EXPAND_SZ           = 0x00020000
 REG_MULTI_SZ            = 0x00010000

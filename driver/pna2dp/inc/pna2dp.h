@@ -13,7 +13,7 @@
  */
 #pragma once
 
-#define PNA2DP_DRIVER_VERSION   0x00010012u   /* 0.1.0.18 */
+#define PNA2DP_DRIVER_VERSION   0x00010015u   /* 0.1.0.21 */
 
 #ifdef PN_DEFINE_GUIDS
 #include <initguid.h>      /* driver.cpp defines every GUID exactly once */
@@ -38,11 +38,13 @@
 #include "pna2dp_public.h"
 
 /* C++ allocation operators (implemented in driver.cpp; stdunk.h's inline versions are disabled
- * by _NEW_DELETE_OPERATORS_). */
+ * by _NEW_DELETE_OPERATORS_). POOL_FLAGS is a 64-bit integer like size_t, so a
+ * (void *, POOL_FLAGS) delete would silently be the C++14 sized delete: the sized delete
+ * is declared explicitly instead (the unsized operator delete(void *) is in stdunk.lib). */
 void *__cdecl operator new(size_t Size, POOL_FLAGS PoolFlags, ULONG Tag);
 void *__cdecl operator new(size_t Size, POOL_FLAGS PoolFlags);
-void __cdecl operator delete(void *p, POOL_FLAGS, ULONG);
-void __cdecl operator delete(void *p, POOL_FLAGS);
+void __cdecl operator delete(void *p, POOL_FLAGS, ULONG);   /* placement form of new(size, flags, tag) */
+void __cdecl operator delete(void *p, size_t Size) noexcept;
 
 /* ------------------------------------------------------------------------- */
 /* Pool tags                                                                  */
@@ -59,12 +61,19 @@ void __cdecl operator delete(void *p, POOL_FLAGS);
 #define PNA2DP_TAG_GENERIC  'nGnP'
 
 /* ------------------------------------------------------------------------- */
-/* Tracing: DbgPrintEx with a runtime level (registry "DebugLevel")           */
+/* Tracing (trace.cpp). Each message goes to up to three sinks:                */
+/*  - the bounded ring read by IOCTL_PNA2DP_GET_TRACE: errors, warnings and    */
+/*    information always, verbose when DebugLevel >= 4;                        */
+/*  - DbgPrintEx(DPFLTR_IHVAUDIO_ID) at the matching DPFLTR_ERROR/WARNING/      */
+/*    INFO/TRACE level, up to registry "DebugLevel" (INF default 2, warnings); */
+/*  - the TraceLogging provider "PnA2dp.Driver" at the matching ETW level.     */
 /* ------------------------------------------------------------------------- */
 extern ULONG g_PnDebugLevel;    /* 0 none, 1 error, 2 warning, 3 info, 4 verbose */
-VOID PnTraceInitialize();
+VOID PnTraceInitialize(_In_ PDRIVER_OBJECT DriverObject);
+VOID PnTraceUninitialize(void);
 VOID PnTraceWrite(ULONG Level, PCSTR Format, ...);
 VOID PnTraceRead(PNA2DP_TRACE *Trace);
+BOOLEAN PnTraceEtwEnabled(_In_ ULONG Level);
 NTSTATUS PnPortDispatchIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 
 #define PN_LEVEL_ERROR   1
@@ -73,14 +82,25 @@ NTSTATUS PnPortDispatchIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 #define PN_LEVEL_VERBOSE 4
 
 #define PN_TRACE(level, fmt, ...) \
-    do { if (g_PnDebugLevel >= (level)) { \
-        PnTraceWrite((level), fmt, __VA_ARGS__); \
-        DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL, "pna2dp: " fmt "\n", __VA_ARGS__); } } while (0)
+    do { if ((level) <= PN_LEVEL_INFO || g_PnDebugLevel >= (level) || PnTraceEtwEnabled(level)) \
+        PnTraceWrite((level), fmt, __VA_ARGS__); } while (0)
 
 #define PN_ERR(fmt, ...)   PN_TRACE(PN_LEVEL_ERROR,   "[E] " fmt, __VA_ARGS__)
 #define PN_WARN(fmt, ...)  PN_TRACE(PN_LEVEL_WARN,    "[W] " fmt, __VA_ARGS__)
 #define PN_INFO(fmt, ...)  PN_TRACE(PN_LEVEL_INFO,    "[I] " fmt, __VA_ARGS__)
 #define PN_VERB(fmt, ...)  PN_TRACE(PN_LEVEL_VERBOSE, "[V] " fmt, __VA_ARGS__)
+
+/* System event log (contract C9; <= DISPATCH_LEVEL). Codes are the standard ntiologc.h
+ * IO_ERR_* values whose messages are in IoLogMsg.dll (registered by the INF); %1 in the
+ * message is the device or driver name. UniqueValue is stored as the entry's
+ * UniqueErrorValue and first dump word. A NULL DeviceObject logs against the driver. */
+VOID PnLogDeviceEvent(_In_opt_ PDEVICE_OBJECT DeviceObject, _In_ NTSTATUS Code, _In_ ULONG UniqueValue);
+#define PN_EVENT_CRASH_GUARD    IO_ERR_CONFIGURATION_ERROR  /* load refused; UniqueValue = unclean starts */
+#define PN_EVENT_LOAD_FAILED    IO_ERR_INTERNAL_ERROR       /* DriverEntry failed; UniqueValue = NTSTATUS */
+#define PN_EVENT_START_FAILED   IO_ERR_INTERNAL_ERROR       /* device start failed; UniqueValue = NTSTATUS */
+#define PN_EVENT_CODEC_HOST     IO_ERR_LAYERED_FAILURE      /* codec host fallback or quarantine; UniqueValue below */
+#define PN_EVENT_CODEC_HOST_QUARANTINE  0x00010000u   /* | quarantine number: the host failed repeatedly */
+#define PN_EVENT_CODEC_HOST_FALLBACK    0x00020000u   /* | PNA2DP_CODEC_*: its encoder vanished, renegotiating */
 
 #define PN_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define PN_MAX(a, b) ((a) > (b) ? (a) : (b))

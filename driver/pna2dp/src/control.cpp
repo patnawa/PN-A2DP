@@ -2,13 +2,64 @@
  * control.cpp - private control interface dispatch (create/cleanup/close/ioctl).
  * SPDX-License-Identifier: MIT
  */
+#include <ntifs.h>      /* token queries for the per-handle caller role */
 #include "pna2dp.h"
+#include "control_access.h"
 
-#define PN_CTL_FILE_MAGIC   ((PVOID)(ULONG_PTR)0x50414332u)   /* 'PAC2' */
+/* FsContext2 of a control handle: 'PAC' tag with the caller's PN_CTL_ROLE_* in the low byte.
+ * No kernel pointer (KS object headers) can take one of these values. */
+#define PN_CTL_FILE_MAGIC   0x50414300u
+#define PN_CTL_FILE_TAG(role) ((PVOID)(ULONG_PTR)(PN_CTL_FILE_MAGIC | (role)))
 
 BOOLEAN ControlIsOurFile(_In_ PFILE_OBJECT File)
 {
-    return File && File->FsContext2 == PN_CTL_FILE_MAGIC;
+    if (!File) return FALSE;
+    ULONG_PTR v = (ULONG_PTR)File->FsContext2;
+    return (v & ~(ULONG_PTR)0xFF) == PN_CTL_FILE_MAGIC && (v & 0xFF) <= PN_CTL_ROLE_SYSTEM;
+}
+
+static ULONG ControlFileRole(_In_ PFILE_OBJECT File)
+{
+    return (ULONG)((ULONG_PTR)File->FsContext2 & 0xFF);
+}
+
+/* S-1-5-18 and S-1-5-32-544, laid out as SIDs (SID declares one sub-authority). */
+static const SID g_PnLocalSystemSid = { SID_REVISION, 1, SECURITY_NT_AUTHORITY, { SECURITY_LOCAL_SYSTEM_RID } };
+static const struct { UCHAR Revision, SubAuthorityCount; SID_IDENTIFIER_AUTHORITY IdentifierAuthority; ULONG SubAuthority[2]; }
+    g_PnAdminsSid = { SID_REVISION, 2, SECURITY_NT_AUTHORITY, { SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS } };
+
+/* Role of the token that opens a control handle (the impersonation token when the caller
+ * impersonates). Any query failure yields the least-privileged role. */
+static ULONG ControlCallerRole(_In_ PIO_STACK_LOCATION Sp)
+{
+    PAGED_CODE();
+    PIO_SECURITY_CONTEXT sc = Sp->Parameters.Create.SecurityContext;
+    if (!sc || !sc->AccessState) return PN_CTL_ROLE_USER;
+    PSECURITY_SUBJECT_CONTEXT subject = &sc->AccessState->SubjectSecurityContext;
+    BOOLEAN system = FALSE, admins = FALSE;
+    ULONG adminsAttributes = 0;
+    SeLockSubjectContext(subject);
+    PACCESS_TOKEN token = SeQuerySubjectContextToken(subject);
+    if (token) {
+        PTOKEN_USER user = NULL;
+        if (NT_SUCCESS(SeQueryInformationToken(token, TokenUser, (PVOID *)&user)) && user) {
+            system = RtlEqualSid(user->User.Sid, (PSID)&g_PnLocalSystemSid);
+            ExFreePool(user);
+        }
+        PTOKEN_GROUPS groups = NULL;
+        if (!system && NT_SUCCESS(SeQueryInformationToken(token, TokenGroups, (PVOID *)&groups)) && groups) {
+            for (ULONG i = 0; i < groups->GroupCount; ++i) {
+                if (RtlEqualSid(groups->Groups[i].Sid, (PSID)&g_PnAdminsSid)) {
+                    admins = TRUE;
+                    adminsAttributes = groups->Groups[i].Attributes;
+                    break;
+                }
+            }
+            ExFreePool(groups);
+        }
+    }
+    SeUnlockSubjectContext(subject);
+    return PnControlRoleFromToken(system, admins, adminsAttributes);
 }
 
 NTSTATUS ControlRegisterInterface(_Inout_ PPNA2DP_DEVICE D)
@@ -29,7 +80,8 @@ VOID ControlUnregisterInterface(_Inout_ PPNA2DP_DEVICE D)
 {
     PAGED_CODE();
     if (D->InterfaceRegistered) {
-        IoSetDeviceInterfaceState(&D->InterfaceSymlink, FALSE);
+        NTSTATUS status = IoSetDeviceInterfaceState(&D->InterfaceSymlink, FALSE);
+        if (!NT_SUCCESS(status)) PN_WARN("IoSetDeviceInterfaceState(FALSE) failed 0x%08x", status);
         RtlFreeUnicodeString(&D->InterfaceSymlink);
         D->InterfaceRegistered = FALSE;
     }
@@ -64,8 +116,10 @@ NTSTATUS ControlDispatchCreate(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Ir
     PPNA2DP_DEVICE D = DeviceReferenceFromFdo(DeviceObject);
     if (!D) return CompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
-    sp->FileObject->FsContext2 = PN_CTL_FILE_MAGIC;
+    ULONG role = ControlCallerRole(sp);
+    sp->FileObject->FsContext2 = PN_CTL_FILE_TAG(role);
     sp->FileObject->FsContext = D;
+    PN_VERB("control handle opened by pid %u, role %u", IoGetRequestorProcessId(Irp), role);
     InterlockedIncrement(&D->OpenHandles);
     return CompleteIrp(Irp, STATUS_SUCCESS, FILE_OPENED);
 }
@@ -100,6 +154,17 @@ NTSTATUS ControlDispatchClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp
     return CompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
+/* Every other major PortCls installed (READ, WRITE, FLUSH_BUFFERS, QUERY/SET_SECURITY ...;
+ * driver.cpp): a control handle is no KS object, and KS would read its FsContext as an
+ * object header and dispatch through it. Such requests on a control handle are invalid
+ * (review round 4 #6); everything else goes to PortCls unchanged. Not paged. */
+NTSTATUS ControlDispatchOther(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+    if (!ControlIsOurFile(sp->FileObject)) return PnPortDispatchIrp(DeviceObject, Irp);
+    return CompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
+}
+
 static NTSTATUS ControlDeviceControl(_In_ PPNA2DP_DEVICE D, _Inout_ PIRP Irp);
 
 NTSTATUS ControlDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
@@ -129,6 +194,11 @@ static NTSTATUS ControlDeviceControl(_In_ PPNA2DP_DEVICE D, _Inout_ PIRP Irp)
     ULONG_PTR info = 0;
 
     if (METHOD_FROM_CTL_CODE(code) != METHOD_BUFFERED) return CompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
+    /* Caller role captured at open (see control_access.h for which role may do what). */
+    if (!PnControlRoleAllows(ControlFileRole(sp->FileObject), code)) {
+        PN_VERB("control request 0x%08x denied for role %u", code, ControlFileRole(sp->FileObject));
+        return CompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+    }
 
     switch (code) {
     case IOCTL_PNA2DP_SBC_SAMPLE: {
@@ -222,6 +292,10 @@ static NTSTATUS ControlDeviceControl(_In_ PPNA2DP_DEVICE D, _Inout_ PIRP Irp)
 
     case IOCTL_PNA2DP_CODEC_REGISTER:
         if (inLen < sizeof(PNA2DP_CODEC_REGISTER)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        if (!PnControlCodecHostPidValid(((const PNA2DP_CODEC_REGISTER *)buf)->HostPid, IoGetRequestorProcessId(Irp))) {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
         status = CodecHostRegister(&D->Host, sp->FileObject, (const PNA2DP_CODEC_REGISTER *)buf);
         break;
     case IOCTL_PNA2DP_CODEC_UNREGISTER:

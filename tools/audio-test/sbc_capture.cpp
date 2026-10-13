@@ -31,7 +31,11 @@ int main(int argc, char **argv)
         DeviceIoControl(h, IOCTL_PNA2DP_SBC_SAMPLE, &action, sizeof(action), nullptr, 0, &got, nullptr);
     }
     CloseHandle(h);
-    if (!ok) { printf("Capture failed: %lu\n", error); return 1; }
+    if (!ok) {
+        printf("Capture failed: %lu\n", error);
+        if (error == ERROR_ACCESS_DENIED) printf("SBC capture requires an elevated (administrator) prompt\n");
+        return 1;
+    }
     if (got != sizeof(*sample) || sample->Size != sizeof(*sample) || !sample->PcmBytes || !sample->SbcBytes ||
         sample->PcmBytes > sizeof(sample->Pcm) || sample->SbcBytes > sizeof(sample->Sbc) ||
         !sample->Channels || sample->Channels > 2 || sample->PcmBytes % (sample->Channels * 2)) return 1;
