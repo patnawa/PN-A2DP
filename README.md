@@ -13,9 +13,10 @@ adaptive quality, and diagnostics you can understand.
 
 </div>
 
-![PN-A2DP Quality dashboard showing an active Sony SBC stream, a 60-second bitrate graph, and audio health checks](docs/images/quality-dashboard.jpg)
+![PN-A2DP Quality dashboard showing an EDIFIER MR5 streaming LDAC at 990 kbps, a 60-second bitrate graph, and audio health checks](docs/images/quality-dashboard.jpg)
 
-*Actual control panel v0.1.0.27 on Windows 11, streaming to a Sony CMT-SBT40D.
+*Actual control panel v0.1.0.34 (driver 0.1.0.21) on Windows 11, streaming LDAC at 990 kbps
+to an EDIFIER MR5: 11,208 packets in 60 seconds with no drops, write failures or latency trims.
 The dashboard reports observed transport health; it does not measure acoustic quality.*
 
 ## What you can do
@@ -47,6 +48,13 @@ The dashboard reports observed transport health; it does not measure acoustic qu
 | Automatic quality management | Managed by Windows | Receiver-aware policy for supported variable-rate codecs |
 | Custom kernel driver required | No | Yes |
 | Current installation path | Application-only installer or portable panel | Development package on a prepared test machine |
+
+**Windows mode or Test Mode?** Windows mode keeps Microsoft's Bluetooth driver and
+changes nothing about how Windows starts. PN driver mode loads PN-A2DP's own kernel
+driver, which is signed only with a development certificate today, so Windows loads
+it only in **Test Mode**, a boot setting for development-signed drivers. You choose
+per speaker; switch speakers back to Windows mode *before* turning Test Mode off. See
+[Windows mode and Test Mode explained](docs/19-windows-mode-and-test-mode.md).
 
 **Start with Windows mode** for device controls and diagnostics without installing
 a custom driver. It needs no Test Mode, driver certificate, or Microsoft developer
@@ -185,6 +193,7 @@ docs/              Architecture, installation, and validation notes
 | Guide | Contents |
 |---|---|
 | [Audio diagnostics](docs/14-audio-diagnostics.md) | Check my audio, live quality, export contents, and privacy |
+| [Windows mode and Test Mode explained](docs/19-windows-mode-and-test-mode.md) | Plain-language comparison, which to choose, turning Test Mode on and off safely, Thai summary |
 | [Windows mode](docs/13-windows-mode.md) | Standard driver controls, switching, and boot-mode readiness |
 | [Automatic quality](docs/10-adapter-quality.md) | Adapter detection, congestion response, and recovery |
 | [Control panel and installer](docs/07-control-panel-and-installer.md) | Device controls, configuration, and installation behavior |

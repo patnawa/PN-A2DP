@@ -10,6 +10,10 @@ for Program Files and shortcuts; the panel's normal audio controls do not.
 The unsigned application may still show a Windows publisher/reputation prompt.
 This is separate from kernel driver signing.
 
+For a plain-language comparison of Windows mode and PN driver mode, and the safe
+order for turning Test Mode on and off, see
+[Windows mode and Test Mode explained](19-windows-mode-and-test-mode.md).
+
 The installer preserves existing device driver assignments. If upgrading from
 the PN-A2DP driver, select the device, open **Driver**, and choose **Use Windows
 mode**. This changes only that device and preserves its PN-A2DP codec preferences.

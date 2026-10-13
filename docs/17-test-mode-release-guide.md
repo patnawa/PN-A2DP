@@ -19,6 +19,8 @@ preserves existing driver assignments. If a device already uses PN, select
 
 Windows mode provides output controls and diagnostics. Windows manages its codecs;
 PN codec selection and Bluetooth bitrate telemetry need the custom driver.
+New to Test Mode? Read [Windows mode and Test Mode explained](19-windows-mode-and-test-mode.md)
+first; it covers what Test Mode changes and which mode to choose.
 
 ## Verify the download
 
@@ -138,7 +140,8 @@ loading of this development driver.
    trouble and sufficient fresh observations.
 
 Setup changes neither boot policy nor firmware settings and does not reboot the
-computer. Existing codec settings are retained on upgrade. A new Windows audio
+computer on its own; the Finish page offers an optional, unticked "Restart the
+computer now" box. Existing codec settings are retained on upgrade. A new Windows audio
 endpoint ID can be assigned during installation; reselect the named receiver if
 an application was pinned to its old endpoint.
 
@@ -222,6 +225,8 @@ are included; those do not establish patent clearance or product certification.
 
 ## ภาษาไทยแบบย่อ
 
+- อ่านคำอธิบายแบบเข้าใจง่ายว่า Windows mode กับ Test Mode ต่างกันอย่างไรได้ที่
+  [Windows mode and Test Mode explained](19-windows-mode-and-test-mode.md#สรุปภาษาไทย)
 - ถ้าไม่ต้องการ Test Mode ให้ใช้ไฟล์ **windows-setup.exe**; Windows จะเป็นผู้เลือก codec
 - ไฟล์ **testmode-setup.exe** เป็นไดรเวอร์ทดลอง ต้องเตรียม Test Mode ON, Secure Boot OFF
   และ Memory Integrity OFF ตามข้อกำหนดของรุ่นนี้ แล้วรีสตาร์ตและตรวจสถานะก่อนติดตั้ง
