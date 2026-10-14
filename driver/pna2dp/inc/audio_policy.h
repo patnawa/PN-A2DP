@@ -2,6 +2,23 @@
  * SPDX-License-Identifier: MIT */
 #pragma once
 
+/* ---- Sample-rate conversion in the pump (0.1.0.22 #1, pcm.h PnPcmRatePlan) -----------------
+ * What the pump bridges between the Windows engine (WaveRT) rate and the codec rate. */
+#define PN_RATECONV_NONE   0u   /* equal rates only */
+#define PN_RATECONV_HALF   1u   /* C8: also exactly 2:1, 96 -> 48 and 88.2 -> 44.1 kHz (0.1.0.21) */
+#define PN_RATECONV_ANY    2u   /* #1: also 44.1 <-> 48 kHz and 88.2 / 96 kHz to the other family */
+
+/* TRUE when Level bridges an engine at Engine Hz to a codec at Codec Hz. At PN_RATECONV_ANY it
+ * is exactly the set PnPcmRatePlan converts (core_test checks every pair of A2DP rates). */
+static inline BOOLEAN PnRateConvertible(ULONG Engine, ULONG Codec, ULONG Level)
+{
+    if (!Engine || !Codec) return FALSE;
+    if (Engine == Codec) return TRUE;
+    if (Level >= PN_RATECONV_HALF && ((Engine == 96000 && Codec == 48000) || (Engine == 88200 && Codec == 44100))) return TRUE;
+    return Level >= PN_RATECONV_ANY && (Engine == 44100 || Engine == 48000 || Engine == 88200 || Engine == 96000) &&
+           (Codec == 44100 || Codec == 48000);
+}
+
 /* Stream format reconciliation must leave in-band bitrate adaptation alone. */
 static inline BOOLEAN PnStreamFormatNeedsUpdate(ULONG Codec, ULONG CurrentRate,
     ULONG CurrentMode, ULONG SelectedRate, ULONG SelectedMode)
@@ -424,6 +441,40 @@ static inline BOOLEAN PnPcmWriteShouldWake(ULONG AvailBefore, ULONG Length, ULON
         (AvailBefore < BlockBytes && (ULONGLONG)AvailBefore + Length >= BlockBytes);
 }
 
+/* ---- End of the PCM at a pause or end of stream (PumpFinishStream, findings #15/#26) -------
+ * The PCM waiting for a whole encoder block is padded with silence up to whole blocks of
+ * BlockBytes (the wake level: the most one block takes), plus ExtraBlocks blocks:
+ *   - the codec's flush, as at equal rates: Base blocks drain what the encoder holds (its delay,
+ *     encode + decode: SBC 73 codec frames (37 with 4 subbands), aptX 90, LDAC within its block;
+ *     FDK AAC ~1600 frames: 2 blocks);
+ *   - with a rate converter (DelayEngineFrames != 0), as many more as its delay and a short block
+ *     need: its blocks take up to BlockFrames - 1 frames less than the padding's unit
+ *     (PnPcmMaxInputFrames), so the pump can stop up to BlockFrames - 1 short of the padding's end,
+ *     and the converter holds DelayEngineFrames of what it took.
+ * With Extra = Base + ceil((DelayEngineFrames + BlockFrames - 1) / BlockFrames) the pump takes at
+ * least rendered + DelayEngineFrames + Base * BlockFrames: every rendered frame leaves the
+ * converter and the encoder gets at least the equal-rate flush after it, at any backlog, residual
+ * and converter phase (core_test TestRateConverterPauseDrain sweeps them). Fewer blocks left the
+ * sound ending mid-fade, its rest coming out after the resume (0.1.0.22 #1 with one block for a
+ * polyphase stage; with the alias-free filters' longer delays, the encoder's last ~0.7 ms of the
+ * fade, review of 0.1.0.22 #1). BlockFrames 0 (unknown): the codec's flush only. Within RoomBytes,
+ * in whole blocks. */
+static inline ULONG PnFinishExtraBlocks(ULONG Codec, ULONG BlockFrames, ULONG DelayEngineFrames)
+{
+    ULONG base = Codec == PNA2DP_CODEC_AAC ? 2u : 1u;
+    if (!BlockFrames || !DelayEngineFrames) return base;
+    return base + (ULONG)(((ULONGLONG)DelayEngineFrames + 2ull * BlockFrames - 2) / BlockFrames);
+}
+
+static inline ULONG PnFinishPadBytes(ULONG AvailBytes, ULONG BlockBytes, ULONG ExtraBlocks, ULONG RoomBytes)
+{
+    if (!BlockBytes) return 0;
+    ULONG residual = AvailBytes % BlockBytes;
+    ULONGLONG pad = (ULONGLONG)(residual ? BlockBytes - residual : 0) + (ULONGLONG)ExtraBlocks * BlockBytes;
+    if (pad > RoomBytes) pad = RoomBytes - RoomBytes % BlockBytes;
+    return (ULONG)pad;
+}
+
 /* ---- Pipeline latency (contract C3) --------------------------------------------
  * PCM still in the ring (at the engine rate) plus PCM held further down the pipeline
  * (at the codec rate: at the codec host, in encoded results, in L2CAP writes) plus the
@@ -488,18 +539,40 @@ typedef struct _PN_ABR_SAMPLE {
     ULONGLONG DeliveredBits;
     ULONGLONG BusyUs;
     ULONG     Stalls;           /* completed writes held by a stall: not in DeliveredBits / BusyUs */
+    /* latency profiles (0.1.0.22): the buffer the profile keeps absorbs a hiccup */
+    ULONG     SoftGateUs;       /* PnAbrSoftGateUs of the effective target; 0 = the 0.1.0.21 rules */
+    ULONG     RingStartUs;      /* ring latency at the start and the end of the window */
+    ULONG     RingEndUs;
 } PN_ABR_SAMPLE;
 
-/* PNA2DP_QUALITY_REASON_* bits for the link congestion seen in S; 0 = healthy. */
+/* A backlog shrinking at least this much within one window is draining: the link has spare
+ * capacity again and the backlog is the remainder of a hiccup, not congestion. */
+#define PN_ABR_DRAIN_US 10000u
+
+/* The backlog (ring, while the TX queue is full) a SLOW reason needs before it counts with a
+ * larger buffer. 0 = always: a target of 60 ms or less (Balanced, Low latency) keeps the
+ * 0.1.0.21 rules exactly. Music (150 ms): 90 ms. */
+static inline ULONG PnAbrSoftGateUs(ULONG EffTargetMs)
+{
+    return EffTargetMs > 60 ? (EffTargetMs - 60) * 1000u : 0;
+}
+
+/* PNA2DP_QUALITY_REASON_* bits for the link congestion seen in S; 0 = healthy. With a soft
+ * gate (a buffer above 60 ms) the buffer is allowed to do its job: slow writes and a link
+ * below real time count only once the backlog passes the gate, and a backlog the link is
+ * draining (no trim in the window) is no reason at all. Failures and drops always count. */
 static inline ULONG PnAbrReasons(const PN_ABR_SAMPLE *S)
 {
     ULONG r = 0;
     if (S->Failed) r |= PNA2DP_QUALITY_REASON_FAILED;
     if (S->Pressure) r |= PNA2DP_QUALITY_REASON_PRESSURE;
-    if (S->QueueFull && S->BacklogPeakUs > S->TargetLatencyUs) r |= PNA2DP_QUALITY_REASON_BACKLOG;
-    if (S->Slow >= 2 && (ULONGLONG)S->Slow * 10 >= S->Completed) r |= PNA2DP_QUALITY_REASON_SLOW;
+    BOOLEAN tolerant = S->SoftGateUs != 0;
+    BOOLEAN draining = tolerant && !S->Trims && (ULONGLONG)S->RingEndUs + PN_ABR_DRAIN_US <= S->RingStartUs;
+    if (S->QueueFull && S->BacklogPeakUs > S->TargetLatencyUs && !draining) r |= PNA2DP_QUALITY_REASON_BACKLOG;
+    BOOLEAN soft = !tolerant || (S->QueueFull && S->BacklogPeakUs > S->SoftGateUs && !draining);
+    if (soft && S->Slow >= 2 && (ULONGLONG)S->Slow * 10 >= S->Completed) r |= PNA2DP_QUALITY_REASON_SLOW;
     /* the queue was full and the link delivered less than 90% of real time */
-    if (S->QueueFull && S->ElapsedMs >= 200 && S->DeliveredMediaUs * 10 < (ULONGLONG)S->ElapsedMs * 9000) r |= PNA2DP_QUALITY_REASON_SLOW;
+    if (soft && S->QueueFull && S->ElapsedMs >= 200 && S->DeliveredMediaUs * 10 < (ULONGLONG)S->ElapsedMs * 9000) r |= PNA2DP_QUALITY_REASON_SLOW;
     return r;
 }
 
@@ -612,6 +685,15 @@ static inline ULONG PnSduSlots(ULONG MaxSdu, ULONG Bytes)
         slots += 2u * j + 2u;
     }
     return slots;
+}
+
+/* The latency target SBC packing uses (PnSbcPacking, A2dpSbcPlanStream): the configured target
+ * up to 80 ms, the largest value shipped before the latency profiles. A Music buffer does not
+ * make 50 ms packets, of which one lost packet would cost 50 ms of audio. */
+#define PN_SBC_PACKING_MAX_TARGET_MS 80u
+static inline ULONG PnSbcPackingTargetMs(ULONG TargetLatencyMs)
+{
+    return TargetLatencyMs < PN_SBC_PACKING_MAX_TARGET_MS ? TargetLatencyMs : PN_SBC_PACKING_MAX_TARGET_MS;
 }
 
 /* SBC frames per media packet: fill the MTU, stay under ~Target/3 ms per packet and 15

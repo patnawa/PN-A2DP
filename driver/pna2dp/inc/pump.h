@@ -7,32 +7,35 @@
  *                                                         --> RTP packetiser --> L2CAP media channel
  *
  * The WaveRT side is the clock. The pump drains whatever PCM is available, converts it to
- * the encoder's input format (2:1 half-band decimation when the engine runs at twice the
- * codec rate; ring, trims and PcmFramesConsumed stay in engine frames), encodes, and
- * keeps a bounded number of L2CAP writes in flight. A latency guard drops PCM (with a
+ * the encoder's input format and, when the engine rate is not the codec rate, to the codec
+ * rate (pcm.h: a 2:1 decimation FIR and / or a polyphase stage, 44.1 / 48 / 88.2 / 96 kHz to
+ * 44.1 / 48 kHz; ring, trims and PcmFramesConsumed stay in engine frames, RTP time in codec
+ * frames), encodes, and keeps a bounded number of L2CAP writes in flight. A latency guard drops PCM (with a
  * short crossfade) when the ring exceeds MaxLatencyMs; the adaptive bitrate controller
  * (ABR) watches each write's own send time, the media time the link delivers and the TX
- * queue (audio_policy.h).
+ * queue (audio_policy.h), and with a larger latency target (the Music profile,
+ * config_policy.h) lets the ring absorb a hiccup before it lowers the bitrate.
  *
  * SPDX-License-Identifier: MIT
  */
 #pragma once
 #include "audio_policy.h"
+#include "config_policy.h"
 #include "pcm.h"
 
 #define PN_PUMP_RING_MS            600     /* PCM ring capacity */
 #define PN_PUMP_MAX_PACKET         2048    /* staging buffer per RTP packet */
-#define PN_PUMP_MAX_PCM_BLOCK      32768   /* ring bytes handed to an encoder at once (15 SBC frames from 96 kHz S32) */
+#define PN_PUMP_MAX_PCM_BLOCK      32768   /* ring bytes handed to an encoder at once (15 SBC frames from 96 kHz S32 at 2:1; 14 to 44.1 kHz) */
 #define PN_PUMP_HOST_WINDOW        4       /* outstanding encode blocks at the host (<= PN_HOST_LEDGER_SLOTS) */
 #define PN_PUMP_HOST_TIMEOUT_MS    200     /* an unanswered request is written off after this */
 #define PN_PUMP_HOST_BLOCKS        (2 * PN_PUMP_HOST_WINDOW)   /* preallocated result blocks */
-#define PN_PUMP_DEFAULT_TARGET_MS  60
-#define PN_PUMP_DEFAULT_MAX_MS     250
+#define PN_PUMP_DEFAULT_TARGET_MS  PN_LATENCY_BALANCED_TARGET_MS   /* the Balanced profile (config_policy.h) */
+#define PN_PUMP_DEFAULT_MAX_MS     PN_LATENCY_BALANCED_MAX_MS
 #define PN_PUMP_TICK_MS            4       /* safety tick while streaming (latency guard, host watchdog); work
                                               * is event driven. bthlink frees the write slot before it reports
                                               * the completion (T14), so this could grow; kept until heard on hardware */
 #define PN_PUMP_FADE_BYTES         8192    /* outgoing side of a trim crossfade (4 ms at 192 kHz stereo S32 = 6144) */
-#define PN_PUMP_CAN_DECIMATE_2     1       /* an engine rate of exactly twice the codec rate is accepted (contract C8) */
+#define PN_PUMP_RATE_CONVERT       PN_RATECONV_ANY   /* engine rates PumpStartStream bridges (C8, 0.1.0.22 #1; PnPcmRatePlan) */
 
 typedef enum _PN_ENCODER_OWNER {
     PnEncoderNone = 0,
@@ -82,6 +85,7 @@ typedef struct _PN_ABR {
     volatile LONG QueueFull;       /* steps that found the TX queue full */
     ULONG       Trims;             /* latency trims since the last observation (pump thread) */
     ULONG       BacklogPeakUs;     /* ring latency while the TX queue was full */
+    ULONG       LastRingUs;        /* ring latency at the previous observation (draining, PnAbrReasons) */
     ULONG       FloorBps;
     ULONG       Downgrades;
     ULONG       Upgrades;
@@ -120,7 +124,7 @@ typedef struct _PN_PUMP {
     ULONG               SbcSduBytes;          /* baseband SDU SBC packets are sized to (A2DP_SBC_STREAM_PLAN) */
     ULONG               PayloadRoom;          /* media MTU less the RTP and payload headers */
     ULONG               EncoderPcmFormat;     /* PNA2DP_FMT_* expected by the encoder */
-    ULONG               Decimation;           /* engine frames per codec frame: 1, or 2 (half-band 2:1) */
+    PN_PCM_RATE_PLAN    Rate;                 /* engine rate -> codec rate (pcm.h); read at DISPATCH while StreamActive */
     PUCHAR              ConvBuffer;           /* PCM converted to encoder format */
     ULONG               ConvCapacity;
 

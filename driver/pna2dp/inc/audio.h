@@ -159,7 +159,6 @@ class CPnMiniportWaveRT : public IMiniportWaveRT, public IMiniportAudioSignalPro
     VOID     LoadFormatInput(_Out_ PN_WAVE_FORMAT_INPUT *In);
     BOOLEAN  BuildFormatTable();     /* TRUE if the table changed */
     NTSTATUS PropertyProposedFormat(_In_ PPCPROPERTY_REQUEST Req);
-    NTSTATUS PropertyProposedFormat2(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS PropertyModes(_In_ PPCPROPERTY_REQUEST Req);
     NTSTATUS PropertyPinLatency(_In_ PPCPROPERTY_REQUEST Req);
     BOOLEAN  IsFormatSupported(_In_ PKSDATAFORMAT Format);

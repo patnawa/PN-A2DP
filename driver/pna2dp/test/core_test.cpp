@@ -3,6 +3,7 @@
 #include "pcm.h"
 #include "avdtp_wire.h"
 #include "audio_policy.h"
+#include "config_policy.h"
 #include <stdio.h>
 #include "../../../common/recovery_policy.h"
 #include <vector>
@@ -337,14 +338,17 @@ static void TestQualityCodecLimits()
 }
 
 #include "core_test_P.inl"
+#include "core_test_R.inl"
 #include "core_test_T.inl"
 #include "core_test_G.inl"
 
 int main()
 {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* a crash keeps the output before it */
     TestCodecNegotiation(); TestRtp(); TestPcm(); TestAvdtp(); TestAudioPolicy(); TestQualityCodecLimits();
     TestMalformedPackets();
     TestLaneP();
+    TestLaneR();
     TestControlAccess();
     TestLaneW();
     TestLaneT();

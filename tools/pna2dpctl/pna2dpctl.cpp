@@ -21,7 +21,10 @@
  *                 aac.bitrate=N        aac.vbr=0|1
  *                 ldac.quality=hq|sq|mq ldac.abr=0|1  ldac.bits=16|24|32
  *                 abr=0|1  latency=N(ms)  maxlatency=N(ms)  allrates=0|1  swvolume=0|1  delayreport=0|1
+ *                 latency.profile=music|balanced|low  (150/450, 60/250, 30/120 ms; custom = keep)
+ *                 preset=best|defaults|lowlatency|compat|sbcxq  (the panel's presets; volume kept)
  *                 suspendonsco=0|1  hostonly=0|1
+ *                 Keys apply left to right: "preset=best latency.profile=balanced" ends Balanced.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -110,11 +113,11 @@ static void PrintStatus(HANDLE h)
     printf("state       : %s%s%s%s%s\n", StateName(s.State), (s.Flags & PNA2DP_STATUS_FLAG_SCO_ACTIVE) ? " [SCO active]" : "",
            (s.Flags & PNA2DP_STATUS_FLAG_AUDIO_ACTIVE) ? " [audio running]" : "", (s.Flags & PNA2DP_STATUS_FLAG_REMOTE_INITIATED) ? " [remote initiated]" : "",
            (s.Flags & PNA2DP_STATUS_FLAG_HOST_MISSING) ? " [codec host missing]" : "");
-    printf("codec       : %s%s  %u Hz, %u ch, %u-bit in  (encoder: %s)\n", CodecName(s.Codec), (s.Flags & PNA2DP_STATUS_FLAG_ABR_ACTIVE) ? " (ABR reduced)" : "",
-           s.SampleRate, s.Channels, s.BitsPerSample, s.EncoderOwner == 1 ? "kernel" : s.EncoderOwner == 2 ? "codec host" : "-");
+    printf("codec       : %s%s  %ls  (encoder: %s)\n", CodecName(s.Codec), (s.Flags & PNA2DP_STATUS_FLAG_ABR_ACTIVE) ? " (ABR reduced)" : "",
+           pn::StreamFormatText(s).c_str(), s.EncoderOwner == 1 ? "kernel" : s.EncoderOwner == 2 ? "codec host" : "-");
     printf("bitrate     : %u kbps (max %u)\n", s.BitrateBps / 1000, s.MaxBitrateBps / 1000);
     printf("latency     : %u ms estimated, sink reports %u.%u ms%s\n", s.EstimatedLatencyUs / 1000, s.SinkReportedDelayUs / 1000, (s.SinkReportedDelayUs / 100) % 10,
-           (s.Flags & PNA2DP_STATUS_FLAG_DELAY_REPORTING) ? "" : " (no delay reporting)");
+           (s.Flags & PNA2DP_STATUS_FLAG_DELAY_REPORTING) ? "" : s.SinkReportedDelayUs ? " (reported without delay-reporting negotiation)" : " (not reported; a per-codec default is assumed)");
     printf("media mtu   : %u   AVDTP %x.%x   remote SEID %u\n", s.MediaMtu, s.AvdtpVersion >> 8, s.AvdtpVersion & 0xFF, s.RemoteSeid);
     if (s.LastError) printf("last error  : 0x%08x\n", s.LastError);
 }
@@ -154,7 +157,8 @@ static void PrintConfig(const PNA2DP_CONFIG &c)
            (c.Flags & PNA2DP_CFG_DELAY_REPORTING) ? " delay-reporting" : "", (c.Flags & PNA2DP_CFG_DUAL_CHANNEL_PREFER) ? " prefer-dual" : "",
            (c.Flags & PNA2DP_CFG_HOST_CODECS_ONLY) ? " host-only" : "", (c.Flags & PNA2DP_CFG_SBC_XQ) ? " sbc-xq" : "");
     printf("auto quality   : %s\n", (c.Flags & PNA2DP_CFG_AUTO_QUALITY) ? "enabled" : "disabled");
-    printf("latency        : target %u ms, max %u ms, ABR floor %u kbps\n", c.TargetLatencyMs, c.MaxLatencyMs, c.AbrFloorBps / 1000);
+    ULONG profile = pn::LatencyProfileOf(c);
+    printf("latency        : %ls (target %u ms, max %u ms), ABR floor %u kbps\n", pn::LatencyProfileKey(profile), c.TargetLatencyMs, c.MaxLatencyMs, c.AbrFloorBps / 1000);
     printf("SBC            : bitpool %u..%u%s, rates %s, modes 0x%02x, blocks 0x%02x, subbands 0x%02x, alloc 0x%02x\n", c.Sbc.MinBitpool, c.Sbc.MaxBitpool,
            c.Sbc.AllowBitpoolOverride ? " (override allowed)" : "", c.Sbc.RateMask ? "custom" : "any", c.Sbc.ChannelModeMask, c.Sbc.BlockMask, c.Sbc.SubbandMask, c.Sbc.AllocMask);
     printf("AAC            : bitrate %u kbps%s, vbr %u, object %u\n", c.Aac.BitrateBps / 1000, c.Aac.BitrateBps ? "" : " (sink max)", c.Aac.Vbr, c.Aac.ObjectType);
@@ -240,6 +244,25 @@ static int DoSet(HANDLE h, int argc, char **argv, int start)
         else if (!_stricmp(k, "ldac.bits")) c.Ldac.FormatMask = atoi(v) == 16 ? PNA2DP_FMT_S16 : atoi(v) == 24 ? PNA2DP_FMT_S24 : PNA2DP_FMT_S32;
         else if (!_stricmp(k, "ldac.rates")) { ULONG m; if (!ParseRates(v, &m)) return 1; c.Ldac.RateMask = m; }
         else if (!_stricmp(k, "abr")) flag(PNA2DP_CFG_ABR_ENABLE);
+        else if (!_stricmp(k, "latency.profile")) {
+            ULONG profile;
+            std::wstring w(v, v + strlen(v));
+            if (!pn::LatencyProfileFromKey(w.c_str(), profile)) { fprintf(stderr, "unknown latency profile %s (music, balanced, low, custom)\n", v); return 1; }
+            pn::ApplyLatencyProfile(c, profile);   /* custom: the values stay as they are */
+        } else if (!_stricmp(k, "preset")) {
+            pn::Preset preset;
+            std::wstring w(v, v + strlen(v));
+            if (!pn::PresetFromKey(w.c_str(), preset)) {
+                ULONG profile;
+                fprintf(stderr, "unknown preset %s (best, defaults, lowlatency, compat, sbcxq)\n", v);
+                if (pn::LatencyProfileFromKey(w.c_str(), profile))   /* review #5: buffering only, not a whole preset */
+                    fprintf(stderr, "for buffering only use latency.profile=%s; a preset replaces the whole configuration\n", v);
+                return 1;
+            }
+            LONG volume = c.VolumeDb16;
+            pn::ApplyPreset(c, preset);
+            c.VolumeDb16 = volume;
+        }
         else if (!_stricmp(k, "latency")) c.TargetLatencyMs = (ULONG)atol(v);
         else if (!_stricmp(k, "maxlatency")) c.MaxLatencyMs = (ULONG)atol(v);
         else if (!_stricmp(k, "allrates")) flag(PNA2DP_CFG_EXPOSE_ALL_RATES);
@@ -340,7 +363,8 @@ int main(int argc, char **argv)
         printf("usage: pna2dpctl windows [list|status|spatial|connect|disconnect] [-d N]\n"
                "       pna2dpctl list|status|spatial|quality|caps|config|auto|set|watch|stats|trace|reconnect|connect|disconnect [-d index] [key=value ...]\n"
                "         connect / disconnect: connect or disconnect the receiver, as Windows Settings does\n"
-               "         reconnect: reset the link (disconnect first, then connect)\n");
+               "         reconnect: reset the link (disconnect first, then connect)\n"
+               "         set keys include latency.profile=music|balanced|low and preset=best|defaults|lowlatency|compat|sbcxq\n");
         return 1;
     }
     const char *cmd = argv[1];

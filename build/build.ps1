@@ -120,6 +120,13 @@ function Build-Driver {
     Write-Host "built $sys ($((Get-Item $sys).Length) bytes)"
     # Universal (DCH) driver rule: only DDIs on the WDK's universal list may be imported.
     Test-UniversalDriverApis $sys
+    # No auto-vectorizer ISA dispatch in the kernel image: its AVX2 / AVX-512 paths run when
+    # __isa_available says so, which nothing sets in the kernel (dead code), and would use vector
+    # state without KeSaveExtendedProcessorState if anything did. pcm.cpp keeps its loops scalar
+    # (#pragma loop(no_vector)), so user-mode tests time and run exactly the driver's code.
+    if ((Get-Content -LiteralPath (Join-Path $Out 'pna2dp.map') -Raw) -match '__isa_available') {
+        throw "pna2dp.sys contains auto-vectorizer ISA dispatch (__isa_available): keep that loop scalar (#pragma loop(no_vector))"
+    }
 
     # package: INF + sys (+ cat when signing)
     $pkg = Join-Path $Out 'package'

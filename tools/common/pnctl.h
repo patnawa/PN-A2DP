@@ -68,6 +68,13 @@ std::wstring   ChannelModeMaskText(ULONG mask);
 std::wstring   FormatMaskText(ULONG mask);
 std::wstring   BtAddressText(ULONGLONG addr);  /* "E8:EC:4A:12:34:56" */
 std::wstring   StatusFlagsText(ULONG flags);
+/* "48000 Hz (Windows 44100 Hz, converted), 2 ch, 24-bit in": the stream format and, when the driver
+ * converts (0.1.0.22 EngineSampleRate; older drivers report 0) and withEngineRate is set, the
+ * Windows rate it converts from */
+std::wstring   StreamFormatText(const PNA2DP_STATUS &status, bool withEngineRate = true);
+/* The Windows rate on its own: "44100 Hz, converted to 48000 Hz", "48000 Hz, no conversion",
+ * or "-" without a Windows stream (and from drivers before 0.1.0.22) */
+std::wstring   EngineRateText(const PNA2DP_STATUS &status);
 std::wstring   NtStatusText(ULONG status);
 std::wstring   DescribeSep(const PNA2DP_REMOTE_SEP &sep);   /* multi-line decode of the codec IEs */
 std::wstring   HexBytes(const UCHAR *p, ULONG n);
@@ -76,7 +83,7 @@ const wchar_t *QualityHealthName(ULONG health);
 std::wstring   QualityReport(const PNA2DP_QUALITY &q);
 
 /* ---- configuration helpers -------------------------------------------------- */
-void  ConfigDefaults(PNA2DP_CONFIG &c);        /* identical to the driver's RegCfgDefaults */
+void  ConfigDefaults(PNA2DP_CONFIG &c);        /* the driver's RegCfgDefaults (config_policy.h PnConfigDefaults) */
 void  UseAutomaticCodecs(PNA2DP_CONFIG &c);    /* reset codec restrictions, keep volume/transport */
 bool  SinkSupportsCodec(const PNA2DP_CAPABILITIES &caps, ULONG codec);
 bool  CanActivateCodec(const PNA2DP_CAPABILITIES &caps, const PNA2DP_VERSION &version, ULONG codec);
@@ -88,11 +95,21 @@ ULONG SbcFrameBytes(ULONG subbands, ULONG blocks, ULONG channelMode /*PNA2DP_SBC
 ULONG SbcBitrateBps(ULONG sampleRate, ULONG subbands, ULONG blocks, ULONG channelMode, ULONG bitpool);
 ULONG LdacBitrateBps(ULONG eqmid, ULONG sampleRate);
 
+/* Latency profiles (config_policy.h PN_LATENCY_PROFILE_*): a TargetLatencyMs / MaxLatencyMs
+ * pair. Music 150 / 450 ms rides out radio hiccups without lowering quality, Balanced 60 / 250
+ * (default), Low latency 30 / 120 (video, games); any other pair is Custom. */
+ULONG          LatencyProfileOf(const PNA2DP_CONFIG &c);
+void           ApplyLatencyProfile(PNA2DP_CONFIG &c, ULONG profile);   /* Custom: no change */
+const wchar_t *LatencyProfileKey(ULONG profile);    /* "low", "balanced", "music", "custom" */
+const wchar_t *LatencyProfileName(ULONG profile);   /* "Low latency", "Balanced", "Music", "Custom" */
+bool           LatencyProfileFromKey(const wchar_t *key, ULONG &profile);   /* also "lowlatency"; case-insensitive */
+
 /* Presets applied on top of a configuration (codec priority + per codec knobs). */
 enum class Preset { BestQuality = 0, Balanced, LowLatency, Compatibility, SbcXq };
 const wchar_t *PresetName(Preset p);
 const wchar_t *PresetDescription(Preset p);
 void ApplyPreset(PNA2DP_CONFIG &c, Preset p);
+bool PresetFromKey(const wchar_t *key, Preset &p);  /* best, defaults, lowlatency, compat, sbcxq; not the latency profile words */
 
 /* Round trip of a configuration through text ("key=value" lines, pna2dpctl syntax where it
  * exists, plus a hex dump of the whole structure for exact restore). */

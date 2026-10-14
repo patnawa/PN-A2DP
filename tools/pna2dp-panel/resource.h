@@ -99,6 +99,7 @@
 #define IDC_ST_SEID             1112
 #define IDC_ST_FLAGS            1113
 #define IDC_ST_LASTERR          1114
+#define IDC_ST_ENGINE           1115
 #define IDC_ST_PCM              1120
 #define IDC_ST_PACKETS          1121
 #define IDC_ST_BYTES            1122
@@ -236,6 +237,8 @@
 #define IDC_TR_VOLUME           1713
 #define IDC_TR_VOLUME_SPIN      1714
 #define IDC_TR_NOTE             1715
+#define IDC_TR_PROFILE          1716
+#define IDC_TR_PROFILE_DESC     1717
 
 /* sink page */
 #define IDC_SINK_INFO           1801

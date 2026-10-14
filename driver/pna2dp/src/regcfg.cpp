@@ -28,61 +28,19 @@ VOID RegCfgShutdown()
     if (g_PersistentState) { ZwClose(g_PersistentState); g_PersistentState = NULL; }
 }
 
+/* The defaults and the validation live in config_policy.h, shared with the tools and tests. */
+C_ASSERT(PN_CONFIG_MAX_LATENCY_MS == PN_PUMP_RING_MS - PN_RING_HEADROOM_MS);   /* the latency ceiling stays below the ring */
+C_ASSERT(PN_CONFIG_STATUS_NAME_NOT_FOUND == STATUS_OBJECT_NAME_NOT_FOUND);
+C_ASSERT(PN_CONFIG_STATUS_PATH_NOT_FOUND == STATUS_OBJECT_PATH_NOT_FOUND);
+
 VOID RegCfgDefaults(_Out_ PPNA2DP_CONFIG Cfg)
 {
-    RtlZeroMemory(Cfg, sizeof(*Cfg));
-    Cfg->Size = sizeof(*Cfg);
-    Cfg->Version = PNA2DP_ABI_VERSION;
-    /* Quality first: LDAC > aptX HD > AAC > aptX > aptX LL > SBC. A codec that no host offers is skipped. */
-    Cfg->CodecPriority[0] = PNA2DP_CODEC_LDAC;
-    Cfg->CodecPriority[1] = PNA2DP_CODEC_APTX_HD;
-    Cfg->CodecPriority[2] = PNA2DP_CODEC_AAC;
-    Cfg->CodecPriority[3] = PNA2DP_CODEC_APTX;
-    Cfg->CodecPriority[4] = PNA2DP_CODEC_APTX_LL;
-    Cfg->CodecPriority[5] = PNA2DP_CODEC_SBC;
-    Cfg->EnabledCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_AAC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX) |
-                            PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_HD) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_LL) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_LDAC);
-    Cfg->Flags = PNA2DP_CFG_ABR_ENABLE | PNA2DP_CFG_APPLY_LIVE | PNA2DP_CFG_SUSPEND_ON_SCO | PNA2DP_CFG_DELAY_REPORTING | PNA2DP_CFG_SOFTWARE_VOLUME | PNA2DP_CFG_AUTO_QUALITY;
-    Cfg->TargetLatencyMs = PN_PUMP_DEFAULT_TARGET_MS;
-    Cfg->MaxLatencyMs = PN_PUMP_DEFAULT_MAX_MS;
-    Cfg->AbrFloorBps = 128000;
-    Cfg->VolumeDb16 = 0;
-    Cfg->ReconnectDelayMs = 2000;
-    Cfg->Sbc.MinBitpool = 2;
-    Cfg->Sbc.MaxBitpool = 0;            /* 0 = whatever the sink allows */
-    Cfg->Aac.Vbr = 1;
-    Cfg->Aac.BitrateBps = 0;
-    Cfg->Ldac.Eqmid = PNA2DP_LDAC_EQMID_SQ;
-    Cfg->Ldac.AbrEnable = 1;
+    PnConfigDefaults(Cfg);
 }
 
 BOOLEAN RegCfgValidate(_Inout_ PPNA2DP_CONFIG Cfg)
 {
-    if (Cfg->Size != sizeof(*Cfg) || Cfg->Version != PNA2DP_ABI_VERSION) return FALSE;
-    if (Cfg->TargetLatencyMs < 20) Cfg->TargetLatencyMs = 20;
-    if (Cfg->TargetLatencyMs > 400) Cfg->TargetLatencyMs = 400;
-    if (Cfg->MaxLatencyMs < Cfg->TargetLatencyMs + 20) Cfg->MaxLatencyMs = Cfg->TargetLatencyMs + 20;
-    /* the pump never lets the ring grow beyond this (PnEffectiveLatencyMs): store what applies */
-    if (Cfg->MaxLatencyMs > PN_PUMP_RING_MS - PN_RING_HEADROOM_MS) Cfg->MaxLatencyMs = PN_PUMP_RING_MS - PN_RING_HEADROOM_MS;
-    if (Cfg->Sbc.MinBitpool && Cfg->Sbc.MinBitpool < 2) Cfg->Sbc.MinBitpool = 2;
-    if (Cfg->Sbc.MaxBitpool > 250) Cfg->Sbc.MaxBitpool = 250;
-    if (Cfg->Sbc.MaxBitpool && Cfg->Sbc.MinBitpool > Cfg->Sbc.MaxBitpool) Cfg->Sbc.MinBitpool = Cfg->Sbc.MaxBitpool;
-    if (Cfg->Ldac.Eqmid > PNA2DP_LDAC_EQMID_MQ && Cfg->Ldac.Eqmid != PNA2DP_LDAC_EQMID_ABR) Cfg->Ldac.Eqmid = PNA2DP_LDAC_EQMID_SQ;
-    if (Cfg->VolumeDb16 > 0) Cfg->VolumeDb16 = 0;
-    if (Cfg->VolumeDb16 < -96 * 0x10000) Cfg->VolumeDb16 = -96 * 0x10000;
-    BOOLEAN any = FALSE;
-    for (ULONG i = 0; i < PN_ARRAYSIZE(Cfg->CodecPriority); i++) {
-        if (Cfg->CodecPriority[i] >= PNA2DP_CODEC_MAX) Cfg->CodecPriority[i] = 0;
-        if (Cfg->CodecPriority[i]) any = TRUE;
-    }
-    if (!any) Cfg->CodecPriority[0] = PNA2DP_CODEC_SBC;
-    Cfg->EnabledCodecMask |= PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);   /* SBC is mandatory */
-    Cfg->Flags |= PNA2DP_CFG_SOFTWARE_VOLUME;   /* no AVRCP absolute-volume implementation */
-    if (Cfg->Flags & PNA2DP_CFG_AUTO_QUALITY) {
-        Cfg->Flags |= PNA2DP_CFG_ABR_ENABLE;
-        Cfg->Ldac.AbrEnable = 1;
-    }
-    return TRUE;
+    return PnConfigValidate(Cfg);
 }
 
 static NTSTATUS OpenDeviceKey(_In_ PDRIVER_OBJECT DriverObject, _In_ BTH_ADDR Address, _In_ BOOLEAN Create, _In_ ACCESS_MASK Access, _Out_ PHANDLE Key)

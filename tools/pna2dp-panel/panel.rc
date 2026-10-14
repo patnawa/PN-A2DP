@@ -96,72 +96,74 @@ IDD_PAGE_STATUS DIALOGEX 0, 0, 400, 262
 STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    GROUPBOX        "Connection", -1, 4, 2, 196, 170
+    GROUPBOX        "Connection", -1, 4, 2, 216, 181
     LTEXT           "Device:", -1, 10, 14, 58, 10
-    LTEXT           "", IDC_ST_DEVICE, 70, 14, 126, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "", IDC_ST_DEVICE, 70, 14, 146, 10, SS_NOPREFIX | SS_ENDELLIPSIS
     LTEXT           "Address:", -1, 10, 25, 58, 10
-    LTEXT           "", IDC_ST_ADDRESS, 70, 25, 126, 10
+    LTEXT           "", IDC_ST_ADDRESS, 70, 25, 146, 10
     LTEXT           "State:", -1, 10, 36, 58, 10
-    LTEXT           "", IDC_ST_STATE, 70, 36, 126, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "", IDC_ST_STATE, 70, 36, 146, 10, SS_NOPREFIX | SS_ENDELLIPSIS
     LTEXT           "Codec:", -1, 10, 47, 58, 10
-    LTEXT           "", IDC_ST_CODEC, 70, 47, 126, 10
+    LTEXT           "", IDC_ST_CODEC, 70, 47, 146, 10
     LTEXT           "Format:", -1, 10, 58, 58, 10
-    LTEXT           "", IDC_ST_FORMAT, 70, 58, 126, 10
-    LTEXT           "Encoder:", -1, 10, 69, 58, 10
-    LTEXT           "", IDC_ST_ENCODER, 70, 69, 126, 10
-    LTEXT           "Bitrate:", -1, 10, 80, 58, 10
-    LTEXT           "", IDC_ST_BITRATE, 70, 80, 126, 10
-    LTEXT           "Latency:", -1, 10, 91, 58, 10
-    LTEXT           "", IDC_ST_LATENCY, 70, 91, 126, 10
-    LTEXT           "Sink delay:", -1, 10, 102, 58, 10
-    LTEXT           "", IDC_ST_SINKDELAY, 70, 102, 126, 10
-    LTEXT           "Media MTU:", -1, 10, 113, 58, 10
-    LTEXT           "", IDC_ST_MTU, 70, 113, 126, 10
-    LTEXT           "AVDTP:", -1, 10, 124, 58, 10
-    LTEXT           "", IDC_ST_AVDTP, 70, 124, 126, 10
-    LTEXT           "Remote SEID:", -1, 10, 135, 58, 10
-    LTEXT           "", IDC_ST_SEID, 70, 135, 126, 10
-    LTEXT           "Flags:", -1, 10, 146, 58, 10
-    LTEXT           "", IDC_ST_FLAGS, 70, 146, 126, 10, SS_NOPREFIX | SS_ENDELLIPSIS
-    LTEXT           "Last error:", -1, 10, 157, 58, 10
-    LTEXT           "", IDC_ST_LASTERR, 70, 157, 126, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "", IDC_ST_FORMAT, 70, 58, 146, 10
+    LTEXT           "Windows rate:", -1, 10, 69, 58, 10
+    LTEXT           "", IDC_ST_ENGINE, 70, 69, 146, 10
+    LTEXT           "Encoder:", -1, 10, 80, 58, 10
+    LTEXT           "", IDC_ST_ENCODER, 70, 80, 146, 10
+    LTEXT           "Bitrate:", -1, 10, 91, 58, 10
+    LTEXT           "", IDC_ST_BITRATE, 70, 91, 146, 10
+    LTEXT           "Latency:", -1, 10, 102, 58, 10
+    LTEXT           "", IDC_ST_LATENCY, 70, 102, 146, 10
+    LTEXT           "Sink delay:", -1, 10, 113, 58, 10
+    LTEXT           "", IDC_ST_SINKDELAY, 70, 113, 146, 10
+    LTEXT           "Media MTU:", -1, 10, 124, 58, 10
+    LTEXT           "", IDC_ST_MTU, 70, 124, 146, 10
+    LTEXT           "AVDTP:", -1, 10, 135, 58, 10
+    LTEXT           "", IDC_ST_AVDTP, 70, 135, 146, 10
+    LTEXT           "Remote SEID:", -1, 10, 146, 58, 10
+    LTEXT           "", IDC_ST_SEID, 70, 146, 146, 10
+    LTEXT           "Flags:", -1, 10, 157, 58, 10
+    LTEXT           "", IDC_ST_FLAGS, 70, 157, 146, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    LTEXT           "Last error:", -1, 10, 168, 58, 10
+    LTEXT           "", IDC_ST_LASTERR, 70, 168, 146, 10, SS_NOPREFIX | SS_ENDELLIPSIS
 
-    GROUPBOX        "Transport statistics", -1, 206, 2, 190, 170
-    LTEXT           "PCM frames:", -1, 212, 14, 70, 10
-    LTEXT           "", IDC_ST_PCM, 284, 14, 108, 10
-    LTEXT           "Packets sent:", -1, 212, 25, 70, 10
-    LTEXT           "", IDC_ST_PACKETS, 284, 25, 108, 10
-    LTEXT           "Bytes sent:", -1, 212, 36, 70, 10
-    LTEXT           "", IDC_ST_BYTES, 284, 36, 108, 10
-    LTEXT           "Codec frames:", -1, 212, 47, 70, 10
-    LTEXT           "", IDC_ST_FRAMES, 284, 47, 108, 10
-    LTEXT           "Dropped:", -1, 212, 58, 70, 10
-    LTEXT           "", IDC_ST_DROPPED, 284, 58, 108, 10
-    LTEXT           "Write failures:", -1, 212, 69, 70, 10
-    LTEXT           "", IDC_ST_WRITEFAIL, 284, 69, 108, 10
-    LTEXT           "Latency trims:", -1, 212, 80, 70, 10
-    LTEXT           "", IDC_ST_TRIMS, 284, 80, 108, 10
-    LTEXT           "TX queue:", -1, 212, 91, 70, 10
-    LTEXT           "", IDC_ST_QUEUE, 284, 91, 108, 10
-    LTEXT           "TX completion:", -1, 212, 102, 70, 10
-    LTEXT           "", IDC_ST_TXTIME, 284, 102, 108, 10
-    LTEXT           "ABR:", -1, 212, 113, 70, 10
-    LTEXT           "", IDC_ST_ABR, 284, 113, 108, 10
-    LTEXT           "Host round trip:", -1, 212, 124, 70, 10
-    LTEXT           "", IDC_ST_HOSTRTT, 284, 124, 108, 10
-    LTEXT           "Host timeouts:", -1, 212, 135, 70, 10
-    LTEXT           "", IDC_ST_HOSTTO, 284, 135, 108, 10
-    PUSHBUTTON      "Reset statistics", IDC_ST_RESETSTATS, 212, 150, 80, 14
-    PUSHBUTTON      "Reconnect", IDC_ST_RECONNECT, 296, 150, 60, 14
+    GROUPBOX        "Transport statistics", -1, 224, 2, 172, 181
+    LTEXT           "PCM frames:", -1, 230, 14, 62, 10
+    LTEXT           "", IDC_ST_PCM, 294, 14, 98, 10
+    LTEXT           "Packets sent:", -1, 230, 25, 62, 10
+    LTEXT           "", IDC_ST_PACKETS, 294, 25, 98, 10
+    LTEXT           "Bytes sent:", -1, 230, 36, 62, 10
+    LTEXT           "", IDC_ST_BYTES, 294, 36, 98, 10
+    LTEXT           "Codec frames:", -1, 230, 47, 62, 10
+    LTEXT           "", IDC_ST_FRAMES, 294, 47, 98, 10
+    LTEXT           "Dropped:", -1, 230, 58, 62, 10
+    LTEXT           "", IDC_ST_DROPPED, 294, 58, 98, 10
+    LTEXT           "Write failures:", -1, 230, 69, 62, 10
+    LTEXT           "", IDC_ST_WRITEFAIL, 294, 69, 98, 10
+    LTEXT           "Latency trims:", -1, 230, 80, 62, 10
+    LTEXT           "", IDC_ST_TRIMS, 294, 80, 98, 10
+    LTEXT           "TX queue:", -1, 230, 91, 62, 10
+    LTEXT           "", IDC_ST_QUEUE, 294, 91, 98, 10
+    LTEXT           "TX completion:", -1, 230, 102, 62, 10
+    LTEXT           "", IDC_ST_TXTIME, 294, 102, 98, 10
+    LTEXT           "ABR:", -1, 230, 113, 62, 10
+    LTEXT           "", IDC_ST_ABR, 294, 113, 98, 10
+    LTEXT           "Host round trip:", -1, 230, 124, 62, 10
+    LTEXT           "", IDC_ST_HOSTRTT, 294, 124, 98, 10
+    LTEXT           "Host timeouts:", -1, 230, 135, 62, 10
+    LTEXT           "", IDC_ST_HOSTTO, 294, 135, 98, 10
+    PUSHBUTTON      "Reset statistics", IDC_ST_RESETSTATS, 230, 161, 80, 14
+    PUSHBUTTON      "Reconnect", IDC_ST_RECONNECT, 314, 161, 60, 14
 
-    GROUPBOX        "Driver and codec host", -1, 4, 176, 392, 54
-    LTEXT           "Driver:", -1, 10, 188, 70, 10
-    LTEXT           "", IDC_ST_DRIVERVER, 82, 188, 310, 10, SS_NOPREFIX
-    LTEXT           "Codec host service:", -1, 10, 200, 70, 10
-    LTEXT           "", IDC_ST_HOSTSVC, 82, 200, 310, 10, SS_NOPREFIX
-    LTEXT           "Encoders available:", -1, 10, 212, 70, 10
-    LTEXT           "", IDC_ST_ENCODERS, 82, 212, 310, 10, SS_NOPREFIX
-    LTEXT           "The status refreshes on every driver event and once a second while streaming.", -1, 4, 240, 392, 10
+    GROUPBOX        "Driver and codec host", -1, 4, 187, 392, 54
+    LTEXT           "Driver:", -1, 10, 199, 70, 10
+    LTEXT           "", IDC_ST_DRIVERVER, 82, 199, 310, 10, SS_NOPREFIX
+    LTEXT           "Codec host service:", -1, 10, 211, 70, 10
+    LTEXT           "", IDC_ST_HOSTSVC, 82, 211, 310, 10, SS_NOPREFIX
+    LTEXT           "Encoders available:", -1, 10, 223, 70, 10
+    LTEXT           "", IDC_ST_ENCODERS, 82, 223, 310, 10, SS_NOPREFIX
+    LTEXT           "The status refreshes on every driver event and once a second while streaming.", -1, 4, 251, 392, 10
 END
 
 // ------------------------------------------------------------------------------------
@@ -177,8 +179,8 @@ BEGIN
     PUSHBUTTON      "Activate selected", IDC_CODEC_ACTIVATE, 128, 136, 126, 16
     PUSHBUTTON      "Auto quality + codecs", IDC_CODEC_ENABLEALL, 258, 136, 138, 16
     GROUPBOX        "Load a preset", -1, 4, 157, 392, 48
-    COMBOBOX        IDC_PRESET, 10, 169, 170, 100, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL
-    PUSHBUTTON      "Load preset", IDC_PRESET_APPLY, 186, 168, 64, 14
+    COMBOBOX        IDC_PRESET, 10, 169, 210, 100, CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL
+    PUSHBUTTON      "Load preset", IDC_PRESET_APPLY, 226, 168, 64, 14
     LTEXT           "", IDC_PRESET_DESC, 10, 185, 380, 18, SS_NOPREFIX
     CONTROL         "Prefer codec host encoders (kernel SBC remains the safety fallback)", IDC_CODEC_HOSTONLY, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 4, 211, 392, 10
     CONTROL         "Apply codec changes live (renegotiate the stream without disconnecting the receiver)", IDC_CODEC_APPLYLIVE, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 4, 225, 392, 10
@@ -356,15 +358,18 @@ STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     GROUPBOX        "Buffering and latency", -1, 4, 2, 392, 70
-    LTEXT           "Target buffer (ms):", -1, 10, 16, 70, 10
-    CONTROL         "", IDC_TR_TARGET_SLIDER, TRACKBAR_CLASS, WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, 112, 13, 190, 15
-    EDITTEXT        IDC_TR_TARGET_EDIT, 306, 14, 36, 12, ES_NUMBER | ES_AUTOHSCROLL
-    LTEXT           "20 .. 400", -1, 346, 16, 40, 10
-    LTEXT           "Maximum before trimming (ms):", -1, 10, 34, 100, 10
-    CONTROL         "", IDC_TR_MAX_SLIDER, TRACKBAR_CLASS, WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, 112, 31, 190, 15
-    EDITTEXT        IDC_TR_MAX_EDIT, 306, 32, 36, 12, ES_NUMBER | ES_AUTOHSCROLL
-    LTEXT           "40 .. 1000", -1, 346, 34, 40, 10
-    LTEXT           "A smaller target buffer lowers the audio delay; a larger one rides out interference. When the backlog exceeds the maximum, the oldest audio is trimmed.", -1, 10, 48, 380, 20
+    LTEXT           "Listening profile:", -1, 10, 14, 100, 10
+    COMBOBOX        IDC_TR_PROFILE, 112, 12, 170, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "", IDC_TR_PROFILE_DESC, 288, 14, 102, 10, SS_NOPREFIX
+    LTEXT           "Target buffer (ms):", -1, 10, 30, 70, 10
+    CONTROL         "", IDC_TR_TARGET_SLIDER, TRACKBAR_CLASS, WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, 112, 27, 190, 15
+    EDITTEXT        IDC_TR_TARGET_EDIT, 306, 28, 36, 12, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "20 .. 400", -1, 346, 30, 40, 10
+    LTEXT           "Maximum before trimming (ms):", -1, 10, 46, 100, 10
+    CONTROL         "", IDC_TR_MAX_SLIDER, TRACKBAR_CLASS, WS_TABSTOP | TBS_HORZ | TBS_AUTOTICKS | TBS_TOOLTIPS, 112, 43, 190, 15
+    EDITTEXT        IDC_TR_MAX_EDIT, 306, 44, 36, 12, ES_NUMBER | ES_AUTOHSCROLL
+    LTEXT           "40 .. 500", -1, 346, 46, 40, 10
+    LTEXT           "Music rides out interference without lowering quality; Low latency suits video and games.", -1, 10, 60, 380, 10
     GROUPBOX        "Adaptive bitrate (SBC, AAC, LDAC)", -1, 4, 76, 392, 38
     CONTROL         "Reduce the bitrate when the link is congested and raise it after sustained clean traffic", IDC_TR_ABR, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 10, 88, 320, 10
     LTEXT           "Floor (kbps):", -1, 10, 101, 50, 10

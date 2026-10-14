@@ -167,7 +167,9 @@ static VOID UpdateStatusLocked(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG PipelineUs, 
         s->Codec = D->Active.Codec;
         s->SampleRate = D->Active.SampleRate;
         s->Channels = D->Active.Channels;
-        s->BitsPerSample = (D->Active.PcmFormat == PNA2DP_FMT_S16) ? 16 : (D->Active.PcmFormat == PNA2DP_FMT_S24) ? 24 : 32;
+        /* a host codec encodes what the pump hands it (LDAC takes S32 on a converted stream) */
+        ULONG fmt = PumpIsStreaming(&D->Pump) && D->Pump.Owner == PnEncoderHost ? D->Pump.EncoderPcmFormat : D->Active.PcmFormat;
+        s->BitsPerSample = (fmt == PNA2DP_FMT_S16) ? 16 : (fmt == PNA2DP_FMT_S24) ? 24 : 32;
         s->BitrateBps = PumpIsStreaming(&D->Pump) ? PumpCurrentBitrate(&D->Pump) : D->Active.BitrateBps;
         /* while streaming: the pump's effective ceiling (MTU-capped SBC bitpool / AAC fit) */
         s->MaxBitrateBps = PumpIsStreaming(&D->Pump) && CeilingBps ? CeilingBps : D->Active.MaxBitrateBps;
@@ -180,7 +182,7 @@ static VOID UpdateStatusLocked(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG PipelineUs, 
     /* SinkReportedDelayUs keeps its ABI meaning (the receiver's AVDTP delay report, 0 if none);
      * the end-to-end estimate also includes the per-codec default for non-reporting sinks. */
     ULONG sinkUs = DeviceSinkDelayUs(D);
-    s->SinkReportedDelayUs = (D->Avdtp.DelayReportingNegotiated && D->Avdtp.SinkDelayTenthsMs) ? sinkUs : 0;
+    s->SinkReportedDelayUs = D->Avdtp.SinkDelayTenthsMs ? sinkUs : 0;
     s->EstimatedLatencyUs = PipelineUs + sinkUs;
     s->AvdtpVersion = D->Avdtp.RemoteVersion;
     s->EncoderOwner = (ULONG)D->Pump.Owner;
@@ -194,13 +196,18 @@ static VOID UpdateStatusLocked(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG PipelineUs, 
     if (D->RemoteVolumeActive) s->Flags |= PNA2DP_STATUS_FLAG_REMOTE_VOLUME;
     if (D->RemoteSuspended) s->Flags |= PNA2DP_STATUS_FLAG_REMOTE_SUSPENDED;
     if (D->ReceiverUnreachable) s->Flags |= PNA2DP_STATUS_FLAG_UNREACHABLE;
-    if (PumpIsStreaming(&D->Pump) && D->Pump.Decimation == 2) s->Flags |= PNA2DP_STATUS_FLAG_HALF_RATE;
+    if (PumpIsStreaming(&D->Pump) && D->Pump.Rate.EngineRate != D->Pump.Rate.CodecRate) {
+        s->Flags |= PNA2DP_STATUS_FLAG_RATE_CONVERTED;
+        if (D->Pump.Rate.Decimate == 2 && !D->Pump.Rate.Rs) s->Flags |= PNA2DP_STATUS_FLAG_HALF_RATE;
+    }
+    s->EngineSampleRate = D->AudioStreamOpen ? D->AudioRate : 0;
     if (D->Pump.Owner == PnEncoderKernelSbc && D->Config.CodecPriority[0] != PNA2DP_CODEC_SBC && !CodecHostCodecMask(&D->Host)) s->Flags |= PNA2DP_STATUS_FLAG_HOST_MISSING;
 }
 
 /* C2: sink delay of the current stream (transport_policy.h): the receiver's DELAYREPORT
- * when delay reporting was negotiated for this stream, else the documented per-codec
- * default; 0 without a stream. Lock-free, <= DISPATCH. */
+ * whenever one was received, even without delay-reporting negotiation (the MR5 sends
+ * them unasked), else the documented per-codec default; 0 without a stream.
+ * Lock-free, <= DISPATCH. */
 ULONG DeviceSinkDelayUs(_In_ PPNA2DP_DEVICE D)
 {
     ULONG tenths = D->Avdtp.SinkDelayTenthsMs;
@@ -316,16 +323,13 @@ static BOOLEAN ConservativeRadio(_In_ PPNA2DP_DEVICE D)
         PnAdapterNeedsConservativeProfile(D->Link.RadioInfoValid, D->Link.RadioInfo.radioInfo.lmpSupportedFeatures);
 }
 
-/* C8: may a 96 / 88.2 kHz engine feed a 48 / 44.1 kHz stream? Enabled once the pump
- * decimates 2:1 (PN_PUMP_CAN_DECIMATE_2). */
-static BOOLEAN DeviceAllowHalfRate(_In_ PPNA2DP_DEVICE D)
+/* C8 / #1: the engine rates the pump bridges to another stream rate (PN_RATECONV_*): with the
+ * sample-rate converter any of 44.1 / 48 / 88.2 / 96 kHz feeds a 44.1 or 48 kHz stream, so the
+ * codec choice follows the priority list rather than the Windows format. */
+static ULONG DeviceRateConvert(_In_ PPNA2DP_DEVICE D)
 {
     UNREFERENCED_PARAMETER(D);
-#ifdef PN_PUMP_CAN_DECIMATE_2
-    return TRUE;
-#else
-    return FALSE;
-#endif
+    return PN_PUMP_RATE_CONVERT;
 }
 
 /* The refused (codec, SEID) pairs and the codec upgrade guard belong to one signalling
@@ -369,7 +373,7 @@ static BOOLEAN ChooseConfig(_Inout_ PPNA2DP_DEVICE D, _Out_ PN_CODEC_CHOICE *Cho
     in.PreferredRate = D->AudioStreamOpen ? D->AudioRate : 48000;
     in.PreferredBits = D->AudioStreamOpen ? D->AudioValidBits : 16;
     in.Conservative = ConservativeRadio(D);
-    in.AllowHalfRate = DeviceAllowHalfRate(D);
+    in.RateConvert = DeviceRateConvert(D);
     in.OwnRemoteSeid = D->Avdtp.RemoteSeid;   /* T1: our own (last) stream's SEP is not "in use" for us */
     in.Rejected = &D->Rejected;
     return PnChooseCodecConfig(&in, Choice);
@@ -466,6 +470,7 @@ static VOID SetActiveConfig(_Inout_ PPNA2DP_DEVICE D, _In_opt_ const A2DP_CODEC_
     KeAcquireSpinLock(&D->StatusLock, &irql);
     if (Cfg) D->Active = *Cfg;
     D->ActiveValid = Cfg != NULL;
+    D->ActiveStreamed = FALSE;   /* a new configuration has carried no audio yet */
     KeReleaseSpinLock(&D->StatusLock, irql);
 }
 
@@ -628,7 +633,10 @@ static NTSTATUS StartPumpIfNeeded(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG IntentGen
     if (D->IntentGen != IntentGen || !D->AudioStreamOpen) { PnMutexRelease(&D->IntentMutex); return STATUS_CANCELLED; }
     NTSTATUS status = PumpStartStream(&D->Pump, &D->Active, AvdtpMediaChannel(&D->Avdtp), AvdtpMediaMtu(&D->Avdtp), owner, &D->WorkConfig);
     PumpSetVolume(&D->Pump, SoftwareVolumeDb16(D, D->VolumeDb16), D->Muted);
-    if (NT_SUCCESS(status)) InterlockedExchange64(&D->RenderHoldUntilHns, 0);   /* the clock runs: the pump takes the audio */
+    if (NT_SUCCESS(status)) {
+        InterlockedExchange64(&D->RenderHoldUntilHns, 0);   /* the clock runs: the pump takes the audio */
+        D->ActiveStreamed = TRUE;   /* from now on a Windows rate change is bridged (PnStreamBridged) */
+    }
     PnMutexRelease(&D->IntentMutex);
     if (!NT_SUCCESS(status)) D->Status.LastError = (ULONG)status;
     return status;
@@ -654,7 +662,8 @@ static PN_FORMAT_ACTION CheckStreamFormat(_Inout_ PPNA2DP_DEVICE D)
     in.Conservative = ConservativeRadio(D);
     in.StreamState = st;
     in.RemoteConfigured = D->RemoteConfigured;
-    in.AllowHalfRate = DeviceAllowHalfRate(D);
+    in.RateConvert = DeviceRateConvert(D);
+    in.Streamed = D->ActiveStreamed;
     PN_FORMAT_ACTION action = PnPlanStreamFormat(&in, &cfg);
     switch (action) {
     case PnFormatReconfigure: {
@@ -668,6 +677,7 @@ static PN_FORMAT_ACTION CheckStreamFormat(_Inout_ PPNA2DP_DEVICE D)
         } else {
             cfg.BitrateBps = cfg.MaxBitrateBps = A2dpNominalBitrate(&cfg);
             D->Active = cfg;
+            D->ActiveStreamed = FALSE;
         }
         break;
     }
@@ -681,6 +691,9 @@ static PN_FORMAT_ACTION CheckStreamFormat(_Inout_ PPNA2DP_DEVICE D)
         PN_INFO("receiver configured %u Hz; reconfiguring to %u Hz once the stream is open", D->Active.SampleRate, cfg.SampleRate);
         break;
     default:
+        /* #1: the pump converts; logged when the stream (re)starts, not on every pass */
+        if (D->ActiveValid && D->AudioStreamOpen && D->AudioRate != D->Active.SampleRate && !PumpIsStreaming(&D->Pump))
+            PN_INFO("engine %u Hz bridged to the %u Hz stream", D->AudioRate, D->Active.SampleRate);
         break;
     }
     return action;
@@ -1233,6 +1246,7 @@ static UCHAR OnRemoteSetConfiguration(_In_ PVOID Ctx, _In_ PAVDTP_LOCAL_SEP Loca
     KeAcquireSpinLock(&D->StatusLock, &irql);
     D->Active = cfg;
     D->ActiveValid = TRUE;
+    D->ActiveStreamed = FALSE;
     KeReleaseSpinLock(&D->StatusLock, irql);
     /* T3/T9/T10: the receiver drives this stream's setup; the worker gives its OPEN time */
     D->RemoteConfiguredHns = PnNowHns();
@@ -1251,6 +1265,7 @@ static UCHAR OnRemoteReconfigure(_In_ PVOID Ctx, _In_reads_bytes_(Len) const UCH
     KIRQL irql;
     KeAcquireSpinLock(&D->StatusLock, &irql);
     D->Active = cfg;
+    D->ActiveStreamed = FALSE;
     KeReleaseSpinLock(&D->StatusLock, irql);
     QueueAudioWork(D, FALSE);
     return 0;
@@ -1264,6 +1279,7 @@ static VOID OnStreamStateChanged(_In_ PVOID Ctx, _In_ AVDTP_STREAM_STATE Old, _I
         KIRQL irql;
         KeAcquireSpinLock(&D->StatusLock, &irql);
         D->ActiveValid = FALSE;
+        D->ActiveStreamed = FALSE;
         KeReleaseSpinLock(&D->StatusLock, irql);
         D->RemoteConfigured = FALSE;
         InterlockedExchange(&D->RemoteSuspended, 0);
@@ -1664,9 +1680,13 @@ NTSTATUS DeviceStart(_Inout_ PPNA2DP_DEVICE D)
         LOCALE_NEUTRAL, PLUGPLAY_PROPERTY_PERSISTENT, DEVPROP_TYPE_STRING,
         (ULONG)(nameBytes + sizeof(WCHAR)), D->Link.RemoteNameW);
     if (!NT_SUCCESS(nameStatus)) PN_WARN("device friendly name failed 0x%08x", nameStatus);
-    if (!NT_SUCCESS(RegCfgLoadDevice(D->DriverObject, D->Link.RemoteAddress, &D->Config))) {
+    NTSTATUS loaded = RegCfgLoadDevice(D->DriverObject, D->Link.RemoteAddress, &D->Config);
+    if (!NT_SUCCESS(loaded)) {
         RegCfgDefaults(&D->Config);
-        RegCfgSaveDevice(D->DriverObject, D->Link.RemoteAddress, &D->Config, D->Link.RemoteName);
+        /* only where nothing is stored: a saved configuration this build cannot read (another
+         * ABI, a rejected value, an I/O error) is never overwritten; SET_CONFIG saves it */
+        if (PnConfigShouldSaveDefaults(loaded)) RegCfgSaveDevice(D->DriverObject, D->Link.RemoteAddress, &D->Config, D->Link.RemoteName);
+        else PN_WARN("saved configuration not loaded (0x%08x): defaults in memory, the stored value is kept", loaded);
     }
     D->VolumeDb16 = D->Config.VolumeDb16;
     D->WorkConfig = D->Config;   /* each worker pass takes a fresh copy (ApplyIntents) */

@@ -112,6 +112,9 @@ typedef struct PNA2DP_DEVICE {
     PN_REJECTED_SET     Rejected;          /* (codec, remote SEID) pairs the receiver refused */
     BOOLEAN             CodecUpgradeTried;
     BOOLEAN             RemoteConfigured;  /* the receiver configured the current stream (AVDTP callback) */
+    BOOLEAN             ActiveStreamed;    /* the pump started on the current stream configuration: only such a
+                                            * stream is bridged across a Windows rate change (PnStreamBridged);
+                                            * set by StartPumpIfNeeded, cleared with each new configuration */
     BOOLEAN             SdpVersionApplied;
     BOOLEAN             ReceiverUnreachable;
     ULONG               OpenCollisions;    /* consecutive OPENs that crossed the receiver's (review #3) */

@@ -140,8 +140,6 @@ VOID PumpFinishStream(_Inout_ PPN_PUMP P, _In_reads_bytes_opt_(TailBytes) const 
 {
     PPN_PCM_RING R = &P->Ring;
     ULONG block = P->WakeBytes;
-    /* blocks of silence that push the encoder's delay out: FDK AAC holds ~1600 frames */
-    ULONG extra = P->Cfg.Codec == PNA2DP_CODEC_AAC ? 2 : 1;
     BOOLEAN padded = FALSE, wake = FALSE;
     KIRQL irql;
     KeAcquireSpinLock(&R->Lock, &irql);
@@ -160,10 +158,10 @@ VOID PumpFinishStream(_Inout_ PPN_PUMP P, _In_reads_bytes_opt_(TailBytes) const 
         /* an empty ring (the pump took every whole block) still gets its silence: the encoder
          * drains and the resumed audio fades in (findings #1/#7) */
         if (avail) RingFadeTailLocked(R, PN_MIN(avail / R->BytesPerFrame, R->SampleRate * PN_TRIM_FADE_MS / 1000));
-        ULONG residual = avail % block;
-        ULONG pad = (residual ? block - residual : 0) + extra * block;
-        ULONG room = R->Capacity - avail;
-        if (pad > room) pad = room - room % block;
+        /* blocks of silence that push the encoder's delay out (FDK AAC holds ~1600 frames) and,
+         * converting, the rate converter's and a short block's (audio_policy.h PnFinishExtraBlocks) */
+        ULONG extra = PnFinishExtraBlocks(P->Cfg.Codec, block / R->BytesPerFrame, P->Rate.DelayEngineFrames);
+        ULONG pad = PnFinishPadBytes(avail, block, extra, R->Capacity - avail);
         for (ULONG done = 0; done < pad;) {
             ULONG off = (ULONG)((R->WritePos + done) % R->Capacity);
             ULONG n = PN_MIN(pad - done, R->Capacity - off);
@@ -248,6 +246,12 @@ VOID PumpReleaseInput(_Inout_ PPN_PUMP P)
 /* ------------------------------------------------------------------------- */
 /* PCM conversion to encoder input                                              */
 /* ------------------------------------------------------------------------- */
+
+/* Bytes of one sample in a PNA2DP_FMT_* encoder format. */
+static ULONG PcmFormatBytes(ULONG Fmt)
+{
+    return Fmt == PNA2DP_FMT_S16 ? 2 : Fmt == PNA2DP_FMT_S24 ? 3 : 4;
+}
 
 /* Converts `Frames` interleaved frames from the ring format to Target format with gain. */
 static ULONG ConvertPcm(_In_ PPN_PUMP P, _In_reads_bytes_(InBytes) const UCHAR *In, _In_ ULONG InBytes, _Out_writes_bytes_(OutCap) PUCHAR Out, _In_ ULONG OutCap,
@@ -429,10 +433,13 @@ static ULONG AbrBitrateAtLevel(_In_ PPN_PUMP P, ULONG Level, _Out_opt_ A2DP_CODE
     return A2dpQualityAtLevel(&base, Level, P->Abr.FloorBps, Result);
 }
 
-/* Bytes of one encoder input block in the ring (2:1 decimation doubles them). */
+/* Ring bytes one encoder input block of Frames codec frames can take: at the engine rate, the
+ * most the rate converter needs for them from any state (PnPcmMaxInputFrames; exact when the
+ * rates are equal). Sizes the PCM block and the wake level. */
 static ULONG PumpBlockBytes(_In_ PPN_PUMP P, ULONG Frames)
 {
-    return Frames * P->PcmFramesPerCodecFrame * P->Decimation * P->Ring.BytesPerFrame;
+    ULONGLONG bytes = (ULONGLONG)PnPcmMaxInputFrames(&P->Rate, Frames * P->PcmFramesPerCodecFrame) * P->Ring.BytesPerFrame;
+    return bytes > 0xFFFFFFFFull ? 0xFFFFFFFFu : (ULONG)bytes;
 }
 
 /* SBC frames per packet for the encoder's current bitpool (findings #6, #8): a bitpool
@@ -440,7 +447,7 @@ static ULONG PumpBlockBytes(_In_ PPN_PUMP P, ULONG Frames)
  * frames into fewer packets so the reduction frees air. Within the pump's PCM block. */
 static VOID PumpSbcRepack(_Inout_ PPN_PUMP P)
 {
-    ULONG n = A2dpSbcFramesPerPacket(&P->Cfg, P->TargetLatencyMs, P->PayloadRoom, P->TxHeaderBytes, P->SbcSduBytes);
+    ULONG n = A2dpSbcFramesPerPacket(&P->Cfg, PnSbcPackingTargetMs(P->TargetLatencyMs), P->PayloadRoom, P->TxHeaderBytes, P->SbcSduBytes);
     if (!n) n = 1;
     while (n > 1 && PumpBlockBytes(P, n) > PN_PUMP_MAX_PCM_BLOCK) n--;
     P->CodecFramesPerPacket = n;
@@ -479,6 +486,13 @@ static VOID AbrTick(_Inout_ PPN_PUMP P)
     ULONG effTarget, effMax;
     PnEffectiveLatencyMs(P->TargetLatencyMs, P->MaxLatencyMs, PN_PUMP_RING_MS, &effTarget, &effMax);
     s.TargetLatencyUs = effTarget * 1000;
+    /* latency profiles: the ring at both ends of the window (draining) and the backlog the
+     * profile's buffer absorbs before slow writes count (0 up to a 60 ms target) */
+    ULONG ringUs = RingLatencyUs(P);
+    s.RingStartUs = P->Abr.LastRingUs;
+    s.RingEndUs = ringUs;
+    P->Abr.LastRingUs = ringUs;
+    s.SoftGateUs = PnAbrSoftGateUs(effTarget);
     ULONGLONG deliveredFrames;
     KIRQL irql;
     KeAcquireSpinLock(&P->TxLock, &irql);
@@ -555,7 +569,8 @@ static BOOLEAN PumpStepSbc(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In_ ULONG
     if (P->CodecFrameBytes && framesPerPacket * P->CodecFrameBytes > P->PayloadRoom)
         framesPerPacket = PN_MAX(P->PayloadRoom / P->CodecFrameBytes, 1u);
     ULONG pcmFrames = framesPerPacket * P->PcmFramesPerCodecFrame;
-    ULONG ringFrames = pcmFrames * P->Decimation;   /* engine frames; 2:1 decimation halves them */
+    /* engine frames that make exactly pcmFrames codec frames from the converter's state */
+    ULONG ringFrames = PnPcmInputFramesFor(&P->PcmState, pcmFrames);
     ULONG needBytes = ringFrames * P->Ring.BytesPerFrame;
     if (needBytes > PcmCap) return FALSE;
     if (RingAvailable(&P->Ring) < needBytes) return FALSE;
@@ -568,7 +583,8 @@ static BOOLEAN PumpStepSbc(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In_ ULONG
      * being rounded to 16 bits first (16-bit input at unity gain encodes bit-exactly). */
     ULONG channels = P->Sbc.channels;
     ULONG pcmPerFrame = P->PcmFramesPerCodecFrame;
-    ULONG convBytes = ConvertPcm(P, PcmBuf, got, P->ConvBuffer, P->ConvCapacity, PNA2DP_FMT_S32, channels);
+    ULONG convBytes = ConvertPcm(P, PcmBuf, got, P->ConvBuffer, PN_MIN(P->ConvCapacity, pcmFrames * channels * (ULONG)sizeof(LONG)),
+                                 PNA2DP_FMT_S32, channels);
     if (convBytes < pcmFrames * channels * sizeof(LONG)) return FALSE;
     const LONG *s32 = (const LONG *)P->ConvBuffer;
     ULONG n = 0, count = 0;
@@ -608,7 +624,7 @@ static BOOLEAN PumpStepHostSubmit(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In
     if (P->HostOutstanding >= PN_PUMP_HOST_WINDOW) return FALSE;
     if (P->HostResultCount >= PN_PUMP_HOST_WINDOW) return FALSE;
     ULONG pcmFrames = P->CodecFramesPerPacket * P->PcmFramesPerCodecFrame;
-    ULONG ringFrames = pcmFrames * P->Decimation;
+    ULONG ringFrames = PnPcmInputFramesFor(&P->PcmState, pcmFrames);   /* engine frames for exactly pcmFrames */
     ULONG needBytes = ringFrames * P->Ring.BytesPerFrame;
     if (needBytes > PcmCap) return FALSE;
     if (RingAvailable(&P->Ring) < needBytes) return FALSE;
@@ -623,7 +639,8 @@ static BOOLEAN PumpStepHostSubmit(_Inout_ PPN_PUMP P, _Inout_ PUCHAR PcmBuf, _In
     ULONG got = RingRead(&P->Ring, PcmBuf, needBytes);
     if (got < needBytes) RtlZeroMemory(PcmBuf + got, needBytes - got);
     P->Stats.PcmFramesConsumed += ringFrames;
-    ULONG convBytes = dst ? ConvertPcm(P, PcmBuf, needBytes, dst, dstCap, P->EncoderPcmFormat, P->Cfg.Channels) : 0;
+    ULONG outBytes = pcmFrames * P->Cfg.Channels * PcmFormatBytes(P->EncoderPcmFormat);
+    ULONG convBytes = dst ? ConvertPcm(P, PcmBuf, needBytes, dst, PN_MIN(dstCap, outBytes), P->EncoderPcmFormat, P->Cfg.Channels) : 0;
 
     PNA2DP_CODEC_WORK hdr;
     RtlZeroMemory(&hdr, sizeof(hdr));
@@ -806,22 +823,27 @@ static VOID PumpTrim(_Inout_ PPN_PUMP P, _In_ ULONG KeepMs)
 {
     PPN_PCM_RING R = &P->Ring;
     ULONG fade = 0, drop = 0;
+    /* a crossfade not started yet (a stall trims again before anything was converted) keeps
+     * its source: that continues the audio played last, the newly dropped audio does not */
+    BOOLEAN pending = PnPcmFadePending(&P->PcmState);   /* PcmState belongs to the pump thread */
     KIRQL irql;
     KeAcquireSpinLock(&R->Lock, &irql);
     if (R->Buffer && R->Capacity && R->BytesPerFrame && R->SampleRate) {
         ULONG keepBytes = (ULONG)((ULONGLONG)R->SampleRate * KeepMs / 1000) * R->BytesPerFrame;
         drop = PnTrimPlan(RingAvailableLocked(R), keepBytes, R->BytesPerFrame, R->SampleRate * PN_TRIM_FADE_MS / 1000,
-                          P->FadeBuffer ? PN_PUMP_FADE_BYTES : 0, &fade);
-        if (fade && P->FadeBuffer) RingPeekLocked(R, P->FadeBuffer, fade * R->BytesPerFrame);
+                          P->FadeBuffer && !pending ? PN_PUMP_FADE_BYTES : 0, &fade);
+        if (fade && P->FadeBuffer && !pending) RingPeekLocked(R, P->FadeBuffer, fade * R->BytesPerFrame);
         R->ReadPos += drop;
         R->DroppedBytes += drop;
     }
     KeReleaseSpinLock(&R->Lock, irql);
     if (!drop) return;
-    /* replaces a crossfade still in progress: its source was older audio anyway */
-    P->PcmState.FadeOut = fade ? P->FadeBuffer : NULL;
-    P->PcmState.FadeFrames = fade;
-    P->PcmState.FadePos = 0;
+    /* replaces a crossfade in progress (its source was older audio anyway); a pending one stays */
+    if (!pending) {
+        P->PcmState.FadeOut = fade ? P->FadeBuffer : NULL;
+        P->PcmState.FadeFrames = fade;
+        P->PcmState.FadePos = 0;
+    }
     P->Stats.Underruns++;   /* ABI name; counts latency-trim events */
     P->Abr.Trims++;
 }
@@ -1009,10 +1031,11 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
     PumpStopStream(P);
     if (!P->Running || !P->ConvBuffer || !P->Ring.Buffer || !P->Ring.BytesPerFrame) return STATUS_INVALID_DEVICE_STATE;
     if (!Cfg->SampleRate || !Cfg->Channels || !Media) return STATUS_INVALID_PARAMETER;
-    // The only rate conversion is the 2:1 half-band decimator (96 -> 48 kHz, 88.2 -> 44.1 kHz).
-    // Never play 48 kHz PCM at 44.1 kHz.
-    if (Cfg->SampleRate != P->Ring.SampleRate && P->Ring.SampleRate != 2 * Cfg->SampleRate) return STATUS_NOT_SUPPORTED;
-    P->Decimation = P->Ring.SampleRate == Cfg->SampleRate ? 1 : 2;
+    /* The engine rate is converted to the codec rate (pcm.h PnPcmRatePlan: equal, exactly 2:1, or
+     * 44.1 / 48 / 88.2 / 96 kHz to 44.1 / 48 kHz). Never play PCM at another rate unconverted. */
+    PN_PCM_RATE_PLAN rate;
+    if (!PnPcmRatePlan(P->Ring.SampleRate, Cfg->SampleRate, &rate)) return STATUS_NOT_SUPPORTED;
+    P->Rate = rate;
 
     P->Cfg = *Cfg;
     P->Media = Media;
@@ -1034,6 +1057,7 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
     InterlockedExchange(&P->Abr.QueueFull, 0);
     P->Abr.Trims = 0;
     P->Abr.BacklogPeakUs = 0;
+    P->Abr.LastRingUs = 0;
     P->Abr.FloorBps = User->AbrFloorBps;
     P->Abr.LastObservationHns = PnNowHns();
     P->StallReported = FALSE;
@@ -1050,7 +1074,7 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
     InterlockedExchange(&P->ResumeFade, 0);
     PumpFlush(P);
     P->Finished = FALSE;
-    PnPcmStateReset(&P->PcmState, P->Decimation, midProgramme);
+    PnPcmStateResetRate(&P->PcmState, &P->Rate, midProgramme);   /* a fresh converter per stream */
     InterlockedExchange(&P->HostWaitingForWork, 0);
     P->TxHeaderBytes = (P->UseRtpHeader ? RTP_HEADER_SIZE : 0) + (P->UsePayloadHeader ? 1 : 0);
     P->PayloadRoom = P->MediaMtu - P->TxHeaderBytes;
@@ -1088,7 +1112,7 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
                                       D->Link.RemoteFeaturesValid, D->Link.RemoteFeatures);
         A2DP_SBC_STREAM_PLAN plan;
         if (!A2dpSbcPlanStream(Cfg, (User->Flags & PNA2DP_CFG_SBC_XQ) != 0, localSdu, xqSdu, payloadRoom, P->TxHeaderBytes,
-                               P->TargetLatencyMs, &plan)) return STATUS_NOT_SUPPORTED;
+                               PnSbcPackingTargetMs(P->TargetLatencyMs), &plan)) return STATUS_NOT_SUPPORTED;
         sp.bitpool = plan.StartBitpool;
         if (sbc_encoder_init(&P->Sbc, &sp) != 0) return STATUS_INVALID_PARAMETER;
         /* a bitpool lowered live stays the ABR's top rung across the restart; a live change
@@ -1137,6 +1161,10 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
         P->PcmFramesPerCodecFrame = (Cfg->SampleRate >= 88200) ? 256 : 128;
         P->CodecFramesPerPacket = 2;   /* blocks of 2 LDAC frames: the plugin packs per MTU and never queues more than one packet per call */
         P->EncoderPcmFormat = Cfg->PcmFormat ? Cfg->PcmFormat : PNA2DP_FMT_S32;
+        /* converted audio is not re-quantised to 16 bits: the automatic format takes S32 (a stream
+         * set up for a 16-bit engine at its own rate, then bridged to another engine rate) */
+        if (P->Rate.EngineRate != P->Rate.CodecRate && !User->Ldac.FormatMask && P->EncoderPcmFormat == PNA2DP_FMT_S16)
+            P->EncoderPcmFormat = PNA2DP_FMT_S32;
         P->LdacBaseQuality = PnLdacAbrQuality(Cfg->LdacEqmid, 0);
         P->Abr.MaxLevel = 2 - P->LdacBaseQuality;
         break;
@@ -1151,8 +1179,8 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
     }
     /* Rounding to S16 is dithered (kernel SBC takes S32 and needs none). */
     P->PcmState.Dither = P->Owner == PnEncoderHost && P->EncoderPcmFormat == PNA2DP_FMT_S16;
-    /* one encoder block must fit the pump's PCM buffer (2:1 decimation doubles it); aptX
-     * keeps whole sync periods */
+    /* one encoder block must fit the pump's PCM buffer (at an engine rate above the codec rate
+     * the block takes more ring bytes); aptX keeps whole sync periods */
     BOOLEAN aptx = Cfg->Codec == PNA2DP_CODEC_APTX || Cfg->Codec == PNA2DP_CODEC_APTX_HD || Cfg->Codec == PNA2DP_CODEC_APTX_LL;
     while (P->CodecFramesPerPacket > 1 && PumpBlockBytes(P, P->CodecFramesPerPacket) > PN_PUMP_MAX_PCM_BLOCK)
         P->CodecFramesPerPacket -= (aptx && P->CodecFramesPerPacket > PN_APTX_SYNC_BLOCKS) ? PN_APTX_SYNC_BLOCKS : 1;
@@ -1184,8 +1212,9 @@ NTSTATUS PumpStartStream(_Inout_ PPN_PUMP P, _In_ const A2DP_CODEC_CONFIG *Cfg, 
             return status;
         }
     }
-    PN_INFO("pump start: %s %u Hz ch %u bitrate %u, %u frames/packet, mtu %u, owner %u, engine %u Hz", A2dpCodecName(Cfg->Codec), Cfg->SampleRate,
-            Cfg->Channels, P->Cfg.BitrateBps, P->CodecFramesPerPacket, P->MediaMtu, P->Owner, P->Ring.SampleRate);
+    PN_INFO("pump start: %s %u Hz ch %u bitrate %u, %u frames/packet, mtu %u, owner %u, engine %u Hz (2:1 %u, polyphase %u/%u, +%u frames)",
+            A2dpCodecName(Cfg->Codec), Cfg->SampleRate, Cfg->Channels, P->Cfg.BitrateBps, P->CodecFramesPerPacket, P->MediaMtu, P->Owner,
+            P->Ring.SampleRate, P->Rate.Decimate == 2, P->Rate.Rs ? P->Rate.Rs->L : 0, P->Rate.Rs ? P->Rate.Rs->M : 0, P->Rate.DelayEngineFrames);
     AbrTick(P); // publish this stream's codec/range before callers observe it
     /* PCM writes wake the thread once a whole encoder input block is buffered */
     P->WakeBytes = PN_MIN(PumpBlockBytes(P, P->CodecFramesPerPacket), (ULONG)PN_PUMP_MAX_PCM_BLOCK);
@@ -1333,7 +1362,7 @@ ULONG PumpPipelineLatencyUs(_In_ PPN_PUMP P)
     if (R->Buffer && R->BytesPerFrame) {
         ringFrames = RingAvailableLocked(R) / R->BytesPerFrame;
         ringRate = R->SampleRate;
-        if (P->StreamActive && P->Decimation == 2) ringFrames += PN_HB_CENTER;   /* half-band group delay */
+        if (P->StreamActive) ringFrames += P->Rate.DelayEngineFrames;   /* the rate converter's latency (0 at equal rates) */
     }
     KeReleaseSpinLock(&R->Lock, irql);
     KeAcquireSpinLock(&P->HostLock, &irql);

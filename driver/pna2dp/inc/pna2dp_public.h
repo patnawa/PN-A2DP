@@ -194,7 +194,10 @@ typedef struct _PNA2DP_STATUS {
     ULONG      RemoteSeid;
     ULONG      ActiveFormatIndex; /* index in the WaveRT format table */
     ULONG      EncoderOwner;      /* 0 none, 1 kernel, 2 host */
-    ULONG      Reserved[4];
+    /* Former Reserved[4] (0.1.0.22): size and offsets unchanged; older drivers report 0. */
+    ULONG      EngineSampleRate;  /* Windows audio engine (WaveRT) rate while a stream is open, else 0;
+                                     differs from SampleRate when the driver converts (RATE_CONVERTED) */
+    ULONG      Reserved[3];
 } PNA2DP_STATUS, *PPNA2DP_STATUS;
 
 #define PNA2DP_STATUS_FLAG_SCO_ACTIVE        0x00000001
@@ -208,7 +211,8 @@ typedef struct _PNA2DP_STATUS {
 #define PNA2DP_STATUS_FLAG_REMOTE_VOLUME     0x00000100  /* Windows confirmed receiver volume */
 #define PNA2DP_STATUS_FLAG_REMOTE_SUSPENDED  0x00000200  /* the receiver suspended the stream */
 #define PNA2DP_STATUS_FLAG_UNREACHABLE       0x00000400  /* link lost or media stalled; retrying */
-#define PNA2DP_STATUS_FLAG_HALF_RATE         0x00000800  /* engine at twice SampleRate: 2:1 decimation */
+#define PNA2DP_STATUS_FLAG_HALF_RATE         0x00000800  /* engine at twice SampleRate: the 2:1 decimator alone */
+#define PNA2DP_STATUS_FLAG_RATE_CONVERTED    0x00001000  /* streaming through the sample-rate converter: EngineSampleRate != SampleRate */
 
 /* One remote stream endpoint (SEP) as reported by AVDTP GET_(ALL_)CAPABILITIES. */
 typedef struct _PNA2DP_REMOTE_SEP {

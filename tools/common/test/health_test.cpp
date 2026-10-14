@@ -122,6 +122,7 @@ int wmain(int argc, wchar_t **argv) {
     auto report = pn::DiagnosticReport(h, history, 4000, L"0.1.0.27");
     CHECK(report.find(L"PRIVATE_SENTINEL") == std::wstring::npos && report.find(L"112233445566") == std::wstring::npos, "allowlist excludes names identifiers addresses and freeform details");
     CHECK(report.find(L"schema 1") != std::wstring::npos && report.find(L"Saved preferences") != std::wstring::npos && report.find(L"age_ms,") != std::wstring::npos, "report includes schema config and timeline");
+    CHECK(report.find(L"; Windows rate ") != std::wstring::npos && report.find(L"; flags ") != std::wstring::npos, "report includes the Windows rate the driver converts from (0.1.0.22)");
     h.demo = true;
     CHECK(pn::DiagnosticReport(h, history, 4000, L"test").find(L"DEMO") != std::wstring::npos, "demo report cannot be confused with hardware evidence");
     wchar_t folder[MAX_PATH]{}, path[MAX_PATH]{}; GetTempPathW(MAX_PATH, folder); GetTempFileNameW(folder, L"pnh", 0, path);

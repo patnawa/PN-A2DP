@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "pnctl.h"
+#include "config_policy.h"
 #include <cfgmgr32.h>
 #include <devpkey.h>
 #include <stdio.h>
@@ -227,8 +228,24 @@ std::wstring StatusFlagsText(ULONG f)
     if (f & PNA2DP_STATUS_FLAG_RADIO_IN_RANGE) add(L"in range");
     if (f & PNA2DP_STATUS_FLAG_REMOTE_SUSPENDED) add(L"suspended by receiver");
     if (f & PNA2DP_STATUS_FLAG_UNREACHABLE) add(L"receiver unreachable");
-    if (f & PNA2DP_STATUS_FLAG_HALF_RATE) add(L"2:1 rate conversion");
+    if (f & PNA2DP_STATUS_FLAG_RATE_CONVERTED) add((f & PNA2DP_STATUS_FLAG_HALF_RATE) ? L"rate converted (2:1)" : L"rate converted");
+    else if (f & PNA2DP_STATUS_FLAG_HALF_RATE) add(L"2:1 rate conversion");   /* drivers before 0.1.0.22 */
     return r.empty() ? L"-" : r;
+}
+
+std::wstring StreamFormatText(const PNA2DP_STATUS &s, bool withEngineRate)
+{
+    std::wstring r = std::to_wstring(s.SampleRate) + L" Hz";
+    if (withEngineRate && s.EngineSampleRate && s.EngineSampleRate != s.SampleRate) r += L" (Windows " + std::to_wstring(s.EngineSampleRate) + L" Hz, converted)";
+    return r + L", " + std::to_wstring(s.Channels) + L" ch, " + std::to_wstring(s.BitsPerSample) + L"-bit in";
+}
+
+std::wstring EngineRateText(const PNA2DP_STATUS &s)
+{
+    if (!s.EngineSampleRate) return L"-";
+    std::wstring r = std::to_wstring(s.EngineSampleRate) + L" Hz";
+    if (!s.SampleRate) return r;   /* Windows is open before the Bluetooth stream is configured */
+    return s.EngineSampleRate == s.SampleRate ? r + L", no conversion" : r + L", converted to " + std::to_wstring(s.SampleRate) + L" Hz";
 }
 
 std::wstring NtStatusText(ULONG status)
@@ -347,29 +364,48 @@ std::wstring DescribeSep(const PNA2DP_REMOTE_SEP &s)
 
 void ConfigDefaults(PNA2DP_CONFIG &c)
 {
-    ZeroMemory(&c, sizeof(c));
-    c.Size = sizeof(c);
-    c.Version = PNA2DP_ABI_VERSION;
-    c.CodecPriority[0] = PNA2DP_CODEC_LDAC;
-    c.CodecPriority[1] = PNA2DP_CODEC_APTX_HD;
-    c.CodecPriority[2] = PNA2DP_CODEC_AAC;
-    c.CodecPriority[3] = PNA2DP_CODEC_APTX;
-    c.CodecPriority[4] = PNA2DP_CODEC_APTX_LL;
-    c.CodecPriority[5] = PNA2DP_CODEC_SBC;
-    c.EnabledCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_AAC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX) |
-                         PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_HD) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_LL) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_LDAC);
-    c.Flags = PNA2DP_CFG_ABR_ENABLE | PNA2DP_CFG_APPLY_LIVE | PNA2DP_CFG_SUSPEND_ON_SCO | PNA2DP_CFG_DELAY_REPORTING | PNA2DP_CFG_SOFTWARE_VOLUME | PNA2DP_CFG_AUTO_QUALITY;
-    c.TargetLatencyMs = 60;
-    c.MaxLatencyMs = 250;
-    c.AbrFloorBps = 128000;
-    c.VolumeDb16 = 0;
-    c.ReconnectDelayMs = 2000;
-    c.Sbc.MinBitpool = 2;
-    c.Sbc.MaxBitpool = 0;
-    c.Aac.Vbr = 1;
-    c.Aac.BitrateBps = 0;
-    c.Ldac.Eqmid = PNA2DP_LDAC_EQMID_SQ;
-    c.Ldac.AbrEnable = 1;
+    PnConfigDefaults(&c);
+}
+
+ULONG LatencyProfileOf(const PNA2DP_CONFIG &c)
+{
+    return PnLatencyProfileOf(c.TargetLatencyMs, c.MaxLatencyMs);
+}
+
+void ApplyLatencyProfile(PNA2DP_CONFIG &c, ULONG profile)
+{
+    PnApplyLatencyProfile(&c, profile);
+}
+
+const wchar_t *LatencyProfileKey(ULONG profile)
+{
+    switch (profile) {
+    case PN_LATENCY_PROFILE_LOW: return L"low";
+    case PN_LATENCY_PROFILE_BALANCED: return L"balanced";
+    case PN_LATENCY_PROFILE_MUSIC: return L"music";
+    default: return L"custom";
+    }
+}
+
+const wchar_t *LatencyProfileName(ULONG profile)
+{
+    switch (profile) {
+    case PN_LATENCY_PROFILE_LOW: return L"Low latency";
+    case PN_LATENCY_PROFILE_BALANCED: return L"Balanced";
+    case PN_LATENCY_PROFILE_MUSIC: return L"Music";
+    default: return L"Custom";
+    }
+}
+
+bool LatencyProfileFromKey(const wchar_t *key, ULONG &profile)
+{
+    if (!key) return false;
+    if (!_wcsicmp(key, L"low") || !_wcsicmp(key, L"lowlatency")) profile = PN_LATENCY_PROFILE_LOW;
+    else if (!_wcsicmp(key, L"balanced")) profile = PN_LATENCY_PROFILE_BALANCED;
+    else if (!_wcsicmp(key, L"music")) profile = PN_LATENCY_PROFILE_MUSIC;
+    else if (!_wcsicmp(key, L"custom")) profile = PN_LATENCY_PROFILE_CUSTOM;
+    else return false;
+    return true;
 }
 
 ULONG SbcFrameBytes(ULONG nsb, ULONG nblk, ULONG chmode, ULONG bp)
@@ -507,7 +543,7 @@ const wchar_t *PresetName(Preset p)
 {
     switch (p) {
     case Preset::BestQuality: return L"Best quality";
-    case Preset::Balanced: return L"Balanced (driver defaults)";
+    case Preset::Balanced: return L"Driver defaults (best quality, balanced buffering)";
     case Preset::LowLatency: return L"Low latency";
     case Preset::Compatibility: return L"Compatibility (SBC only)";
     case Preset::SbcXq: return L"SBC XQ (dual channel, radio-sized packets)";
@@ -518,8 +554,8 @@ const wchar_t *PresetName(Preset p)
 const wchar_t *PresetDescription(Preset p)
 {
     switch (p) {
-    case Preset::BestQuality: return L"LDAC 990 kbps 24-bit first, then aptX HD, AAC 320 kbps, aptX, SBC. ABR on, 80 ms buffer.";
-    case Preset::Balanced: return L"LDAC 660 kbps with ABR, then aptX HD, AAC, aptX, aptX LL, SBC. 60 ms buffer.";
+    case Preset::BestQuality: return L"LDAC 990 kbps 24-bit first, then aptX HD, AAC 320 kbps, aptX, SBC at the receiver's maximum bitpool. ABR on, Music buffering (150 / 450 ms).";
+    case Preset::Balanced: return L"LDAC 990 kbps, aptX HD, AAC 320 kbps, aptX, aptX LL, SBC at the receiver's maximum, each with ABR. Balanced buffering (60 / 250 ms).";
     case Preset::LowLatency: return L"aptX Low Latency, aptX, SBC with a 30 ms buffer and ABR; no LDAC/AAC (they buffer more).";
     case Preset::Compatibility: return L"SBC only at the sink's own limits. Use when a headset misbehaves with other codecs.";
     case Preset::SbcXq: return L"SBC only, dual channel, 16 blocks, 8 subbands at the receiver's maximum bitpool (617 / 672 kbps at bitpool 53), packed to the radio's EDR packets.";
@@ -545,8 +581,8 @@ void ApplyPreset(PNA2DP_CONFIG &c, Preset p)
         order({ PNA2DP_CODEC_LDAC, PNA2DP_CODEC_APTX_HD, PNA2DP_CODEC_AAC, PNA2DP_CODEC_APTX, PNA2DP_CODEC_SBC });
         c.Ldac.Eqmid = PNA2DP_LDAC_EQMID_HQ; c.Ldac.AbrEnable = 1; c.Ldac.FormatMask = PNA2DP_FMT_S24;
         c.Aac.BitrateBps = 320000; c.Aac.Vbr = 0;
-        c.Sbc.MaxBitpool = 53; c.Sbc.AllowBitpoolOverride = 0;
-        c.TargetLatencyMs = 80; c.MaxLatencyMs = 300;
+        c.Sbc.MaxBitpool = 0; c.Sbc.AllowBitpoolOverride = 0;   /* the receiver's maximum (53 lowered receivers that offer more) */
+        PnApplyLatencyProfile(&c, PN_LATENCY_PROFILE_MUSIC);
         c.Flags |= PNA2DP_CFG_ABR_ENABLE; c.Flags &= ~(PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_SBC_XQ);
         break;
     case Preset::Balanced: {
@@ -557,7 +593,7 @@ void ApplyPreset(PNA2DP_CONFIG &c, Preset p)
     }
     case Preset::LowLatency:
         order({ PNA2DP_CODEC_APTX_LL, PNA2DP_CODEC_APTX, PNA2DP_CODEC_SBC });
-        c.TargetLatencyMs = 30; c.MaxLatencyMs = 120;
+        PnApplyLatencyProfile(&c, PN_LATENCY_PROFILE_LOW);
         c.Sbc.MaxBitpool = 53; c.Sbc.AllowBitpoolOverride = 0;
         c.Flags |= PNA2DP_CFG_ABR_ENABLE; c.Flags &= ~(PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_SBC_XQ);
         break;
@@ -581,6 +617,20 @@ void ApplyPreset(PNA2DP_CONFIG &c, Preset p)
         break;
     }
     c.EnabledCodecMask |= PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);
+}
+
+/* "balanced" and "low" are latency profile words (latency.profile=): as preset keys they would
+ * replace the whole configuration, so they are not accepted here (review #5). */
+bool PresetFromKey(const wchar_t *key, Preset &p)
+{
+    if (!key) return false;
+    if (!_wcsicmp(key, L"best") || !_wcsicmp(key, L"bestquality")) p = Preset::BestQuality;
+    else if (!_wcsicmp(key, L"defaults")) p = Preset::Balanced;
+    else if (!_wcsicmp(key, L"lowlatency")) p = Preset::LowLatency;
+    else if (!_wcsicmp(key, L"compat") || !_wcsicmp(key, L"compatibility")) p = Preset::Compatibility;
+    else if (!_wcsicmp(key, L"sbcxq")) p = Preset::SbcXq;
+    else return false;
+    return true;
 }
 
 /* ---- text round trip ---------------------------------------------------- */
@@ -682,8 +732,14 @@ std::wstring ConfigToText(const PNA2DP_CONFIG &c)
     AppendLine(out, L"ldac.quality=%s", c.Ldac.Eqmid == 0 ? L"hq" : c.Ldac.Eqmid == 1 ? L"sq" : c.Ldac.Eqmid == 2 ? L"mq" : L"abr");
     AppendLine(out, L"ldac.abr=%u", c.Ldac.AbrEnable);
     AppendLine(out, L"abr=%u", (c.Flags & PNA2DP_CFG_ABR_ENABLE) ? 1 : 0);
-    AppendLine(out, L"latency=%u", c.TargetLatencyMs);
-    AppendLine(out, L"maxlatency=%u", c.MaxLatencyMs);
+    /* a named profile is one line; only Custom spells out both values (so an edited profile
+     * line is not overridden by later lines) */
+    ULONG profile = LatencyProfileOf(c);
+    AppendLine(out, L"latency.profile=%s", LatencyProfileKey(profile));
+    if (profile == PN_LATENCY_PROFILE_CUSTOM) {
+        AppendLine(out, L"latency=%u", c.TargetLatencyMs);
+        AppendLine(out, L"maxlatency=%u", c.MaxLatencyMs);
+    }
     AppendLine(out, L"allrates=%u", (c.Flags & PNA2DP_CFG_EXPOSE_ALL_RATES) ? 1 : 0);
     AppendLine(out, L"swvolume=%u", (c.Flags & PNA2DP_CFG_SOFTWARE_VOLUME) ? 1 : 0);
     AppendLine(out, L"delayreport=%u", (c.Flags & PNA2DP_CFG_DELAY_REPORTING) ? 1 : 0);
@@ -807,6 +863,7 @@ bool ConfigFromText(const std::wstring &text, PNA2DP_CONFIG &c)
         else if (k == L"ldac.quality") { if (vl == L"hq") n.Ldac.Eqmid = 0; else if (vl == L"sq") n.Ldac.Eqmid = 1; else if (vl == L"mq") n.Ldac.Eqmid = 2; else if (vl == L"abr") n.Ldac.Eqmid = PNA2DP_LDAC_EQMID_ABR; }
         else if (k == L"ldac.abr") setU8(n.Ldac.AbrEnable, 1);
         else if (k == L"abr") flag(PNA2DP_CFG_ABR_ENABLE);
+        else if (k == L"latency.profile") { ULONG profile; if (LatencyProfileFromKey(vl.c_str(), profile)) PnApplyLatencyProfile(&n, profile); else recognised--; }
         else if (k == L"latency") { if (isNum) n.TargetLatencyMs = num; }
         else if (k == L"maxlatency") { if (isNum) n.MaxLatencyMs = num; }
         else if (k == L"allrates") flag(PNA2DP_CFG_EXPOSE_ALL_RATES);

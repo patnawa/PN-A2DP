@@ -11,24 +11,17 @@
 #include "pnctl.h"
 #include "pndrv.h"
 #include "pnretry.h"
+#include "config_policy.h"
 
 static int g_fail = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { g_fail++; printf("FAIL %s:%d  ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-/* mirror of driver/pna2dp/src/regcfg.cpp RegCfgValidate: returns true when the driver would keep the config unchanged */
+/* the driver's own validation (regcfg.cpp RegCfgValidate = config_policy.h PnConfigValidate):
+ * true when the driver would store the config unchanged */
 static bool DriverKeepsUnchanged(const PNA2DP_CONFIG &in)
 {
     PNA2DP_CONFIG c = in;
-    if (c.Size != sizeof(c) || c.Version != PNA2DP_ABI_VERSION) return false;
-    if (c.TargetLatencyMs < 20) c.TargetLatencyMs = 20;
-    if (c.TargetLatencyMs > 400) c.TargetLatencyMs = 400;
-    if (c.MaxLatencyMs < c.TargetLatencyMs + 20) c.MaxLatencyMs = c.TargetLatencyMs + 20;
-    if (c.MaxLatencyMs > 1000) c.MaxLatencyMs = 1000;
-    if (c.Sbc.MinBitpool && c.Sbc.MinBitpool < 2) c.Sbc.MinBitpool = 2;
-    if (c.Sbc.MaxBitpool > 250) c.Sbc.MaxBitpool = 250;
-    if (c.Sbc.MaxBitpool && c.Sbc.MinBitpool > c.Sbc.MaxBitpool) c.Sbc.MinBitpool = c.Sbc.MaxBitpool;
-    c.EnabledCodecMask |= PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);
-    return memcmp(&c, &in, sizeof(c)) == 0;
+    return PnConfigValidate(&c) && memcmp(&c, &in, sizeof(c)) == 0;
 }
 
 static void TestConfigText()
@@ -38,6 +31,7 @@ static void TestConfigText()
     a.TargetLatencyMs = 90; a.MaxLatencyMs = 333; a.AbrFloorBps = 200000; a.VolumeDb16 = -6 * 65536 - 32768; a.ReconnectDelayMs = 4321;
     a.Sbc.MaxBitpool = 47; a.Sbc.BlockMask = PNA2DP_SBC_BLOCKS_16; a.Ldac.FormatMask = PNA2DP_FMT_S24; a.Aac.RateMask = PNA2DP_RATE_48000;
     a.Flags |= PNA2DP_CFG_AUTO_START_ON_CONNECT;
+    a.Ldac.Eqmid = PNA2DP_LDAC_EQMID_SQ;   /* the default is HQ since 0.1.0.22; the edit below raises it */
     std::wstring t = pn::ConfigToText(a);
     PNA2DP_CONFIG b = {};
     CHECK(pn::ConfigFromText(t, b), "round trip parse");
@@ -72,8 +66,68 @@ static void TestConfigText()
     CHECK(!pn::ConfigFromText(malformed, b) && memcmp(&a, &b, sizeof(a)) == 0,
           "invalid hex in the saved blob rejects the import without changing the destination");
     CHECK(!pn::ConfigFromText(L"blob=00\nlatency=100\n", b), "truncated blob cannot silently fall back to defaults");
-    CHECK(pn::ConfigFromText(L"latency=-1\naac.bitrate=4294967296\n", b) && b.TargetLatencyMs == 60 && b.Aac.BitrateBps == 0,
+    CHECK(pn::ConfigFromText(L"latency=-1\naac.bitrate=4294967296\n", b) && b.TargetLatencyMs == 60 && b.Aac.BitrateBps == 320000,
           "negative and overflowing numeric preferences are ignored rather than wrapped");
+}
+
+/* 0.1.0.22 #5: latency profiles in the text format and the helpers */
+static void TestLatencyProfileText()
+{
+    const struct { ULONG profile; const wchar_t *key, *name; ULONG target, max; } k[] = {
+        { PN_LATENCY_PROFILE_LOW, L"low", L"Low latency", 30, 120 },
+        { PN_LATENCY_PROFILE_BALANCED, L"balanced", L"Balanced", 60, 250 },
+        { PN_LATENCY_PROFILE_MUSIC, L"music", L"Music", 150, 450 },
+    };
+    for (const auto &e : k) {
+        PNA2DP_CONFIG c;
+        pn::ConfigDefaults(c);
+        pn::ApplyLatencyProfile(c, e.profile);
+        CHECK(c.TargetLatencyMs == e.target && c.MaxLatencyMs == e.max && pn::LatencyProfileOf(c) == e.profile, "profile %ls values", e.key);
+        CHECK(!wcscmp(pn::LatencyProfileKey(e.profile), e.key) && !wcscmp(pn::LatencyProfileName(e.profile), e.name), "profile %ls names", e.key);
+        ULONG back = 99;
+        CHECK(pn::LatencyProfileFromKey(e.key, back) && back == e.profile, "profile %ls key parses", e.key);
+        CHECK(DriverKeepsUnchanged(c), "profile %ls is accepted unchanged by the driver", e.key);
+        std::wstring t = pn::ConfigToText(c);
+        CHECK(t.find(std::wstring(L"latency.profile=") + e.key + L"\r\n") != std::wstring::npos, "export names profile %ls", e.key);
+        CHECK(t.find(L"\nlatency=") == std::wstring::npos && t.find(L"maxlatency=") == std::wstring::npos, "a named profile exports no latency= lines");
+        PNA2DP_CONFIG r = {};
+        CHECK(pn::ConfigFromText(t, r) && !memcmp(&r, &c, sizeof(r)), "profile %ls round trip", e.key);
+    }
+    ULONG p = 0;
+    CHECK(pn::LatencyProfileFromKey(L"LowLatency", p) && p == PN_LATENCY_PROFILE_LOW, "lowlatency alias, case-insensitive");
+    CHECK(pn::LatencyProfileFromKey(L"custom", p) && p == PN_LATENCY_PROFILE_CUSTOM && !pn::LatencyProfileFromKey(L"loud", p), "custom and unknown keys");
+    PNA2DP_CONFIG c;
+    pn::ConfigDefaults(c);
+    c.TargetLatencyMs = 90; c.MaxLatencyMs = 333;
+    CHECK(pn::LatencyProfileOf(c) == PN_LATENCY_PROFILE_CUSTOM, "90/333 is custom");
+    pn::ApplyLatencyProfile(c, PN_LATENCY_PROFILE_CUSTOM);
+    CHECK(c.TargetLatencyMs == 90 && c.MaxLatencyMs == 333, "applying custom changes nothing");
+    std::wstring t = pn::ConfigToText(c);
+    CHECK(t.find(L"latency.profile=custom\r\nlatency=90\r\nmaxlatency=333\r\n") != std::wstring::npos, "custom exports both values");
+    /* key-only files */
+    PNA2DP_CONFIG r;
+    CHECK(pn::ConfigFromText(L"latency.profile=music\n", r) && r.TargetLatencyMs == 150 && r.MaxLatencyMs == 450, "latency.profile=music alone");
+    CHECK(pn::ConfigFromText(L"latency.profile=MUSIC\nlatency=100\n", r) && r.TargetLatencyMs == 100 && r.MaxLatencyMs == 450, "later lines win");
+    CHECK(pn::ConfigFromText(L"latency=100\nlatency.profile=custom\n", r) && r.TargetLatencyMs == 100 && r.MaxLatencyMs == 250, "custom is a no-op");
+    CHECK(pn::ConfigFromText(L"latency.profile=loud\nlatency=100\n", r) && r.TargetLatencyMs == 100, "unknown profile names are ignored");
+    CHECK(!pn::ConfigFromText(L"latency.profile=loud\n", r), "an unknown profile alone is not a configuration");
+    /* an edited profile line in an export wins over the blob */
+    PNA2DP_CONFIG m;
+    pn::ConfigDefaults(m);
+    m.ReconnectDelayMs = 4321;
+    t = pn::ConfigToText(m);
+    size_t at = t.find(L"latency.profile=balanced");
+    CHECK(at != std::wstring::npos, "defaults export the Balanced profile");
+    if (at != std::wstring::npos) t.replace(at, 24, L"latency.profile=music");
+    CHECK(pn::ConfigFromText(t, r) && r.TargetLatencyMs == 150 && r.MaxLatencyMs == 450 && r.ReconnectDelayMs == 4321, "edited profile applies over the blob");
+    pn::Preset preset;
+    CHECK(pn::PresetFromKey(L"best", preset) && preset == pn::Preset::BestQuality && pn::PresetFromKey(L"defaults", preset) && preset == pn::Preset::Balanced &&
+          pn::PresetFromKey(L"LowLatency", preset) && preset == pn::Preset::LowLatency && pn::PresetFromKey(L"compat", preset) && preset == pn::Preset::Compatibility &&
+          pn::PresetFromKey(L"sbcxq", preset) && preset == pn::Preset::SbcXq && !pn::PresetFromKey(L"loudest", preset), "preset keys");
+    /* review #5: the latency profile words are not presets: "preset=balanced" / "preset=low" would
+     * replace the whole configuration (codec order, SBC XQ / dual channel, auto start) */
+    CHECK(!pn::PresetFromKey(L"balanced", preset) && !pn::PresetFromKey(L"Low", preset) && !pn::PresetFromKey(L"music", preset) &&
+          pn::PresetFromKey(L"lowlatency", preset) && preset == pn::Preset::LowLatency, "latency profile words are not preset keys");
 }
 
 static void TestConfigFiles()
@@ -129,6 +183,62 @@ static void TestEventRetry()
     retry.Reset();
     CHECK(!retry.ShouldPause(L"device-b", 12001), "explicit Refresh permits retry");
     CHECK(!retry.ShouldPause(L"device-a", 0xffffffffull + 500) && retry.ShouldPause(L"device-a", 0xffffffffull + 1500), "long system uptime keeps backoff intact");
+}
+
+/* 0.1.0.22 (#2/#5): every codec starts at its best level; presets match the new defaults */
+static void TestBestQualityDefaults()
+{
+    PNA2DP_CONFIG d;
+    pn::ConfigDefaults(d);
+    CHECK(d.Ldac.Eqmid == PNA2DP_LDAC_EQMID_HQ && d.Ldac.AbrEnable && d.Ldac.FormatMask == 0, "defaults: LDAC HQ ceiling with ABR, automatic format");
+    CHECK(d.Aac.BitrateBps == 320000 && d.Aac.Vbr == 0, "defaults: AAC at the sink's maximum up to 320 kbps, CBR");
+    CHECK(d.Sbc.MaxBitpool == 0 && d.Sbc.MinBitpool == 2 && !d.Sbc.AllowBitpoolOverride && !(d.Flags & (PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_SBC_XQ)),
+          "defaults: SBC at the receiver's maximum bitpool, channel-mode default unchanged");
+    CHECK(d.CodecPriority[0] == PNA2DP_CODEC_LDAC && d.CodecPriority[1] == PNA2DP_CODEC_APTX_HD && d.CodecPriority[3] == PNA2DP_CODEC_APTX,
+          "defaults: aptX HD before aptX");
+    CHECK(d.TargetLatencyMs == 60 && d.MaxLatencyMs == 250 && (d.Flags & PNA2DP_CFG_ABR_ENABLE) && (d.Flags & PNA2DP_CFG_AUTO_QUALITY),
+          "defaults: Balanced buffering, ABR as the safety net");
+    CHECK(DriverKeepsUnchanged(d), "the driver keeps the defaults unchanged");
+    /* automatic codecs restore exactly the defaults' codec sections and priority */
+    PNA2DP_CONFIG a;
+    pn::ConfigDefaults(a);
+    a.Ldac.Eqmid = PNA2DP_LDAC_EQMID_MQ; a.Aac.BitrateBps = 128000; a.Aac.Vbr = 1; a.Sbc.MaxBitpool = 35;
+    a.CodecPriority[0] = PNA2DP_CODEC_SBC; a.CodecPriority[5] = PNA2DP_CODEC_LDAC;
+    pn::UseAutomaticCodecs(a);
+    CHECK(!memcmp(a.CodecPriority, d.CodecPriority, sizeof(a.CodecPriority)) && a.EnabledCodecMask == d.EnabledCodecMask &&
+          !memcmp(&a.Sbc, &d.Sbc, sizeof(a.Sbc)) && !memcmp(&a.Aac, &d.Aac, sizeof(a.Aac)) && !memcmp(&a.Aptx, &d.Aptx, sizeof(a.Aptx)) &&
+          !memcmp(&a.AptxHd, &d.AptxHd, sizeof(a.AptxHd)) && !memcmp(&a.AptxLl, &d.AptxLl, sizeof(a.AptxLl)) && !memcmp(&a.Ldac, &d.Ldac, sizeof(a.Ldac)),
+          "automatic codec sections equal the defaults");
+    /* Best quality: Music buffering, the receiver's own SBC maximum (53 lowered receivers that advertise more) */
+    PNA2DP_CONFIG b;
+    pn::ConfigDefaults(b);
+    b.Sbc.MaxBitpool = 40;
+    pn::ApplyPreset(b, pn::Preset::BestQuality);
+    CHECK(b.TargetLatencyMs == 150 && b.MaxLatencyMs == 450, "best quality uses the Music profile (got %u/%u)", b.TargetLatencyMs, b.MaxLatencyMs);
+    CHECK(b.Sbc.MaxBitpool == 0 && !b.Sbc.AllowBitpoolOverride, "best quality keeps the receiver's maximum SBC bitpool (got %u)", b.Sbc.MaxBitpool);
+    CHECK(b.Ldac.Eqmid == PNA2DP_LDAC_EQMID_HQ && b.Ldac.FormatMask == PNA2DP_FMT_S24 && b.Aac.BitrateBps == 320000 && !b.Aac.Vbr &&
+          (b.Flags & PNA2DP_CFG_ABR_ENABLE) && !(b.Flags & (PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_SBC_XQ)), "best quality codec settings");
+    CHECK(b.CodecPriority[0] == PNA2DP_CODEC_LDAC && b.CodecPriority[1] == PNA2DP_CODEC_APTX_HD && b.CodecPriority[2] == PNA2DP_CODEC_AAC &&
+          b.CodecPriority[3] == PNA2DP_CODEC_APTX && b.CodecPriority[4] == PNA2DP_CODEC_SBC && !b.CodecPriority[5], "best quality priority");
+    /* Balanced is the full driver default (volume kept) */
+    PNA2DP_CONFIG bal;
+    pn::ConfigDefaults(bal);
+    bal.TargetLatencyMs = 150; bal.MaxLatencyMs = 450; bal.Ldac.Eqmid = PNA2DP_LDAC_EQMID_SQ; bal.VolumeDb16 = -3 * 65536;
+    pn::ApplyPreset(bal, pn::Preset::Balanced);
+    PNA2DP_CONFIG expect = d; expect.VolumeDb16 = -3 * 65536;
+    CHECK(!memcmp(&bal, &expect, sizeof(bal)), "the defaults preset equals the driver defaults, keeping the volume");
+    PNA2DP_CONFIG low;
+    pn::ConfigDefaults(low);
+    pn::ApplyPreset(low, pn::Preset::LowLatency);
+    CHECK(low.TargetLatencyMs == 30 && low.MaxLatencyMs == 120, "low latency preset uses the Low latency profile");
+    for (pn::Preset p : { pn::Preset::Compatibility, pn::Preset::SbcXq }) {
+        PNA2DP_CONFIG c;
+        pn::ConfigDefaults(c);
+        c.TargetLatencyMs = 150; c.MaxLatencyMs = 450;
+        pn::ApplyPreset(c, p);
+        CHECK(c.TargetLatencyMs == 60 && c.MaxLatencyMs == 250, "preset %d uses the default (Balanced) buffering", (int)p);
+    }
+    CHECK(std::wstring(pn::PresetName(pn::Preset::Balanced)).find(L"Driver defaults") == 0, "the Balanced preset is named after the driver defaults");
 }
 
 static void TestPresets()
@@ -263,6 +373,34 @@ static void TestCodecPageDetails()
     CHECK(pn::CodecPageStatus(caps, status, PNA2DP_CODEC_SBC).find(L"Live:") == std::wstring::npos, "stale disconnected status is not live");
 }
 
+/* 0.1.0.22 #1: the status shows the Windows rate the driver converts from */
+static void TestRateConversionStatus()
+{
+    PNA2DP_STATUS s = {};
+    s.SampleRate = 48000; s.Channels = 2; s.BitsPerSample = 24;
+    CHECK(pn::StreamFormatText(s) == L"48000 Hz, 2 ch, 24-bit in", "native format: %ls", pn::StreamFormatText(s).c_str());
+    s.EngineSampleRate = 48000;
+    CHECK(pn::StreamFormatText(s) == L"48000 Hz, 2 ch, 24-bit in", "the engine at the codec rate: no conversion shown");
+    s.EngineSampleRate = 44100;
+    CHECK(pn::StreamFormatText(s) == L"48000 Hz (Windows 44100 Hz, converted), 2 ch, 24-bit in", "converted: %ls", pn::StreamFormatText(s).c_str());
+    /* 0.1.0.36: the panel's Status page shows the Windows rate on its own row; the combined line
+     * did not fit the value column and lost its end */
+    CHECK(pn::StreamFormatText(s, false) == L"48000 Hz, 2 ch, 24-bit in", "format without the Windows rate: %ls", pn::StreamFormatText(s, false).c_str());
+    CHECK(pn::EngineRateText(s) == L"44100 Hz, converted to 48000 Hz", "converted Windows rate: %ls", pn::EngineRateText(s).c_str());
+    s.EngineSampleRate = 48000;
+    CHECK(pn::EngineRateText(s) == L"48000 Hz, no conversion", "native Windows rate: %ls", pn::EngineRateText(s).c_str());
+    s.EngineSampleRate = 0;
+    CHECK(pn::EngineRateText(s) == L"-", "no Windows stream, or a driver before 0.1.0.22");
+    s.EngineSampleRate = 44100; s.SampleRate = 0;
+    CHECK(pn::EngineRateText(s) == L"44100 Hz", "Windows open before the stream is configured: %ls", pn::EngineRateText(s).c_str());
+    s.SampleRate = 48000;
+    CHECK(pn::StatusFlagsText(PNA2DP_STATUS_FLAG_RATE_CONVERTED) == L"rate converted", "flag text");
+    CHECK(pn::StatusFlagsText(PNA2DP_STATUS_FLAG_RATE_CONVERTED | PNA2DP_STATUS_FLAG_HALF_RATE) == L"rate converted (2:1)", "2:1 text");
+    CHECK(pn::StatusFlagsText(PNA2DP_STATUS_FLAG_HALF_RATE) == L"2:1 rate conversion", "a 0.1.0.21 driver's half-band flag");
+    /* ABI 1: EngineSampleRate is a former reserved word, the structure keeps its size */
+    static_assert(sizeof(PNA2DP_STATUS) == 224 && offsetof(PNA2DP_STATUS, EngineSampleRate) == 208 && sizeof(s.Reserved) == 12, "PNA2DP_STATUS layout");
+}
+
 static void TestErrorText()
 {
     std::wstring s = pn::Win32ErrorText(0xE000022F);
@@ -329,12 +467,15 @@ static void TestMachine()
 int main()
 {
     TestConfigText();
+    TestLatencyProfileText();
     TestConfigFiles();
     TestEventRetry();
     TestPresets();
+    TestBestQualityDefaults();
     TestSbcNumbers();
     TestCodecActivation();
     TestCodecPageDetails();
+    TestRateConversionStatus();
     TestErrorText();
     TestAddressParsing();
     TestDriverPackageSelection();

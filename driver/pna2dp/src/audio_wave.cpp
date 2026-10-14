@@ -24,9 +24,12 @@ static KSDATARANGE g_WaveBridgeRange[] = {
 };
 static PKSDATARANGE g_WaveBridgeRanges[] = { &g_WaveBridgeRange[0] };
 
+/* No KSPROPERTY_PIN_PROPOSEDATAFORMAT2: Windows uses a driver's answer to it as the engine
+ * format and ignores the user's Default Format, so answering it pinned every PN endpoint to
+ * the first table entry (48 kHz). Without it Windows uses the format the user selects; the
+ * stream follows that rate natively when the sink supports it and converts otherwise. */
 static PCPROPERTY_ITEM g_WaveFilterProps[] = {
     { &KSPROPSETID_Pin, KSPROPERTY_PIN_PROPOSEDATAFORMAT, KSPROPERTY_TYPE_SET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportWaveRT::PropertyHandlerWaveFilter },
-    { &KSPROPSETID_Pin, KSPROPERTY_PIN_PROPOSEDATAFORMAT2, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT, CPnMiniportWaveRT::PropertyHandlerWaveFilter },
 };
 static PCEVENT_ITEM g_WaveFilterEvents[] = {
     { &KSEVENTSETID_PinCapsChange, KSEVENT_PINCAPS_FORMATCHANGE, KSEVENT_TYPE_ENABLE | KSEVENT_TYPE_BASICSUPPORT, CPnMiniportWaveRT::EventHandlerPinCapsChange },
@@ -459,39 +462,6 @@ NTSTATUS CPnMiniportWaveRT::PropertyProposedFormat(_In_ PPCPROPERTY_REQUEST Req)
 }
 
 #pragma code_seg("PAGE")
-NTSTATUS CPnMiniportWaveRT::PropertyProposedFormat2(_In_ PPCPROPERTY_REQUEST Req)
-{
-    PAGED_CODE();
-    if (Req->InstanceSize < sizeof(KSP_PIN) - RTL_SIZEOF_THROUGH_FIELD(KSP_PIN, Property)) return STATUS_INVALID_PARAMETER;
-    PKSP_PIN kspPin = CONTAINING_RECORD(Req->Instance, KSP_PIN, PinId);
-    if (kspPin->PinId != PN_WAVE_PIN_SYSTEM) return STATUS_NOT_SUPPORTED;
-    if (Req->Verb & KSPROPERTY_TYPE_BASICSUPPORT) return PnPropertyBasicSupport(Req, KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT, VT_ILLEGAL);
-    /* attributes (mode) follow the KSP_PIN; we have one mode so the default format is the same for any mode */
-    PKSMULTIPLE_ITEM items = (PKSMULTIPLE_ITEM)(kspPin + 1);
-    ULONG cbItems = (ULONG)((((PUCHAR)Req->Instance) + Req->InstanceSize) - (PUCHAR)items);
-    if (cbItems < sizeof(KSMULTIPLE_ITEM) || items->Size > cbItems) cbItems = 0;
-    else cbItems = items->Size;
-    ULONG cbFormat = (sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE) + 7) & ~7u;
-    ULONG need = cbFormat + cbItems;
-    if (Req->ValueSize == 0) { Req->ValueSize = need; return STATUS_BUFFER_OVERFLOW; }
-    if (Req->ValueSize < need) return STATUS_BUFFER_TOO_SMALL;
-    PnMutexAcquire(&m_FormatMutex);
-    ULONG count = m_FormatCount;
-    KSDATAFORMAT_WAVEFORMATEXTENSIBLE def = m_Formats[0];
-    PnMutexRelease(&m_FormatMutex);
-    if (count == 0) return STATUS_NOT_SUPPORTED;
-    RtlZeroMemory(Req->Value, need);
-    RtlCopyMemory(Req->Value, &def, sizeof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE));
-    PKSDATAFORMAT df = (PKSDATAFORMAT)Req->Value;
-    if (cbItems) {
-        df->Flags = KSDATAFORMAT_ATTRIBUTES;
-        RtlCopyMemory((PUCHAR)Req->Value + cbFormat, items, cbItems);
-    }
-    Req->ValueSize = need;
-    return STATUS_SUCCESS;
-}
-
-#pragma code_seg("PAGE")
 NTSTATUS CPnMiniportWaveRT::PropertyHandlerWaveFilter(_In_ PPCPROPERTY_REQUEST Req)
 {
     PAGED_CODE();
@@ -500,7 +470,6 @@ NTSTATUS CPnMiniportWaveRT::PropertyHandlerWaveFilter(_In_ PPCPROPERTY_REQUEST R
     if (!w) return STATUS_INVALID_PARAMETER;
     if (IsEqualGUIDAligned(*Req->PropertyItem->Set, KSPROPSETID_Pin)) {
         if (Req->PropertyItem->Id == KSPROPERTY_PIN_PROPOSEDATAFORMAT) return w->PropertyProposedFormat(Req);
-        if (Req->PropertyItem->Id == KSPROPERTY_PIN_PROPOSEDATAFORMAT2) return w->PropertyProposedFormat2(Req);
     }
     return STATUS_INVALID_DEVICE_REQUEST;
 }

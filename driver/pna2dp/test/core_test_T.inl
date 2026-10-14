@@ -1187,7 +1187,7 @@ static void TestTRedItems()
         e.Add(TSbcSinkSep(1, 0x1f));
         e.in.RestrictRate = TRUE; e.in.PreferredRate = 96000;
         CHECK(!e.Choose(&c));                                /* without decimation: no codec */
-        e.in.AllowHalfRate = TRUE;
+        e.in.RateConvert = PN_RATECONV_HALF;
         RED("C8", e.Choose(&c) && c.Cfg.SampleRate == 48000);
         e.in.PreferredRate = 88200; e.remote[0] = TSbcSinkSep(1, 0x2f);
         RED("C8", e.Choose(&c) && c.Cfg.SampleRate == 44100);
@@ -1211,10 +1211,14 @@ static void TestTRedItems()
         RED("T5", PnShouldQuerySdp(FALSE, 0, FALSE));     /* not known yet: query, whoever opened signalling */
         RED("T5", !PnShouldQuerySdp(TRUE, 0, TRUE));      /* answered once: never again for the device */
     }
-    /* T6: the sink delay is trusted only when negotiated for the current stream */
+    /* T6: the sink delay is the current stream's own report (the acceptor stores it only for
+     * the stream's SEID and it is reset with every configuration), else a per-codec default.
+     * A report is used even when delay reporting was not negotiated: the EDIFIER MR5 reports
+     * 364 ms on its LDAC stream although its LDAC SEP does not offer the capability. */
     {
         RED("T6", PnSinkDelayUs(FALSE, TRUE, TRUE, 1500, PNA2DP_CODEC_SBC) == 0);
-        RED("T6", PnSinkDelayUs(TRUE, FALSE, TRUE, 5000, PNA2DP_CODEC_SBC) == PnDefaultSinkDelayUs(PNA2DP_CODEC_SBC));
+        CHECK(PnSinkDelayUs(TRUE, FALSE, TRUE, 5000, PNA2DP_CODEC_SBC) == 500000);
+        CHECK(PnSinkDelayUs(TRUE, FALSE, TRUE, 3640, PNA2DP_CODEC_LDAC) == 364000);
         RED("T6", PnSinkDelayUs(TRUE, TRUE, FALSE, 0, PNA2DP_CODEC_AAC) == PnDefaultSinkDelayUs(PNA2DP_CODEC_AAC));
         CHECK(PnSinkDelayUs(TRUE, TRUE, TRUE, 1234, PNA2DP_CODEC_AAC) == 123400);
         UCHAR sbc44[] = { 0x21, 0x15, 2, 53 }, caps[40], pl[64];
@@ -1401,6 +1405,20 @@ static void TestTRedScenarios()
         RED("S-44k", PnStreamCloseAction(AvdtpStateConfigured) != PnCloseLocalOnly);
         f.StreamState = AvdtpStateOpen;                      /* the receiver opened it: RECONFIGURE */
         CHECK(PnPlanStreamFormat(&f, &out) == PnFormatReconfigure && out.SampleRate == 48000);
+        /* 0.1.0.22 review #1/#3: the same with the converter (PN_RATECONV_ANY, the shipped setting).
+         * The stream has carried no audio, so a RECONFIGURE interrupts nothing: it goes to the
+         * engine's own rate, with or without a channel-mode preference */
+        f.RateConvert = PN_RATECONV_ANY;
+        for (ULONG pref : { (ULONG)0, (ULONG)PNA2DP_CFG_DUAL_CHANNEL_PREFER }) {
+            cfg.Flags = pref;
+            f.StreamState = AvdtpStateConfigured;
+            RED("R22-bridge", PnPlanStreamFormat(&f, &out) == PnFormatWaitOpenReconfigure && out.SampleRate == 48000);
+            f.StreamState = AvdtpStateOpen;
+            RED("R22-bridge", PnPlanStreamFormat(&f, &out) == PnFormatReconfigure && out.SampleRate == 48000 &&
+                              out.ChannelMode == (ULONG)(pref ? PNA2DP_CHMODE_DUAL : PNA2DP_CHMODE_JOINT));
+            f.StreamState = AvdtpStateStreaming;             /* the receiver STARTed it, our pump never ran */
+            RED("R22-bridge", PnPlanStreamFormat(&f, &out) == PnFormatReconfigure && out.SampleRate == 48000);
+        }
     }
     /* Sink that advertises LDAC and AAC but rejects our configuration of either */
     {
@@ -1493,6 +1511,28 @@ static void TestTSonySbcPath()
         in.CodecUpgradeTried = TRUE; PnPlanReconcile(&in, &p); CHECK(TPlanIs(p, setup));
         in = TWant(AvdtpStateStreaming); in.PumpStreaming = TRUE; in.RemoteConfigured = TRUE; in.CodecUpgradeTried = TRUE;
         PnPlanReconcile(&in, &p); CHECK(TPlanIs(p, setup) && p.RetryDelayMs == 0);
+    }
+    {   /* receiver-initiated at 44.1 kHz joint stereo under the 48 kHz engine (docs/06, 0.1.0.21 on
+         * hardware: reconfigured to dual channel at 48 kHz, 672 kbps). With the shipped converter
+         * setting the same native path (0.1.0.22 review #1/#3), not 44.1 kHz dual plus conversion */
+        UCHAR sbc44joint[4] = { 0x21, 0x15, 2, 53 };
+        A2DP_CODEC_CONFIG active, out;
+        CHECK(A2dpParseConfig(A2DP_CODEC_SBC, sbc44joint, 4, &active));
+        AVDTP_REMOTE_SEP sony = TSepFromCaps(1, TRUE, caps, TCapsBytes(caps, sonyIes, 4, A2DP_CODEC_SBC, FALSE));
+        PN_FORMAT_INPUT f;
+        memset(&f, 0, sizeof(f));
+        f.ActiveValid = TRUE; f.Active = &active; f.Remote = &sony; f.Config = &cfg; f.AudioStreamOpen = TRUE;
+        f.AudioRate = 48000; f.AudioValidBits = 16; f.StreamState = AvdtpStateConfigured; f.RemoteConfigured = TRUE;
+        for (ULONG rc : { (ULONG)PN_RATECONV_HALF, (ULONG)PN_RATECONV_ANY }) {
+            f.RateConvert = rc;
+            f.StreamState = AvdtpStateConfigured;
+            BOOLEAN wait = PnPlanStreamFormat(&f, &out) == PnFormatWaitOpenReconfigure;
+            f.StreamState = AvdtpStateOpen;   /* its OPEN */
+            BOOLEAN reconf = PnPlanStreamFormat(&f, &out) == PnFormatReconfigure;
+            out.BitrateBps = A2dpNominalBitrate(&out);
+            RED("R22-sony44", wait && reconf && out.SampleRate == 48000 && out.ChannelMode == PNA2DP_CHMODE_DUAL && out.SbcMaxBitpool == 53 &&
+                              out.BitrateBps == 672000);
+        }
     }
     /* setup back-off: a 30 s stream that ends also clears the failure count */
     PnSetupRetry r = {};
@@ -2036,6 +2076,255 @@ static void TestTReview5()
     }
 }
 
+/* ---- 0.1.0.22 #1: the sample-rate converter in the selection and format policy ------------ */
+
+/* The 0.1.0.21 rules (C8: AllowHalfRate), for the NONE / HALF differential below. */
+static ULONG TOldStreamRateFor021(ULONG SinkRateMask, ULONG EngineRate, BOOLEAN AllowHalfRate)
+{
+    if ((SinkRateMask & A2dpHzToRateMask(EngineRate)) || !AllowHalfRate) return EngineRate;
+    if ((EngineRate == 96000 || EngineRate == 88200) && (SinkRateMask & A2dpHzToRateMask(EngineRate / 2))) return EngineRate / 2;
+    return EngineRate;
+}
+
+static PN_FORMAT_ACTION TOldPlanStreamFormat021(const PN_FORMAT_INPUT *In, BOOLEAN AllowHalfRate, A2DP_CODEC_CONFIG *Cfg)
+{
+    AVDTP_STREAM_STATE st = In->StreamState;
+    if (!In->ActiveValid || !In->AudioStreamOpen ||
+        (st != AvdtpStateOpen && st != AvdtpStateStreaming && st != AvdtpStateConfigured)) return PnFormatKeep;
+    *Cfg = *In->Active;
+    const AVDTP_REMOTE_SEP *r = In->Remote;
+    A2DP_CODEC_CAPS caps = {};
+    BOOLEAN parsed = r && A2dpParseCaps(r->MediaCodecType, r->CodecCaps, r->CodecCapsLength, &caps, NULL, NULL);
+    ULONG rate = parsed ? TOldStreamRateFor021(caps.RateMask, In->AudioRate, AllowHalfRate) : In->AudioRate;
+    BOOLEAN selected = parsed && (caps.RateMask & A2dpHzToRateMask(rate));
+    if (selected && Cfg->Codec == PNA2DP_CODEC_SBC) {
+        caps.RateMask &= A2dpHzToRateMask(rate);
+        selected = A2dpSelectConfig(&caps, In->Config, rate, In->AudioValidBits, Cfg);
+        if (selected && In->Conservative) selected = A2dpConstrainBasicRadio(Cfg);
+    } else if (selected) {
+        Cfg->SampleRate = rate;
+        A2dpSerializeConfig(Cfg);
+    }
+    if (selected && PnStreamFormatNeedsUpdate(In->Active->Codec, In->Active->SampleRate, In->Active->ChannelMode, Cfg->SampleRate, Cfg->ChannelMode))
+        return (In->RemoteConfigured && st == AvdtpStateConfigured) ? PnFormatWaitOpenReconfigure : PnFormatReconfigure;
+    if (!selected && In->Active->SampleRate != rate) return PnFormatReselect;
+    return PnFormatKeep;
+}
+
+/* A vendor-codec sink SEP with its own rate / channel byte (aptX family, LDAC). */
+static AVDTP_REMOTE_SEP TVendorSinkSep(UCHAR Seid, ULONG Vendor, USHORT CodecId, UCHAR Byte6, UCHAR Byte7, ULONG Length)
+{
+    UCHAR ies[16] = {}, caps[64];
+    ies[0] = (UCHAR)Vendor; ies[1] = (UCHAR)(Vendor >> 8); ies[2] = (UCHAR)(Vendor >> 16); ies[3] = (UCHAR)(Vendor >> 24);
+    ies[4] = (UCHAR)CodecId; ies[5] = (UCHAR)(CodecId >> 8); ies[6] = Byte6; ies[7] = Byte7;
+    return TSepFromCaps(Seid, FALSE, caps, TCapsBytes(caps, ies, Length, A2DP_CODEC_VENDOR, FALSE));
+}
+
+static void TestTRateConvert()
+{
+    const ULONG both = PNA2DP_RATE_44100 | PNA2DP_RATE_48000;
+    /* the stream rate: the engine rate whenever the sink takes it, else what the converter bridges */
+    CHECK(PnStreamRateFor(both, 96000, PN_RATECONV_ANY) == 48000);
+    CHECK(PnStreamRateFor(PNA2DP_RATE_44100, 96000, PN_RATECONV_ANY) == 44100);
+    CHECK(PnStreamRateFor(PNA2DP_RATE_48000, 44100, PN_RATECONV_ANY) == 48000);
+    CHECK(PnStreamRateFor(PNA2DP_RATE_44100, 48000, PN_RATECONV_ANY) == 44100);
+    CHECK(PnStreamRateFor(both, 88200, PN_RATECONV_ANY) == 44100);
+    CHECK(PnStreamRateFor(PNA2DP_RATE_48000, 88200, PN_RATECONV_ANY) == 48000);
+    CHECK(PnStreamRateFor(both, 44100, PN_RATECONV_ANY) == 44100 && PnStreamRateFor(both, 48000, PN_RATECONV_ANY) == 48000);
+    CHECK(PnStreamRateFor(both | PNA2DP_RATE_96000, 96000, PN_RATECONV_ANY) == 96000);   /* native first */
+    CHECK(PnStreamRateFor(PNA2DP_RATE_96000, 48000, PN_RATECONV_ANY) == 48000);           /* no conversion up: the selection fails */
+    CHECK(PnStreamRateFor(PNA2DP_RATE_48000, 32000, PN_RATECONV_ANY) == 32000);           /* 32 kHz engines are not bridged */
+    CHECK(PnStreamRateFor(PNA2DP_RATE_48000, 192000, PN_RATECONV_ANY) == 192000);
+    /* NONE and HALF are the 0.1.0.21 rules exactly */
+    {
+        static const ULONG masks[] = { both, PNA2DP_RATE_44100, PNA2DP_RATE_48000, PNA2DP_RATE_96000, PNA2DP_RATE_32000 | PNA2DP_RATE_16000,
+                                       both | PNA2DP_RATE_88200 | PNA2DP_RATE_96000, PNA2DP_RATE_88200, 0 };
+        static const ULONG engines[] = { 16000, 32000, 44100, 48000, 88200, 96000, 176400, 192000 };
+        BOOLEAN same = TRUE;
+        for (ULONG m : masks) for (ULONG e : engines)
+            same = same && PnStreamRateFor(m, e, PN_RATECONV_NONE) == TOldStreamRateFor021(m, e, FALSE) &&
+                   PnStreamRateFor(m, e, PN_RATECONV_HALF) == TOldStreamRateFor021(m, e, TRUE);
+        CHECK(same);
+    }
+    PN_CODEC_CHOICE c;
+    /* the codec follows the priority list, not the Windows rate: an aptX HD sink at 48 kHz only */
+    {
+        TChoiceEnv e;
+        e.cfg.CodecPriority[0] = PNA2DP_CODEC_APTX_HD; e.cfg.CodecPriority[1] = PNA2DP_CODEC_SBC; e.cfg.CodecPriority[2] = 0;
+        e.cfg.EnabledCodecMask |= PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_HD);
+        e.Add(TVendorSinkSep(1, A2DP_VENDOR_APTX_HD, A2DP_CODECID_APTX_HD, APTX_FREQ_48000 | APTX_CH_STEREO, 0, 11));
+        e.Add(TSbcSinkSep(2, 0x7f));   /* 32 / 44.1 / 48 kHz */
+        e.in.HostCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_HD);
+        e.in.RestrictRate = TRUE; e.in.PreferredRate = 44100; e.in.PreferredBits = 24;
+        CHECK(e.Choose(&c) && c.Cfg.Codec == PNA2DP_CODEC_SBC && c.Cfg.SampleRate == 44100);   /* 0.1.0.21: aptX HD skipped */
+        e.in.RateConvert = PN_RATECONV_ANY;
+        CHECK(e.Choose(&c) && c.Cfg.Codec == PNA2DP_CODEC_APTX_HD && c.Cfg.SampleRate == 48000 && c.RemoteSeid == 1);
+        e.in.PreferredRate = 96000;
+        CHECK(e.Choose(&c) && c.Cfg.Codec == PNA2DP_CODEC_APTX_HD && c.Cfg.SampleRate == 48000);
+        e.in.PreferredRate = 32000;   /* not bridged: SBC at the engine rate, as before */
+        CHECK(e.Choose(&c) && c.Cfg.Codec == PNA2DP_CODEC_SBC && c.Cfg.SampleRate == 32000);
+    }
+    /* an LDAC sink at 44.1 / 48 kHz (the EDIFIER MR5): the engine rate when it has it; a converted
+     * 16-bit engine feeds LDAC S32, not a requantised S16 */
+    {
+        TChoiceEnv e;   /* LDAC, AAC, SBC */
+        e.Add(TVendorSinkSep(1, A2DP_VENDOR_SONY, A2DP_CODECID_LDAC, LDAC_FREQ_44100 | LDAC_FREQ_48000, LDAC_CH_STEREO, 8));
+        e.Add(TSbcSinkSep(2, 0x3f));
+        e.in.HostCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_LDAC);
+        e.in.RestrictRate = TRUE; e.in.RateConvert = PN_RATECONV_ANY; e.in.PreferredBits = 16;
+        e.in.PreferredRate = 44100;
+        CHECK(e.Choose(&c) && c.Cfg.Codec == PNA2DP_CODEC_LDAC && c.Cfg.SampleRate == 44100 && c.Cfg.PcmFormat == PNA2DP_FMT_S16);
+        e.in.PreferredRate = 48000;
+        CHECK(e.Choose(&c) && c.Cfg.Codec == PNA2DP_CODEC_LDAC && c.Cfg.SampleRate == 48000 && c.Cfg.PcmFormat == PNA2DP_FMT_S16);
+        e.in.PreferredRate = 96000;
+        CHECK(e.Choose(&c) && c.Cfg.Codec == PNA2DP_CODEC_LDAC && c.Cfg.SampleRate == 48000 && c.Cfg.PcmFormat == PNA2DP_FMT_S32);
+        e.in.PreferredRate = 88200;
+        CHECK(e.Choose(&c) && c.Cfg.Codec == PNA2DP_CODEC_LDAC && c.Cfg.SampleRate == 44100 && c.Cfg.PcmFormat == PNA2DP_FMT_S32);
+        e.in.RateConvert = PN_RATECONV_NONE; e.in.PreferredRate = 96000;
+        CHECK(!e.Choose(&c));   /* 0.1.0.21 without C8: nothing carries 96 kHz */
+    }
+    /* a Windows format change the pump bridges keeps the stream: no RECONFIGURE */
+    {
+        PNA2DP_CONFIG cfg = TConfig();
+        AVDTP_REMOTE_SEP sbc = TSbcSinkSep(1, 0x3f);
+        UCHAR offer44[] = { 0x21, 0x15, 2, 53 };   /* SBC 44.1 kHz joint stereo */
+        A2DP_CODEC_CONFIG active, out;
+        CHECK(A2dpParseConfig(A2DP_CODEC_SBC, offer44, 4, &active));
+        PN_FORMAT_INPUT in;
+        memset(&in, 0, sizeof(in));
+        in.ActiveValid = TRUE; in.Active = &active; in.Remote = &sbc; in.Config = &cfg; in.AudioStreamOpen = TRUE;
+        in.AudioRate = 48000; in.AudioValidBits = 16; in.StreamState = AvdtpStateOpen;
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatReconfigure && out.SampleRate == 48000);   /* NONE: as before */
+        in.RateConvert = PN_RATECONV_HALF;
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatReconfigure && out.SampleRate == 48000);
+        in.RateConvert = PN_RATECONV_ANY;
+        /* review #4: a stream that has carried no audio since it was configured (ours, configured
+         * with no audio open, e.g. auto start on connect) goes to the engine rate before its START */
+        RED("R22-bridge", PnPlanStreamFormat(&in, &out) == PnFormatReconfigure && out.SampleRate == 48000);
+        in.Streamed = TRUE;                                      /* it has played: the format change is bridged */
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatKeep);
+        in.StreamState = AvdtpStateConfigured; in.RemoteConfigured = TRUE; in.Streamed = FALSE;   /* the receiver configured 44.1 kHz under a 48 kHz engine */
+        RED("R22-bridge", PnPlanStreamFormat(&in, &out) == PnFormatWaitOpenReconfigure && out.SampleRate == 48000);
+        in.StreamState = AvdtpStateStreaming; in.RemoteConfigured = FALSE; in.Streamed = TRUE;
+        in.Remote = NULL;
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatKeep);   /* remote unknown, the pair bridgeable */
+        AVDTP_REMOTE_SEP sbc32 = TSbcSinkSep(1, 0x7f);          /* 32 kHz is not bridged; this sink takes it */
+        in.Remote = &sbc32; in.AudioRate = 32000;
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatReconfigure && out.SampleRate == 32000);
+        in.Remote = &sbc;                                        /* the 44.1 / 48 kHz sink does not: another codec */
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatReselect);
+        /* review #1/#3: a RECONFIGURE needed anyway (a channel-mode preference) lands on the engine
+         * rate, not on the bridged one: it costs the same and ends the conversion */
+        in.AudioRate = 48000; cfg.Flags = PNA2DP_CFG_DUAL_CHANNEL_PREFER;
+        RED("R22-bridge", PnPlanStreamFormat(&in, &out) == PnFormatReconfigure && out.SampleRate == 48000 && out.ChannelMode == PNA2DP_CHMODE_DUAL);
+        cfg.Flags = 0;
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatKeep);   /* without one: bridged */
+    }
+    /* review #4: an LDAC stream we configured at 48 kHz with no audio open (auto start on connect),
+     * then Windows opens at 44.1 kHz: native 44.1 kHz before the first START; once it has played,
+     * a later change to 44.1 kHz is bridged */
+    {
+        PNA2DP_CONFIG cfg = TConfig(), pref = {};
+        AVDTP_REMOTE_SEP ldac = TVendorSinkSep(1, A2DP_VENDOR_SONY, A2DP_CODECID_LDAC, LDAC_FREQ_44100 | LDAC_FREQ_48000, LDAC_CH_STEREO, 8);
+        A2DP_CODEC_CAPS caps;
+        A2DP_CODEC_CONFIG active, out;
+        CHECK(A2dpParseCaps(ldac.MediaCodecType, ldac.CodecCaps, ldac.CodecCapsLength, &caps, NULL, NULL) && A2dpSelectConfig(&caps, &pref, 48000, 16, &active));
+        PN_FORMAT_INPUT in;
+        memset(&in, 0, sizeof(in));
+        in.ActiveValid = TRUE; in.Active = &active; in.Remote = &ldac; in.Config = &cfg; in.AudioStreamOpen = TRUE;
+        in.AudioRate = 44100; in.AudioValidBits = 16; in.StreamState = AvdtpStateOpen; in.RateConvert = PN_RATECONV_ANY;
+        RED("R22-autostart", PnPlanStreamFormat(&in, &out) == PnFormatReconfigure && out.SampleRate == 44100 && out.Codec == PNA2DP_CODEC_LDAC);
+        in.Streamed = TRUE;
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatKeep);
+    }
+    /* a hi-res engine rate the sink takes natively gets its own stream; one it lacks is bridged */
+    {
+        PNA2DP_CONFIG cfg = TConfig(), pref = {};
+        AVDTP_REMOTE_SEP ldac = TSinkSep(1, PNA2DP_CODEC_LDAC), hd = TSinkSep(2, PNA2DP_CODEC_APTX_HD);
+        A2DP_CODEC_CAPS caps;
+        A2DP_CODEC_CONFIG activeLdac, activeHd, out;
+        CHECK(A2dpParseCaps(ldac.MediaCodecType, ldac.CodecCaps, ldac.CodecCapsLength, &caps, NULL, NULL) && A2dpSelectConfig(&caps, &pref, 48000, 24, &activeLdac));
+        CHECK(A2dpParseCaps(hd.MediaCodecType, hd.CodecCaps, hd.CodecCapsLength, &caps, NULL, NULL) && A2dpSelectConfig(&caps, &pref, 48000, 24, &activeHd));
+        PN_FORMAT_INPUT in;
+        memset(&in, 0, sizeof(in));
+        in.ActiveValid = TRUE; in.Active = &activeLdac; in.Remote = &ldac; in.Config = &cfg; in.AudioStreamOpen = TRUE;
+        in.AudioRate = 96000; in.AudioValidBits = 24; in.StreamState = AvdtpStateStreaming; in.RateConvert = PN_RATECONV_ANY;
+        in.Streamed = TRUE;   /* a format change on a stream that has played */
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatReconfigure && out.SampleRate == 96000 && out.Codec == PNA2DP_CODEC_LDAC);
+        in.AudioRate = 44100;   /* LDAC takes 44.1 kHz too, but 44.1 -> 48 kHz is bridged: no interruption */
+        CHECK(PnPlanStreamFormat(&in, &out) == PnFormatKeep);
+        in.Active = &activeHd; in.Remote = &hd;
+        for (ULONG r : { 96000u, 88200u, 44100u }) { in.AudioRate = r; CHECK(PnPlanStreamFormat(&in, &out) == PnFormatKeep); }
+    }
+    /* NONE and HALF: the 0.1.0.21 decisions, over random sinks, streams and engine formats */
+    {
+        static const ULONG codecs[] = { PNA2DP_CODEC_SBC, PNA2DP_CODEC_AAC, PNA2DP_CODEC_APTX, PNA2DP_CODEC_APTX_HD, PNA2DP_CODEC_APTX_LL, PNA2DP_CODEC_LDAC };
+        static const UCHAR sbcFreqModes[] = { 0x3f, 0x2f, 0x1f, 0x11, 0x21, 0x12, 0x14, 0x38, 0xf1 };
+        static const ULONG rates[] = { 44100, 48000, 96000, 88200, 32000, 16000 };
+        unsigned diff = 0, compared = 0, acts[4] = {};
+        for (unsigned it = 0; it < 20000; it++) {
+            ULONG codec = codecs[TRnd() % 6];
+            AVDTP_REMOTE_SEP remote = (codec == PNA2DP_CODEC_SBC && (TRnd() & 1)) ? TSbcSinkSep(1, sbcFreqModes[TRnd() % 9]) : TSinkSep(1, codec);
+            A2DP_CODEC_CAPS caps;
+            A2DP_CODEC_CONFIG active, o1, o2;
+            PNA2DP_CONFIG pref = {}, cfg = {};
+            cfg.Flags = TRnd() & (PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_AUTO_QUALITY);
+            if (!A2dpParseCaps(remote.MediaCodecType, remote.CodecCaps, remote.CodecCapsLength, &caps, NULL, NULL) ||
+                !A2dpSelectConfig(&caps, &pref, rates[TRnd() % 6], 16, &active)) continue;
+            PN_FORMAT_INPUT in;
+            memset(&in, 0, sizeof(in));
+            in.ActiveValid = (TRnd() % 8) != 0; in.Active = &active; in.Remote = (TRnd() % 8) ? &remote : NULL; in.Config = &cfg;
+            in.AudioStreamOpen = (TRnd() % 8) != 0; in.AudioRate = rates[TRnd() % 6]; in.AudioValidBits = (TRnd() & 1) ? 16 : 24;
+            in.Conservative = (TRnd() % 4) == 0; in.StreamState = (AVDTP_STREAM_STATE)(TRnd() % 7); in.RemoteConfigured = TRnd() & 1;
+            in.Streamed = TRnd() & 1;   /* matters only to the converter (ANY) */
+            BOOLEAN half = TRnd() & 1;
+            in.RateConvert = half ? PN_RATECONV_HALF : PN_RATECONV_NONE;
+            memset(&o1, 0, sizeof(o1)); memset(&o2, 0, sizeof(o2));
+            PN_FORMAT_ACTION a = PnPlanStreamFormat(&in, &o1), b = TOldPlanStreamFormat021(&in, half, &o2);
+            compared++;
+            acts[a]++;
+            if (a != b || ((a == PnFormatReconfigure || a == PnFormatWaitOpenReconfigure) && memcmp(&o1, &o2, sizeof(o1)) != 0)) diff++;
+        }
+        CHECK(diff == 0 && compared > 15000 && acts[PnFormatReconfigure] > 100 && acts[PnFormatReselect] > 100);
+    }
+    /* ANY (review #1/#3/#4), over random sinks, streams and engine formats: every RECONFIGURE lands
+     * on the engine's own stream rate (PnStreamRateFor); a stream that has carried no audio is
+     * kept only at that rate; one that has played is kept at another rate only when it is bridged */
+    {
+        static const ULONG codecs[] = { PNA2DP_CODEC_SBC, PNA2DP_CODEC_AAC, PNA2DP_CODEC_APTX, PNA2DP_CODEC_APTX_HD, PNA2DP_CODEC_APTX_LL, PNA2DP_CODEC_LDAC };
+        static const UCHAR sbcFreqModes[] = { 0x3f, 0x2f, 0x1f, 0x11, 0x21, 0x12, 0x14, 0x38, 0xf1 };
+        static const ULONG rates[] = { 44100, 48000, 96000, 88200, 32000, 16000 };
+        unsigned bad = 0, keptBridged = 0, reconf = 0, keptUnplayed = 0;
+        for (unsigned it = 0; it < 20000; it++) {
+            ULONG codec = codecs[TRnd() % 6];
+            AVDTP_REMOTE_SEP remote = (codec == PNA2DP_CODEC_SBC && (TRnd() & 1)) ? TSbcSinkSep(1, sbcFreqModes[TRnd() % 9]) : TSinkSep(1, codec);
+            A2DP_CODEC_CAPS caps;
+            A2DP_CODEC_CONFIG active, o;
+            PNA2DP_CONFIG pref = {}, cfg = {};
+            cfg.Flags = TRnd() & (PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_AUTO_QUALITY);
+            if (!A2dpParseCaps(remote.MediaCodecType, remote.CodecCaps, remote.CodecCapsLength, &caps, NULL, NULL) ||
+                !A2dpSelectConfig(&caps, &pref, rates[TRnd() % 6], 16, &active)) continue;
+            PN_FORMAT_INPUT in;
+            memset(&in, 0, sizeof(in));
+            in.ActiveValid = TRUE; in.Active = &active; in.Remote = &remote; in.Config = &cfg; in.AudioStreamOpen = TRUE;
+            in.AudioRate = rates[TRnd() % 6]; in.AudioValidBits = (TRnd() & 1) ? 16 : 24; in.Conservative = (TRnd() % 4) == 0;
+            static const AVDTP_STREAM_STATE states[] = { AvdtpStateConfigured, AvdtpStateOpen, AvdtpStateStreaming };
+            in.StreamState = states[TRnd() % 3]; in.RemoteConfigured = TRnd() & 1; in.Streamed = TRnd() & 1;
+            in.RateConvert = PN_RATECONV_ANY;
+            ULONG want = PnStreamRateFor(caps.RateMask, in.AudioRate, PN_RATECONV_ANY);
+            PN_FORMAT_ACTION a = PnPlanStreamFormat(&in, &o);
+            if (a == PnFormatReconfigure || a == PnFormatWaitOpenReconfigure) { reconf++; bad += o.SampleRate != want; }
+            if (a == PnFormatKeep && active.SampleRate != want && (caps.RateMask & A2dpHzToRateMask(want))) {
+                if (in.Streamed && PnRateConvertible(in.AudioRate, active.SampleRate, PN_RATECONV_ANY)) keptBridged++;
+                else bad++;
+            }
+            if (a == PnFormatKeep && !in.Streamed) keptUnplayed++;
+        }
+        RED("R22-bridge", bad == 0);
+        CHECK(reconf > 1000 && keptBridged > 500 && keptUnplayed > 500);
+    }
+}
+
 static void TestLaneT()
 {
     unsigned before = failures;
@@ -2054,6 +2343,7 @@ static void TestLaneT()
     TestTReview2();
     TestTReview4();
     TestTReview5();
+    TestTRateConvert();
     tNonRedFailures = failures - before - tRedFailures;
     printf("lane T: %u non-RED failures; RED group (corrected transport): %u of %u checks failing\n",
            tNonRedFailures, tRedFailures, tRedChecks);

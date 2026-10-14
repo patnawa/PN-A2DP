@@ -15,6 +15,17 @@
 #include "sbc.h"
 #include <string.h>
 
+/* The filterbanks' 64-bit multiply-accumulate loops stay scalar. MSVC's auto-vectorizer would add
+ * AVX-512 paths dispatched on __isa_available, which nothing sets in the kernel (dead code in
+ * pna2dp.sys) and which would use vector state without KeSaveExtendedProcessorState if anything
+ * did; build.ps1 refuses a driver image that contains such dispatch. Integer results are the same
+ * either way. */
+#if defined(_MSC_VER)
+#define SBC_SCALAR_LOOP __pragma(loop(no_vector))
+#else
+#define SBC_SCALAR_LOOP
+#endif
+
 /* ------------------------------------------------------------------------- */
 /* Tables (A2DP specification 12.8 / 12.9)                                     */
 /* ------------------------------------------------------------------------- */
@@ -384,11 +395,13 @@ static void sbc_analyze(sbc_s32 *x, const sbc_s16 *in16, const sbc_s32 *in32, in
         for (i = 3; i >= 0; i--) x[i] = sbc_input(in16, in32, (3 - i) * stride);
         for (i = 0; i < 8; i++) {
             sbc_s64 acc = 0;
+            SBC_SCALAR_LOOP
             for (k = 0; k < 5; k++) acc += (sbc_s64)x[i + 8 * k] * sbc_proto4[i + 8 * k];
             z[i] = acc >> 23;                         /* Q8*Q30 -> Q15 */
         }
         for (i = 0; i < 4; i++) {
             sbc_s64 acc = 0;
+            SBC_SCALAR_LOOP
             for (k = 0; k < 8; k++) acc += z[k] * sbc_cos4[i][k];
             out[i] = (sbc_s32)(acc >> 30);            /* Q15 */
         }
@@ -397,11 +410,13 @@ static void sbc_analyze(sbc_s32 *x, const sbc_s16 *in16, const sbc_s32 *in32, in
         for (i = 7; i >= 0; i--) x[i] = sbc_input(in16, in32, (7 - i) * stride);
         for (i = 0; i < 16; i++) {
             sbc_s64 acc = 0;
+            SBC_SCALAR_LOOP
             for (k = 0; k < 5; k++) acc += (sbc_s64)x[i + 16 * k] * sbc_proto8[i + 16 * k];
             z[i] = acc >> 23;
         }
         for (i = 0; i < 8; i++) {
             sbc_s64 acc = 0;
+            SBC_SCALAR_LOOP
             for (k = 0; k < 16; k++) acc += z[k] * sbc_cos8[i][k];
             out[i] = (sbc_s32)(acc >> 30);
         }
@@ -624,6 +639,7 @@ static void sbc_synthesize(sbc_s32 *v, const sbc_s32 *sb_in, int subbands, sbc_s
         for (i = 79; i >= 8; i--) v[i] = v[i - 8];
         for (i = 0; i < 8; i++) {
             sbc_s64 acc = 0;
+            SBC_SCALAR_LOOP
             for (k = 0; k < 4; k++) acc += (sbc_s64)sbc_syn4[i][k] * sb_in[k];
             v[i] = (sbc_s32)(acc >> 30);              /* Q15 */
         }
@@ -635,6 +651,7 @@ static void sbc_synthesize(sbc_s32 *v, const sbc_s32 *sb_in, int subbands, sbc_s
         }
         for (k = 0; k < 4; k++) {
             sbc_s64 acc = 0;
+            SBC_SCALAR_LOOP
             for (i = 0; i < 10; i++) acc += u[k + 4 * i] * sbc_proto4[k + 4 * i];
             /* D = -4*C (measured against the analysis bank): Q15 * Q30 -> Q45; gain 4 -> >> 43 */
             out[k * stride] = sbc_clip16(-(acc >> 43));
@@ -643,6 +660,7 @@ static void sbc_synthesize(sbc_s32 *v, const sbc_s32 *sb_in, int subbands, sbc_s
         for (i = 159; i >= 16; i--) v[i] = v[i - 16];
         for (i = 0; i < 16; i++) {
             sbc_s64 acc = 0;
+            SBC_SCALAR_LOOP
             for (k = 0; k < 8; k++) acc += (sbc_s64)sbc_syn8[i][k] * sb_in[k];
             v[i] = (sbc_s32)(acc >> 30);
         }
@@ -654,6 +672,7 @@ static void sbc_synthesize(sbc_s32 *v, const sbc_s32 *sb_in, int subbands, sbc_s
         }
         for (k = 0; k < 8; k++) {
             sbc_s64 acc = 0;
+            SBC_SCALAR_LOOP
             for (i = 0; i < 10; i++) acc += u[k + 8 * i] * sbc_proto8[k + 8 * i];
             /* D = -8*C -> >> 42 */
             out[k * stride] = sbc_clip16(-(acc >> 42));

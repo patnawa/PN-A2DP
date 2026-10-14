@@ -13,7 +13,9 @@
  *                                               PumpStop/StartStream (restart) replicated minimally
  *                                               from pump.cpp; SBC start and repacking by the
  *                                               production A2dpSbcPlanStream / A2dpSbcFramesPerPacket)
- *     -> PnConvertPcmEx                        (pcm.cpp: conversion, gain ramps, dither, crossfade, 2:1 decimator)
+ *     -> PnConvertPcmEx                        (pcm.cpp: conversion, gain ramps, dither, crossfade, and the
+ *                                               sample-rate converter: PnPcmRatePlan / PnPcmInputFramesFor
+ *                                               as PumpStartStream / the pump steps use them)
  *     -> kernel SBC (common/sbc/sbc.c)  or  codec plugin DLL through the plugin ABI
  *        (codec-host/plugins: SBC built in, AAC/aptX/LDAC from out\Release) with the
  *        pump's host ledger (audio_policy.h PnHostLedger* / PnHostResultValid)
@@ -52,7 +54,20 @@
  *   PACKET    RTP version/PT/marker/sequence/timestamp, payload-header frame counts, SBC/LDAC
  *             frame walk, aptX block multiples, MTU, AAC fragmentation; PCM ACCOUNTING compares
  *             the RTP timeline with the codec input.
- *   PAUSE     audio rendered before a KS pause left unencoded once the pump drained.
+ *   PAUSE     audio rendered before a KS pause the receiver cannot play once the pump drained (in
+ *             the ring, held by the rate converter's delay or by the codec's own: SBC 73 / 37,
+ *             aptX 90, AAC 1600 codec frames; review of 0.1.0.22 #1).
+ *   RATE      group "rate" (the engine at another rate than the codec): the converter's output
+ *             against the analytic signal delayed by its group delay - SNR >= min(source floor,
+ *             110 dB) (100 dB for sweeps, IMD, 20 kHz), THD+N <= -110 dB at 997 Hz -1 dBFS from
+ *             24-bit / float into a 24 / 32-bit encoder input, level within 0.01 dB, alias /
+ *             image rejection >= 110 dB, no 1 ms window 6 dB worse (a block-boundary click),
+ *             digital silence exact; RATE ACCOUNTING compares engine and codec frames. The
+ *             alias-free band plan: tones whose alias or image lands at 22.5 .. 23.9 kHz and a
+ *             stepped sweep from 20 to 24 kHz (26 kHz into 48 kHz from 88.2 / 96 kHz) through every
+ *             converted pair: no alias or image above -110 dB re the tone.
+ *   NATIVE BIT-EXACT  with --hashes-check FILE: a job at the engine's own rate whose conversion
+ *             output or packets differ from the recorded baseline (FNV-1a 64; --hashes-out).
  *   global    SBC XQ below plain dual channel for the same sink, MTU and radio.
  *   KNOWN     a reachable state with a documented, unfixed limit (the dual-channel SBC ABR floor,
  *             #31) reports its verdicts by name instead of failing; KNOWN ISSUE WORSE fails the
@@ -61,7 +76,10 @@
  * packet, a lost host block, ABR / bitrate / EQMID walks, a stream restart after a 200 ms outage
  * (the sink starts a new decoder; the onset must not click), a pause / resume (fades) and the
  * pause race (findings #1/#7: 16 pause instants, the pump taking every block it can, 50 ms of
- * receiver silence).
+ * receiver silence). Latency profiles (groups "profile-music", "profile-low"; config_policy.h):
+ * the 330 ms stall must not trim at Music (150 / 450 ms), a 520 ms stall trims exactly once
+ * (crossfaded), Low latency (30 / 120 ms) trims; Balanced's fault-trim jobs trim exactly once.
+ * LATENCY PROFILE flags a trim count outside those bounds.
  * Self-tests (group "selftest") inject a dropped, duplicated or corrupted packet and a -40 dBFS
  * one-sample click; each must be reported or the run fails. Baselines run FFmpeg's own SBC and
  * aptX encoders on the same codec input to show what the codec itself does.
@@ -128,6 +146,19 @@ static std::string Sfmt(const char *f, ...)
 
 static double Db10(double x) { return x > 1e-300 ? 10.0 * log10(x) : -3000.0; }
 static double Db20(double x) { return x > 1e-300 ? 20.0 * log10(x) : -3000.0; }
+
+/* FNV-1a 64 over a block's length and bytes: the conversion output and the packets of a job,
+ * compared with a recorded baseline (--hashes-out / --hashes-check, native bit-exactness). */
+static const uint64_t kFnvOffset = 0xCBF29CE484222325ull;
+static uint64_t HashBlock(uint64_t h, const void *data, size_t n)
+{
+    uint32_t len = (uint32_t)n;
+    const uint8_t *p = (const uint8_t *)&len;
+    for (size_t i = 0; i < 4; i++) { h ^= p[i]; h *= 0x100000001B3ull; }
+    p = (const uint8_t *)data;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001B3ull; }
+    return h;
+}
 
 struct Rng {
     uint64_t s;
@@ -234,7 +265,13 @@ static void Fft(std::vector<std::complex<double>> &a, bool inverse)
 /* ------------------------------------------------------------------------- */
 
 enum SigKind { K_TONE, K_SWEEP, K_IMD, K_SQUARE, K_IMPULSE, K_PINK, K_SILENCE, K_STEP, K_LONLY, K_RONLY,
-               K_OPPOSITE, K_STEREO2, K_ALIAS, K_NANINF };
+               K_OPPOSITE, K_STEREO2, K_ALIAS, K_NANINF, K_STEPS };
+
+/* K_STEPS: a stepped sine from f0 to f1 in kStepHz steps, each held dur / steps seconds, phase
+ * continuous (the rate converter's transition-band sweep: every step is a steady tone whose alias or
+ * image the analysis fits by its exact frequency) */
+static const double kStepHz = 250.0;
+static int StepCount(double F0, double F1) { return (int)((F1 - F0) / kStepHz + 0.5) + 1; }
 
 struct SigDef {
     std::string name;
@@ -277,9 +314,28 @@ static SigDef FindSig(const char *name)
     if (!strcmp(name, "overrange")) return { "overrange_1.2_f32", K_TONE, 1.2, kTone, 0, 1.5, true };
     if (!strcmp(name, "tone20k")) return { "sine20k_-6dBFS", K_TONE, 0.5, 20000, 0, 1.5, true };
     if (!strcmp(name, "alias")) return { "alias_above_nyquist", K_ALIAS, 0.5, 30000, 0, 1.5, true };
+    /* the rate converter's image: 19 kHz at the polyphase stage's input folds to (Fin - 19 kHz) */
+    if (!strcmp(name, "image")) return { "image19k_-6dBFS", K_TONE, 0.5, 19000, 0, 1.5, true };
     if (!strcmp(name, "fault_tone")) return { "sine997_-6dBFS", K_TONE, 0.5, kTone, 0, 2.4, true };
     fprintf(stderr, "unknown signal %s\n", name);
     exit(2);
+}
+
+/* The rate converter's alias-free band plan (owner decision, 14 October 2026): a tone in the
+ * transition region, and a stepped sweep through it (group "rate"; every alias or image at least
+ * 110 dB below the tone). Not steady: a tone the converter removes leaves the codec nothing to code,
+ * so the codec's click and alignment verdicts do not apply to it. */
+static SigDef TransitionTone(double Hz)
+{
+    return { Sfmt("transition%.1fk_-6dBFS", Hz / 1000.0), K_ALIAS, 0.5, Hz, 0, 1.5, false };
+}
+
+/* 200 ms a step: in the 180 ms fit a 16-bit encoder input's TPDF dither (the AAC path; near 22 kHz
+ * it reaches -126 dB re the tone in a 1.3 s fit) stays at about -117 dB, under the -110 dB
+ * requirement (100 ms steps measured -113 dB) */
+static SigDef TransitionSweep(double F0, double F1)
+{
+    return { Sfmt("transition-sweep%.2f-%.2fk_-6dBFS", F0 / 1000.0, F1 / 1000.0), K_STEPS, 0.5, F0, F1, 0.2 * StepCount(F0, F1), false };
 }
 
 static bool SigHasTone(const SigDef &s)
@@ -304,6 +360,13 @@ static double SigAnalytic(const SigDef &s, int ch, double t)
     case K_OPPOSITE: return (ch == 0 ? 1 : -1) * s.amp * sin(2 * PI * s.f0 * t);
     case K_STEREO2: return s.amp * sin(2 * PI * (ch == 0 ? s.f0 : s.f1) * t);
     case K_ALIAS: return s.amp * sin(2 * PI * s.f0 * t);
+    case K_STEPS: {
+        int n = StepCount(s.f0, s.f1);
+        double hold = s.dur / n, cycles = 0;
+        int i = PN_MIN((int)(t / hold), n - 1);
+        for (int k = 0; k < i; k++) cycles += (s.f0 + kStepHz * k) * hold;
+        return s.amp * sin(2 * PI * (cycles + (s.f0 + kStepHz * i) * (t - i * hold)));
+    }
     case K_SILENCE: return 0;
     default: return NAN;
     }
@@ -441,7 +504,7 @@ struct ConfigDef {
     const PnCodecPlugin *api;
     A2DP_CODEC_CONFIG cfg;     /* A2dpSelectConfig output */
     ULONG mtu;
-    ULONG engineRate;          /* engine (WaveRT) rate; 2x the codec rate engages the decimator */
+    ULONG engineRate;          /* engine (WaveRT) rate; another rate than the codec's engages the rate converter */
     BOOLEAN xq;
     RadioModel radio;
     bool decodable;
@@ -494,6 +557,10 @@ struct Job {
     bool calibration = false;
     int repeat = 0;          /* determinism: encode twice, compare packets */
     int selftest = 0;        /* detector positive controls: 1 drop a packet, 2 duplicate one, 3 corrupt one, 4 add a -40 dBFS click */
+    /* latency profiles (config_policy.h): TargetLatencyMs / MaxLatencyMs instead of the default
+     * 60 / 250 (0 = default), and the latency trims the job must see (-1 = not checked) */
+    ULONG latTarget = 0, latMax = 0;
+    int minTrims = -1, maxTrims = -1;
 };
 
 struct Pkt {
@@ -513,7 +580,7 @@ struct StreamResult {
     int channels = 0;
     ULONG codecRate = 0;
     std::vector<double> ref;           /* codec input (interleaved, normalised to +-1) */
-    std::vector<double> ideal;         /* expected converter output (non-decimated, constant gain) */
+    std::vector<double> ideal;         /* expected converter output (no rate conversion, constant gain) */
     bool idealValid = false;
     std::vector<Pkt> pkts;
     std::vector<Mark> marks;
@@ -521,9 +588,12 @@ struct StreamResult {
     ULONG bitrate = 0, fitBitpool = 0, payloadRoom = 0;
     ULONG trims = 0, oversizeDrops = 0, hostLost = 0, hostInvalid = 0, encodeErrors = 0, convShort = 0, ringOverruns = 0;
     ULONG ldacExtraPcm = 0;
-    long pauseUnsentFrames = -1;       /* EV_PAUSE: engine frames left unencoded once the pump drained */
+    long pauseUnsentFrames = -1;       /* EV_PAUSE: engine frames left in the ring, converter or encoder once the pump drained */
     long pauseResidualFrames = -1;     /* EV_PAUSE: frames waiting for a whole encoder block at the pause */
     uint64_t engineFramesIn = 0;
+    uint64_t engineConsumed = 0, codecProduced = 0;   /* frames into and out of the converter */
+    uint64_t convHash = kFnvOffset;    /* every PnConvertPcmEx output block */
+    uint64_t pktHash = kFnvOffset;     /* every packet as sent */
     std::string error;
 };
 
@@ -570,7 +640,10 @@ private:
     PNA2DP_STREAM_PARAMS hp = {};
     ULONG mtu = 0, room = 0, txHdr = 0;
     bool useRtp = true, usePh = false;
-    ULONG pcmPerCodecFrame = 0, fpp = 0, encFmt = PNA2DP_FMT_S32, decim = 1, targetCh = 2;
+    ULONG pcmPerCodecFrame = 0, fpp = 0, encFmt = PNA2DP_FMT_S32, targetCh = 2;
+    PN_PCM_RATE_PLAN ratePlan = {};   /* PumpStartStream: engine rate -> codec rate */
+    double ratio = 1.0;               /* codec frames per engine frame */
+    ULONG lastPadFrames = 0;          /* silence FinishStream added last */
     sbc_encoder sbc;
     ULONG sbcCeiling = 0, ldacBase = 0, abrLevel = 0, abrMaxLevel = 0, sbcSdu = 0;
     sbc_params sbcStart = {};
@@ -587,6 +660,7 @@ private:
     std::vector<uint8_t> fadeBuf;
     ULONG gain = 32768; bool muted = false;
     RTP_STATE rtp;
+    ULONG rtpSeq0 = 0, rtpTs0 = 0;   /* the stream's first RTP sequence number and timestamp */
     PN_HOST_LEDGER ledger = {};
     ULONG seq = 1, pendingSkip = 0; bool dropNext = false;
     ULONG lastQ = 0, lastB = 0;
@@ -612,6 +686,20 @@ private:
     void Pause(bool race);
     void EmitPcm(const uint8_t *d, ULONG len);
     void FlushTail(bool fadeOut);
+    /* PumpBlockBytes: the ring bytes one block of N codec frames can take (PnPcmMaxInputFrames) */
+    ULONG BlockBytes(ULONG N) const { return PnPcmMaxInputFrames(&ratePlan, N * pcmPerCodecFrame) * bpf; }
+    /* codec frames of input the receiver needs after a frame before it plays it (encode + decode, as
+     * the calibration jobs measure them, delay_frames): SBC 9 x subbands + 1, aptX 90, AAC (FDK +
+     * FFmpeg) 1600; LDAC: not decodable here, its flush is the equal-rate path's (core_test) */
+    ULONG CodecDelayFrames() const
+    {
+        switch (cfg.Codec) {
+        case PNA2DP_CODEC_SBC: return 9 * (cfg.SbcSubbands ? cfg.SbcSubbands : 8) + 1;
+        case PNA2DP_CODEC_APTX: case PNA2DP_CODEC_APTX_HD: case PNA2DP_CODEC_APTX_LL: return 90;
+        case PNA2DP_CODEC_AAC: return 1600;
+        default: return 0;
+        }
+    }
     ULONG LevelBitrate(ULONG l)
     {
         A2DP_CODEC_CONFIG b = cfg, o;
@@ -629,8 +717,8 @@ bool Emu::Start()
     txHdr = (useRtp ? RTP_HEADER_SIZE : 0) + (usePh ? 1 : 0);
     room = mtu - txHdr;
     R.payloadRoom = room;
-    if (C.engineRate != cfg.SampleRate && C.engineRate != 2 * cfg.SampleRate) { R.error = "rate not supported"; return false; }
-    decim = C.engineRate == cfg.SampleRate ? 1 : 2;
+    if (!PnPcmRatePlan(C.engineRate, cfg.SampleRate, &ratePlan)) { R.error = "rate not supported"; return false; }
+    ratio = (double)cfg.SampleRate / C.engineRate;
     host = C.path == PATH_HOST;
     ULONG sdu = PnBasebandSduBytes(C.radio.localValid, C.radio.local);
     switch (cfg.Codec) {
@@ -643,7 +731,7 @@ bool Emu::Start()
         /* PumpStartStream (pump.cpp), SBC branch: the production plan */
         ULONG xqSdu = PnSbcXqSduBytes(C.radio.localValid, C.radio.local, C.radio.remoteValid, C.radio.remote);
         A2DP_SBC_STREAM_PLAN plan;
-        if (!A2dpSbcPlanStream(&cfg, C.xq, sdu, xqSdu, room, txHdr, pref.TargetLatencyMs, &plan)) { R.error = "SBC: no bitpool fits the MTU"; return false; }
+        if (!A2dpSbcPlanStream(&cfg, C.xq, sdu, xqSdu, room, txHdr, PnSbcPackingTargetMs(pref.TargetLatencyMs), &plan)) { R.error = "SBC: no bitpool fits the MTU"; return false; }
         sp.bitpool = plan.StartBitpool;
         if (sbc_encoder_init(&sbc, &sp) != 0) { R.error = "sbc_encoder_init"; return false; }
         sbcStart = sp;
@@ -680,6 +768,8 @@ bool Emu::Start()
     case PNA2DP_CODEC_LDAC:
         pcmPerCodecFrame = cfg.SampleRate >= 88200 ? 256 : 128; fpp = 2;
         encFmt = cfg.PcmFormat ? cfg.PcmFormat : PNA2DP_FMT_S32;
+        /* PumpStartStream: a converted stream is not requantised to 16 bits */
+        if (ratePlan.EngineRate != ratePlan.CodecRate && !pref.Ldac.FormatMask && encFmt == PNA2DP_FMT_S16) encFmt = PNA2DP_FMT_S32;
         ldacBase = PnLdacAbrQuality(cfg.LdacEqmid, 0);
         abrMaxLevel = 2 - ldacBase;
         break;
@@ -697,7 +787,7 @@ bool Emu::Start()
     cap = ((cap + 4095) / 4096) * 4096;
     cap -= cap % bpf;
     ring.assign(cap, 0);
-    while (fpp > 1 && fpp * pcmPerCodecFrame * decim * bpf > 32768) fpp--;   /* PN_PUMP_MAX_PCM_BLOCK */
+    while (fpp > 1 && BlockBytes(fpp) > 32768) fpp--;   /* PN_PUMP_MAX_PCM_BLOCK */
     fadeFrames = PnWaveFadeFrames(rate, rate / 100, 4096 / bpf);              /* PN_WAVE_FADE_SCRATCH */
     cfg.BitrateBps = A2dpNominalBitrate(&cfg);
     R.bitrate = cfg.BitrateBps;
@@ -705,10 +795,11 @@ bool Emu::Start()
     while (abrMaxLevel && LevelBitrate(abrMaxLevel) == LevelBitrate(abrMaxLevel - 1)) abrMaxLevel--;
     R.framesPerPacket = fpp;
     R.pcmPerCodecFrame = pcmPerCodecFrame;
-    PnPcmStateReset(&ps, decim, FALSE);   /* the stream starts at the programme's own start */
+    PnPcmStateResetRate(&ps, &ratePlan, FALSE);   /* the stream starts at the programme's own start */
     ps.Dither = host && encFmt == PNA2DP_FMT_S16;
     fadeBuf.assign(J.noCrossfade ? 0 : 8192, 0);   /* PN_PUMP_FADE_BYTES */
     RtpInit(&rtp, 96);
+    rtpSeq0 = rtp.Sequence; rtpTs0 = rtp.Timestamp;
     gain = PnVolumeGainQ15((LONG)(J.volDb * 65536.0));
     gainExpected = gain / 32768.0;
     R.codecRate = cfg.SampleRate;
@@ -758,20 +849,24 @@ void Emu::RingRead(uint8_t *out, ULONG len)
 void Emu::Trim(ULONG keepMs)
 {
     ULONG fade = 0;
+    BOOLEAN pending = PnPcmFadePending(&ps);   /* a crossfade not started keeps its source */
     ULONG keepBytes = (ULONG)((ULONGLONG)rate * keepMs / 1000) * bpf;
-    ULONG drop = PnTrimPlan(RingAvail(), keepBytes, bpf, rate * PN_TRIM_FADE_MS / 1000, fadeBuf.empty() ? 0 : (ULONG)fadeBuf.size(), &fade);
-    if (fade && !fadeBuf.empty()) {
+    ULONG drop = PnTrimPlan(RingAvail(), keepBytes, bpf, rate * PN_TRIM_FADE_MS / 1000, fadeBuf.empty() || pending ? 0 : (ULONG)fadeBuf.size(), &fade);
+    if (fade && !fadeBuf.empty() && !pending) {
         ULONG off = (ULONG)(rpos % cap), len = fade * bpf, first = PN_MIN(len, cap - off);
         memcpy(fadeBuf.data(), &ring[off], first);
         if (len > first) memcpy(fadeBuf.data() + first, &ring[0], len - first);
     }
     rpos += drop;
     if (!drop) return;
-    ps.FadeOut = fade ? fadeBuf.data() : NULL;
-    ps.FadeFrames = fade;
-    ps.FadePos = 0;
+    if (!pending) {
+        ps.FadeOut = fade ? fadeBuf.data() : NULL;
+        ps.FadeFrames = fade;
+        ps.FadePos = 0;
+    }
     R.trims++;
-    R.marks.push_back({ R.ref.size() / targetCh, Sfmt("trim %u ms (crossfade %u frames)", drop / bpf * 1000 / rate, fade) });
+    R.marks.push_back({ R.ref.size() / targetCh, pending ? Sfmt("trim %u ms (pending crossfade kept)", drop / bpf * 1000 / rate) :
+                                                Sfmt("trim %u ms (crossfade %u frames)", drop / bpf * 1000 / rate, fade) });
 }
 
 void Emu::AppendRef(const uint8_t *conv, ULONG frames, ULONG fmt)
@@ -785,7 +880,7 @@ void Emu::ResolveMarks(uint64_t engineStart, ULONG engineFrames, size_t refStart
     for (auto it = engineMarks.begin(); it != engineMarks.end();) {
         if (it->first < engineStart + engineFrames) {
             uint64_t off = it->first > engineStart ? it->first - engineStart : 0;
-            R.marks.push_back({ refStart + (size_t)(off / decim), it->second });
+            R.marks.push_back({ refStart + (size_t)(off * ratio), it->second });
             it = engineMarks.erase(it);
         } else ++it;
     }
@@ -809,9 +904,9 @@ void Emu::ApplyAbr(ULONG level)
 /* PumpSbcRepack (pump.cpp): frames per packet for the current bitpool. */
 void Emu::Repack()
 {
-    ULONG n = A2dpSbcFramesPerPacket(&cfg, pref.TargetLatencyMs, room, txHdr, sbcSdu);
+    ULONG n = A2dpSbcFramesPerPacket(&cfg, PnSbcPackingTargetMs(pref.TargetLatencyMs), room, txHdr, sbcSdu);
     if (!n) n = 1;
-    while (n > 1 && n * pcmPerCodecFrame * decim * bpf > 32768) n--;
+    while (n > 1 && BlockBytes(n) > 32768) n--;
     fpp = n;
 }
 
@@ -859,15 +954,14 @@ void Emu::FlushTail(bool fadeOut)
 bool Emu::FinishStream()
 {
     if (tailFrames) { RingWrite(tail.data(), tailFrames * bpf); tailFrames = 0; }
-    ULONG block = fpp * pcmPerCodecFrame * decim * bpf, avail = RingAvail();
+    ULONG block = PN_MIN(BlockBytes(fpp), 32768u), avail = RingAvail();   /* WakeBytes */
+    lastPadFrames = 0;
     if (!block) return false;
     if (avail) FadeTail(PN_MIN(avail / bpf, rate * PN_TRIM_FADE_MS / 1000));
-    ULONG residual = avail % block;
-    ULONG pad = (residual ? block - residual : 0) + (cfg.Codec == PNA2DP_CODEC_AAC ? 2 : 1) * block;
-    ULONG roomBytes = cap - avail;
-    if (pad > roomBytes) pad = roomBytes - roomBytes % block;
+    ULONG pad = PnFinishPadBytes(avail, block, PnFinishExtraBlocks(cfg.Codec, block / bpf, ratePlan.DelayEngineFrames), cap - avail);
     std::vector<uint8_t> z(pad, 0);
     RingWrite(z.data(), pad);
+    lastPadFrames = pad / bpf;
     return pad != 0;
 }
 
@@ -881,11 +975,18 @@ bool Emu::FinishStream()
 void Emu::Pause(bool race)
 {
     if (race) for (int guard = 0; guard < 256 && (host ? StepHost() : StepSbc()); guard++) {}
-    R.pauseResidualFrames = (long)((RingAvail() / bpf + tailFrames) % PN_MAX(fpp * pcmPerCodecFrame * decim, 1u));
-    size_t before = R.ref.size() / targetCh + (RingAvail() / bpf + tailFrames) / decim;
+    R.pauseResidualFrames = (long)((RingAvail() / bpf + tailFrames) % PN_MAX(BlockBytes(fpp) / bpf, 1u));
+    size_t before = R.ref.size() / targetCh + (size_t)((RingAvail() / bpf + tailFrames) * ratio);
     bool padded = FinishStream();   /* SetState(PAUSE) */
+    uint64_t realEnd = wpos / bpf - lastPadFrames;   /* the audio rendered before the pause ends here */
     for (int guard = 0; guard < 256 && (host ? StepHost() : StepSbc()); guard++) {}
-    R.pauseUnsentFrames = (long)(RingAvail() / bpf);
+    /* audio rendered before the pause that the receiver cannot play once the pump has drained:
+     * still in the ring, held by the rate converter's delay (it leaves the filters only
+     * DelayEngineFrames of input later; a converting pump's blocks may be up to a block shorter
+     * than the padding's unit), or held by the codec's own delay (CodecDelayFrames: the encoder
+     * codes the end of the fade only once that much more input follows; review of 0.1.0.22 #1) */
+    uint64_t codecEngine = (CodecDelayFrames() * (uint64_t)rate + cfg.SampleRate - 1) / cfg.SampleRate;
+    R.pauseUnsentFrames = (long)PN_MAX((long long)(realEnd + ratePlan.DelayEngineFrames + codecEngine) - (long long)(rpos / bpf), 0ll);
     if (race) {
         std::vector<uint8_t> z((size_t)(rate / 20) * bpf, 0);
         RingWrite(z.data(), (ULONG)z.size());
@@ -893,7 +994,7 @@ void Emu::Pause(bool race)
     }
     if (padded) {
         R.marks.push_back({ before, "pause: fade-out, padded" });
-        R.marks.push_back({ R.ref.size() / targetCh + RingAvail() / bpf / decim, "resume: fade-in" });
+        R.marks.push_back({ R.ref.size() / targetCh + (size_t)(RingAvail() / bpf * ratio), "resume: fade-in" });
     }
     /* SetState(RUN): the resumed audio fades in only from the silence the pump padded */
     fadeInActive = padded && fadeFrames != 0;
@@ -905,11 +1006,11 @@ void Emu::Pause(bool race)
 void Emu::Restart()
 {
     ULONG avail = RingAvail();
-    ULONG flushed = avail / bpf / decim;
+    ULONG flushed = (ULONG)(avail / bpf * ratio);
     /* PumpStartStream: the first block fades in when the discarded PCM ended in a signal (#4) */
     BOOLEAN midProgramme = PnRingTailHasSignal(ring.data(), cap, wpos, avail, rate * PN_TRIM_FADE_MS / 1000 * bpf);
     rpos = wpos;
-    PnPcmStateReset(&ps, decim, midProgramme);
+    PnPcmStateResetRate(&ps, &ratePlan, midProgramme);
     ps.Dither = host && encFmt == PNA2DP_FMT_S16;
     if (cfg.Codec == PNA2DP_CODEC_SBC && !host) { sbc_params sp = sbcStart; sp.bitpool = sbc.p.bitpool; sbc_encoder_init(&sbc, &sp); }
     if (host && enc) {
@@ -951,6 +1052,17 @@ void Emu::Send(const uint8_t *payload, ULONG bytes, ULONG frameCount, ULONG pcmF
         p.expectBitpool = cfg.Codec == PNA2DP_CODEC_SBC ? (host ? cfg.SbcBitpool : sbc.p.bitpool) : 0;
         p.hostPcmClaim = claim;
         if (i == 0 && markRestart) { p.restart = true; markRestart = false; }
+        if (useRtp) {
+            /* RtpInit draws the first sequence number, timestamp and SSRC at random (RFC 3550):
+             * the hash takes them relative to the stream's first values */
+            uint8_t rel[8];
+            ULONG seqRel = (((ULONG)p.bytes[2] << 8) | p.bytes[3]) - rtpSeq0;
+            ULONG tsRel = (((ULONG)p.bytes[4] << 24) | ((ULONG)p.bytes[5] << 16) | ((ULONG)p.bytes[6] << 8) | p.bytes[7]) - rtpTs0;
+            rel[0] = p.bytes[0]; rel[1] = p.bytes[1]; rel[2] = (uint8_t)seqRel; rel[3] = (uint8_t)(seqRel >> 8);
+            memcpy(rel + 4, &tsRel, 4);
+            R.pktHash = HashBlock(R.pktHash, rel, sizeof(rel));
+            R.pktHash = HashBlock(R.pktHash, p.bytes.data() + RTP_HEADER_SIZE, p.bytes.size() - RTP_HEADER_SIZE);
+        } else R.pktHash = HashBlock(R.pktHash, p.bytes.data(), p.bytes.size());
         R.pkts.push_back(std::move(p));
         offset += n;
     }
@@ -959,13 +1071,16 @@ void Emu::Send(const uint8_t *payload, ULONG bytes, ULONG frameCount, ULONG pcmF
 
 bool Emu::StepSbc()
 {
-    ULONG pcmFrames = fpp * pcmPerCodecFrame, ringFrames = pcmFrames * decim, need = ringFrames * bpf;
+    /* PumpStepSbc: the engine frames that make exactly one packet's codec frames */
+    ULONG pcmFrames = fpp * pcmPerCodecFrame, ringFrames = PnPcmInputFramesFor(&ps, pcmFrames), need = ringFrames * bpf;
     if (need > 32768 || RingAvail() < need) return false;
     uint64_t engineStart = rpos / bpf;
     RingRead(pcmBuf.data(), need);
     size_t refStart = R.ref.size() / targetCh;
-    ULONG conv = PnConvertPcmEx(&ps, pcmBuf.data(), need, ch, bits, valid, isFloat, convBuf.data(), 32768,
+    ULONG conv = PnConvertPcmEx(&ps, pcmBuf.data(), need, ch, bits, valid, isFloat, convBuf.data(), PN_MIN(32768u, pcmFrames * sbc.channels * 4),
                                 PNA2DP_FMT_S32, sbc.channels, muted ? 0 : gain);
+    R.engineConsumed += ringFrames; R.codecProduced += conv / (sbc.channels * 4);
+    R.convHash = HashBlock(R.convHash, convBuf.data(), conv);
     if (conv < pcmFrames * sbc.channels * 4) { R.convShort++; return false; }
     AppendRef(convBuf.data(), pcmFrames, PNA2DP_FMT_S32);
     ResolveMarks(engineStart, ringFrames, refStart);
@@ -986,13 +1101,16 @@ bool Emu::StepSbc()
 
 bool Emu::StepHost()
 {
-    ULONG pcmFrames = fpp * pcmPerCodecFrame, ringFrames = pcmFrames * decim, need = ringFrames * bpf;
+    /* PumpStepHostSubmit */
+    ULONG pcmFrames = fpp * pcmPerCodecFrame, ringFrames = PnPcmInputFramesFor(&ps, pcmFrames), need = ringFrames * bpf;
     if (need > 32768 || RingAvail() < need) return false;
     uint64_t engineStart = rpos / bpf;
     RingRead(pcmBuf.data(), need);
     size_t refStart = R.ref.size() / targetCh;
-    ULONG conv = PnConvertPcmEx(&ps, pcmBuf.data(), need, ch, bits, valid, isFloat, convBuf.data(), 65536,
+    ULONG conv = PnConvertPcmEx(&ps, pcmBuf.data(), need, ch, bits, valid, isFloat, convBuf.data(), PN_MIN(65536u, pcmFrames * targetCh * TargetBytes(encFmt)),
                                 encFmt, targetCh, muted ? 0 : gain);
+    R.engineConsumed += ringFrames; R.codecProduced += conv / (targetCh * TargetBytes(encFmt));
+    R.convHash = HashBlock(R.convHash, convBuf.data(), conv);
     AppendRef(convBuf.data(), conv / (targetCh * TargetBytes(encFmt)), encFmt);
     ResolveMarks(engineStart, ringFrames, refStart);
     ULONG sequence = seq++;
@@ -1047,8 +1165,8 @@ StreamResult Emu::Run()
     std::vector<double> held;
     EncodeEngine(L, Rr, kFmts[J.fmt], bytes, held);
     R.engineFramesIn = frames;
-    /* expected converter output for the conversion check: constant gain, no decimation */
-    if (decim == 1 && J.events.empty()) {
+    /* expected converter output for the conversion check: constant gain, no rate conversion */
+    if (ratePlan.EngineRate == ratePlan.CodecRate && J.events.empty()) {
         R.idealValid = true;
         R.ideal.reserve(frames * targetCh);
         for (size_t n = 0; n < frames; n++) {
@@ -1354,6 +1472,63 @@ static SineFit FitSine(const std::vector<double> &x, int ch, int c, size_t begin
     return { sqrt(a * a + b * b), atan2(-b, a), d, resid, total };
 }
 
+/* Amplitudes of a sinusoid at each of Freqs (Hz) in channel c, samples [begin, end) at rate Fs,
+ * fitted jointly with DC (least squares, Gauss-Jordan): a weak alias next to the tone that made it. */
+static std::vector<double> FitTones(const std::vector<double> &x, int ch, int c, size_t begin, size_t end, double Fs,
+                                    const std::vector<double> &Freqs)
+{
+    const size_t P = 2 * Freqs.size() + 1, W = P + 1;
+    std::vector<double> M(P * W, 0.0), v(P);
+    for (size_t n = begin; n < end; n++) {
+        for (size_t f = 0; f < Freqs.size(); f++) { double w = 2 * PI * Freqs[f] / Fs * (double)n; v[2 * f] = cos(w); v[2 * f + 1] = sin(w); }
+        v[P - 1] = 1.0;
+        double y = x[n * ch + c];
+        for (size_t i = 0; i < P; i++) { M[i * W + P] += v[i] * y; for (size_t j = 0; j < P; j++) M[i * W + j] += v[i] * v[j]; }
+    }
+    for (size_t i = 0; i < P; i++) {
+        size_t piv = i;
+        for (size_t r = i + 1; r < P; r++) if (fabs(M[r * W + i]) > fabs(M[piv * W + i])) piv = r;
+        for (size_t k = 0; k < W; k++) std::swap(M[i * W + k], M[piv * W + k]);
+        if (fabs(M[i * W + i]) < 1e-300) return std::vector<double>(Freqs.size(), 0.0);
+        for (size_t r = 0; r < P; r++) if (r != i) { double f = M[r * W + i] / M[i * W + i]; for (size_t k = i; k < W; k++) M[r * W + k] -= f * M[i * W + k]; }
+    }
+    std::vector<double> amp;
+    for (size_t f = 0; f < Freqs.size(); f++) {
+        double a = M[2 * f * W + P] / M[2 * f * W + 2 * f], b = M[(2 * f + 1) * W + P] / M[(2 * f + 1) * W + 2 * f + 1];
+        amp.push_back(sqrt(a * a + b * b));
+    }
+    return amp;
+}
+
+/* Where a tone of Hz lands after sampling at Rate: folded into 0 .. Rate / 2. */
+static double FoldHz(double Hz, double Rate)
+{
+    double f = fmod(Hz, Rate);
+    if (f < 0) f += Rate;
+    return f > Rate / 2 ? Rate - f : f;
+}
+
+/* The polyphase stage's output rate: the codec's, or in a cascade (polyphase, then 2:1) twice it. */
+static double RateMid(const PN_PCM_RATE_PLAN &P)
+{
+    return (double)P.CodecRate * P.Decimate;
+}
+
+/* The first-order alias or image of an input tone of Hz through Plan (0: none, a tone the 2:1 stage
+ * alone passes), and whether the tone itself is in the output band: the polyphase stage folds it
+ * about half its output rate, the 2:1 stage (or the output) about half the codec rate, and its first
+ * image lies at the engine rate less the tone, folded the same way. */
+static double RateSpurious(const PN_PCM_RATE_PLAN &P, double Hz, bool *Wanted)
+{
+    const double fout = P.CodecRate, fin = P.EngineRate, mid = RateMid(P);
+    const double s1 = P.Rs ? FoldHz(Hz, mid) : Hz;
+    const bool wanted = s1 == Hz && Hz < fout / 2;
+    double main = FoldHz(s1, fout);
+    if (wanted) main = P.Rs ? FoldHz(FoldHz(fin - Hz, mid), fout) : 0.0;
+    if (Wanted) *Wanted = wanted;
+    return main > 0 && fabs(main - Hz) > 50.0 ? main : 0.0;
+}
+
 /* Window energies (mean square over channels) of a signal, 1 ms windows, hop W/2. */
 struct Windows { std::vector<double> e; size_t W, hop; };
 static Windows WindowEnergy(const std::vector<double> &x, int ch, size_t begin, size_t end, double rate)
@@ -1534,44 +1709,164 @@ static void AnalyzeConversion(const ConfigDef &C, const Job &J, const StreamResu
     }
 }
 
-static void AnalyzeDecimator(const ConfigDef &C, const Job &J, const StreamResult &S, Metrics &M)
+/* The sample-rate converter (0.1.0.22 #1) alone: the codec input (the converter's output) against
+ * the analytic signal delayed by the converter's group delay, at the codec rate. tau: the 2:1 FIR's
+ * centre less one frame (output m stands for engine frame 2m + 1 - Center) plus CenterTwice / (2 L)
+ * frames of the polyphase stage's own input rate. Thresholds (docs/20-max-audio-quality.md, #1): SNR >=
+ * min(source / encoder floor, 110 dB) for tones up to 0.4 fs_out, min(floor, 100 dB) for the sweep,
+ * IMD and 20 kHz tone; THD+N <= -110 dB for a 997 Hz -1 dBFS tone from 24-bit or float into a 24 / 32
+ * bit encoder input; level within 0.01 dB; alias / image rejection >= 110 dB; no 1 ms window more
+ * than 6 dB worse than needed (a block-boundary click); digital silence stays exact zeros; and
+ * RATE ACCOUNTING: the engine frames consumed make the codec frames produced at Fout / Fin. */
+static void AnalyzeRateConverter(const ConfigDef &C, const Job &J, const StreamResult &S, Metrics &M)
 {
-    if (C.engineRate != 2 * C.cfg.SampleRate) return;
+    PN_PCM_RATE_PLAN plan;
+    if (C.engineRate == C.cfg.SampleRate || !PnPcmRatePlan(C.engineRate, C.cfg.SampleRate, &plan)) return;
     int ch = S.channels;
     size_t frames = S.ref.size() / ch;
-    double fs = C.cfg.SampleRate;
-    if (J.sig.kind == K_ALIAS) {
-        size_t b = (size_t)(0.2 * fs), e = (size_t)((J.sig.dur - 0.05) * fs);
-        double acc = 0;
-        for (size_t n = b; n < e && n < frames; n++) for (int c = 0; c < ch; c++) acc += S.ref[n * ch + c] * S.ref[n * ch + c];
-        double lvl = Db10(acc / (double)((e - b) * ch)) - Db20(J.sig.amp / sqrt(2.0));
-        M.Set("decim_alias_rejection_db", -lvl);
-        if (-lvl < 80) M.flags.push_back(Sfmt("DECIMATOR: %.0f Hz above the codec Nyquist only %.1f dB down (spec >= 80 dB)", J.sig.f0, -lvl));
+    const double fs = C.cfg.SampleRate, fin = C.engineRate, mid = RateMid(plan);
+    /* the polyphase stage's group delay (at the engine rate), then the 2:1 stage's (at twice fs) */
+    const double tau = (plan.Rs ? plan.Rs->CenterTwice / (2.0 * plan.Rs->L * fin) : 0.0) + (plan.Dec ? (plan.Dec->Center - 1.0) / (2.0 * fs) : 0.0);
+    M.Set("rate_delay_ms", tau * 1000.0);
+    double acct = fabs((double)S.engineConsumed * fs / fin - (double)S.codecProduced);
+    M.Set("rate_accounting_frames", acct);
+    if (acct > plan.DelayEngineFrames * fs / fin + 2)
+        M.flags.push_back(Sfmt("RATE ACCOUNTING: %llu engine frames made %llu codec frames (%.1f off the %.0f / %.0f ratio)",
+                               (unsigned long long)S.engineConsumed, (unsigned long long)S.codecProduced, acct, fs, fin));
+    if (!J.events.empty() || J.volDb != 0) return;
+    if (J.sig.kind == K_SILENCE) {
+        size_t nonzero = 0;
+        for (double v : S.ref) if (v != 0.0) nonzero++;
+        M.Set("rate_silence_nonzero", (double)nonzero);
+        if (nonzero) M.flags.push_back(Sfmt("RATE: digital silence through the converter has %zu non-zero samples", nonzero));
         return;
     }
-    if (std::isnan(SigAnalytic(J.sig, 0, 0.3)) || !J.events.empty() || J.volDb != 0) return;
-    /* converter output vs the analytic signal 25 codec frames later (51-tap centre at 2:1) */
-    size_t b = (size_t)(0.1 * fs), e = (size_t)((J.sig.dur - 0.05) * fs);
-    double es = 0, en = 0;
-    for (size_t n = b; n < e && n < frames; n++) for (int c = 0; c < ch; c++) {
-        double ideal = SigAnalytic(J.sig, c, (n - 25.0) / fs);
-        if (ch == 1) ideal = (SigAnalytic(J.sig, 0, (n - 25.0) / fs) + SigAnalytic(J.sig, 1, (n - 25.0) / fs)) / 2;
-        double d = S.ref[n * ch + c] - ideal;
-        es += ideal * ideal; en += d * d;
+    size_t b = (size_t)(0.1 * fs), e = PN_MIN(frames, (size_t)((J.sig.dur - 0.05) * fs));
+    if (e <= b + (size_t)(0.1 * fs)) return;
+    /* the alias-free band plan (owner decision, 14 October 2026): a stepped sweep through the transition
+     * region, every step's first-order alias / image (RateSpurious) fitted jointly with the step's tone
+     * in the step's steady middle (12 ms after its start, 8 ms before its end, delayed by tau), at
+     * most -110 dB re the tone */
+    const bool transition = J.sig.name.rfind("transition", 0) == 0;
+    if (transition && J.sig.kind == K_STEPS) {
+        const int steps = StepCount(J.sig.f0, J.sig.f1);
+        const double hold = J.sig.dur / steps;
+        double worst = -300, worstHz = 0, worstAt = 0;
+        bool worstImage = false;
+        int measured = 0;
+        for (int i = 0; i < steps; i++) {
+            const double hz = J.sig.f0 + kStepHz * i;
+            bool want = false;
+            const double at = RateSpurious(plan, hz, &want);
+            size_t wb = (size_t)((i * hold + tau + 0.012) * fs), we = PN_MIN(frames, (size_t)(((i + 1) * hold + tau - 0.008) * fs));
+            if (at <= 0 || at >= fs / 2 || we <= wb + 64) continue;   /* a tone the 2:1 stage alone passes: nothing folds */
+            std::vector<double> fr = { at };
+            if (want) fr.push_back(hz);
+            for (int c = 0; c < ch; c++) {
+                double lvl = Db20(FitTones(S.ref, ch, c, wb, we, fs, fr)[0] / J.sig.amp);
+                if (lvl > worst) { worst = lvl; worstHz = hz; worstAt = at; worstImage = want; }
+            }
+            measured++;
+        }
+        M.Set("rate_sweep_alias_db", worst);
+        M.Set("rate_sweep_steps", measured);
+        M.notes.push_back(Sfmt("transition sweep %.2f..%.2f kHz: %d of %d steps alias or image into the output band, worst %.1f dB re tone (%.0f Hz at %.0f Hz)",
+                               J.sig.f0 / 1000.0, J.sig.f1 / 1000.0, measured, steps, worst, worstHz, worstAt));
+        if (!measured) M.flags.push_back("RATE: the transition sweep measured no step");
+        else if (worst > -110) M.flags.push_back(Sfmt("RATE: the transition sweep's %s of %.0f Hz at %.0f Hz is %.1f dB re the tone (need <= -110 dB)",
+                                                      worstImage ? "image" : "alias", worstHz, worstAt, worst));
+        return;
     }
-    if (es > 0) {
-        double snr = Db10(es / PN_MAX(en, 1e-300));
-        M.Set("decim_snr_db", snr);
-        /* In band (< 0.45 fs_out) the filter ripple is < 0.001 dB: >= 80 dB; sweeps reach the
-         * transition band above 0.45 fs_out, so only their level is compared. */
-        /* the source quantisation (TPDF-dithered 16/24-bit: LSB^2/4) and the encoder format
-         * (S16 with dither: LSB^2/4) bound what the comparison can show */
-        double noise = 0;
-        if (!kFmts[J.fmt].isFloat && kFmts[J.fmt].valid < 32) noise += pow(2.0, -2.0 * (kFmts[J.fmt].valid - 1)) / 4;
-        if (C.path == PATH_HOST && C.cfg.Codec == PNA2DP_CODEC_AAC) noise += pow(2.0, -30.0) / 4;
-        double floorSnr = noise > 0 ? Db10(es / (double)((e - b) * ch) / noise) - 3 : 200;
-        double need = PN_MIN(floorSnr, J.sig.kind == K_SWEEP ? 20.0 : J.sig.kind == K_IMD || J.sig.f0 > 0.4 * fs ? 40.0 : 80.0);
-        if (snr < need) M.flags.push_back(Sfmt("DECIMATOR: converter output only %.1f dB from the ideal (need %.0f)", snr, need));
+    /* alias (a tone above the 2:1 stage's output band), image (the engine rate's spectral image of a
+     * tone through the polyphase stage) and a transition-band tone's first-order alias or image
+     * (RateSpurious): the component where it folds to, fitted jointly with the tone itself when the
+     * tone is in the output band */
+    double fold = 0;
+    bool wanted = J.sig.f0 < fs / 2;
+    if (transition) fold = RateSpurious(plan, J.sig.f0, &wanted);
+    else if (J.sig.kind == K_ALIAS && plan.Decimate == 2 && J.sig.f0 > fs / 2) fold = FoldHz(FoldHz(J.sig.f0, mid), fs);
+    else if (J.sig.name.rfind("image", 0) == 0 && plan.Rs) fold = FoldHz(FoldHz(fin - J.sig.f0, mid), fs);
+    if (fold > 0 && fold < fs / 2) {
+        double worst = -300;
+        for (int c = 0; c < ch; c++) {
+            std::vector<double> fr = { fold };
+            if (wanted) fr.push_back(J.sig.f0);
+            worst = PN_MAX(worst, Db20(FitTones(S.ref, ch, c, b, e, fs, fr)[0] / J.sig.amp));
+        }
+        if (transition) {
+            M.Set("rate_transition_alias_db", worst);
+            if (worst > -110) M.flags.push_back(Sfmt("RATE: the %s of the %.0f Hz tone at %.0f Hz is %.1f dB re the tone (need <= -110 dB)",
+                                                     wanted ? "image" : "alias", J.sig.f0, fold, worst));
+            return;
+        }
+        M.Set(J.sig.kind == K_ALIAS ? "rate_alias_rejection_db" : "rate_image_rejection_db", -worst);
+        if (-worst < 110) M.flags.push_back(Sfmt("RATE: the %s of %.0f Hz at %.0f Hz is only %.1f dB down (need >= 110 dB)",
+                                                  J.sig.kind == K_ALIAS ? "alias" : "image", J.sig.f0, fold, -worst));
+        if (J.sig.kind == K_ALIAS) return;
+    }
+    if (transition) {
+        /* in the output band, and a 2:1 stage alone folds nothing onto it: only its level through the
+         * transition band (informational) */
+        double lvl = -300;
+        for (int c = 0; c < ch; c++) lvl = PN_MAX(lvl, Db20(FitTones(S.ref, ch, c, b, e, fs, { J.sig.f0 })[0] / J.sig.amp));
+        M.Set("rate_transition_level_db", lvl);
+        return;
+    }
+    if (std::isnan(SigAnalytic(J.sig, 0, 0.3))) return;
+    /* the converter's output against the analytic signal tau later */
+    double es = 0, en = 0;
+    size_t win = (size_t)PN_MAX(16.0, floor(fs * 0.001 + 0.5));
+    double winWorst = 0, winAcc = 0;
+    size_t winCount = 0;
+    for (size_t n = b; n < e; n++) {
+        for (int c = 0; c < ch; c++) {
+            double t = n / fs - tau;
+            double ideal = SigAnalytic(J.sig, c, t);
+            if (ch == 1) ideal = (SigAnalytic(J.sig, 0, t) + SigAnalytic(J.sig, 1, t)) / 2;
+            double d = S.ref[n * ch + c] - ideal;
+            es += ideal * ideal; en += d * d; winAcc += d * d;
+        }
+        if (++winCount == win) { winWorst = PN_MAX(winWorst, winAcc / (double)(win * ch)); winAcc = 0; winCount = 0; }
+    }
+    if (es <= 0) return;
+    double snr = Db10(es / PN_MAX(en, 1e-300));
+    double sigPow = es / (double)((e - b) * ch);
+    M.Set("rate_snr_db", snr);
+    double winSnr = Db10(sigPow / PN_MAX(winWorst, 1e-300));
+    M.Set("rate_window_snr_min_db", winSnr);
+    /* what the source quantisation (TPDF-dithered 16 / 24-bit: LSB^2 / 4) and the encoder format
+     * (S16 with TPDF dither: LSB^2 / 4; S24 rounded: LSB^2 / 12) let the comparison show */
+    double noise = 0;
+    if (!kFmts[J.fmt].isFloat && kFmts[J.fmt].valid < 32) noise += pow(2.0, -2.0 * (kFmts[J.fmt].valid - 1)) / 4;
+    ULONG encFmt = C.path == PATH_HOST ? (C.cfg.Codec == PNA2DP_CODEC_LDAC ? (C.cfg.PcmFormat ? C.cfg.PcmFormat : PNA2DP_FMT_S32) :
+                   C.cfg.Codec == PNA2DP_CODEC_APTX || C.cfg.Codec == PNA2DP_CODEC_APTX_HD || C.cfg.Codec == PNA2DP_CODEC_APTX_LL ? PNA2DP_FMT_S24 : PNA2DP_FMT_S16) : PNA2DP_FMT_S32;
+    if (encFmt == PNA2DP_FMT_S16) noise += pow(2.0, -30.0) / 4;
+    if (encFmt == PNA2DP_FMT_S24) noise += pow(2.0, -46.0) / 12;
+    double floorSnr = noise > 0 ? Db10(sigPow / noise) - 3 : 200;
+    bool hf = J.sig.kind == K_SWEEP || J.sig.kind == K_IMD || ((SigHasTone(J.sig) || J.sig.kind == K_STEREO2) && J.sig.f0 > 0.4 * fs);
+    double need = PN_MIN(floorSnr, hf ? 100.0 : 110.0);
+    M.Set("rate_snr_need_db", need);
+    if (snr < need) M.flags.push_back(Sfmt("RATE: converter output only %.1f dB from the ideal (need %.1f)", snr, need));
+    if (winSnr < need - 6) M.flags.push_back(Sfmt("RATE: a 1 ms window only %.1f dB from the ideal (need %.1f): a click at a block boundary?", winSnr, need - 6));
+    /* tones: level and THD+N (the fit's residual against the fitted tone) */
+    if ((SigHasTone(J.sig) || J.sig.kind == K_STEREO2) && J.sig.kind != K_NANINF) {
+        double worstLevel = 0, worstThd = -300;
+        for (int c = 0; c < ch; c++) {
+            double f = J.sig.kind == K_STEREO2 && c == 1 ? J.sig.f1 : J.sig.f0;
+            double amp = J.sig.amp;
+            if (J.sig.kind == K_LONLY || J.sig.kind == K_RONLY) continue;
+            SineFit fit = FitSine(S.ref, ch, c, b, e, 2 * PI * f / fs);
+            double lvl = Db20(fit.amp / amp);
+            if (fabs(lvl) > fabs(worstLevel)) worstLevel = lvl;
+            worstThd = PN_MAX(worstThd, Db10(fit.resid / PN_MAX(fit.amp * fit.amp / 2 * (double)(e - b), 1e-300)));
+        }
+        M.Set("rate_level_db", worstLevel);
+        M.Set("rate_thdn_db", worstThd);
+        if (fabs(worstLevel) > 0.01 && J.sig.f0 <= 20000)
+            M.flags.push_back(Sfmt("RATE: tone level %+.4f dB through the converter (need within 0.01 dB)", worstLevel));
+        bool hiRes = (J.fmt == FMT_S24IN32 || J.fmt == FMT_F32) && encFmt != PNA2DP_FMT_S16;
+        if (J.sig.name == "sine997_-1dBFS" && hiRes && worstThd > -110.0)
+            M.flags.push_back(Sfmt("RATE: THD+N %.1f dB at 997 Hz -1 dBFS (need <= -110 dB)", worstThd));
     }
 }
 
@@ -1648,7 +1943,7 @@ static void AnalyzeDecoded(const ConfigDef &C, const Job &J, const StreamResult 
     if (e > b + (size_t)(0.2 * fs)) e -= (size_t)(0.04 * fs);
     size_t eq = e;
     if (J.sig.kind == K_SWEEP) eq = PN_MIN(e, (size_t)(J.sig.dur * log(15000.0 / J.sig.f0) / log(J.sig.f1 / J.sig.f0) * fs));
-    bool hfOnly = J.sig.kind == K_IMD || J.sig.kind == K_ALIAS || (SigHasTone(J.sig) && J.sig.f0 > 15000);
+    bool hfOnly = J.sig.kind == K_IMD || J.sig.kind == K_ALIAS || J.sig.kind == K_STEPS || (SigHasTone(J.sig) && J.sig.f0 > 15000);
     /* aligned decoded copy */
     std::vector<double> d(frames * ch, 0.0);
     size_t tlFrames = tl.size() / ch;
@@ -1975,17 +2270,23 @@ static JobOut RunJob(const Job &J)
     Metrics &M = out.M;
     std::string base = g_Work + "\\" + Safe(J.id);
     /* PATH_FFSBC: FFmpeg's own SBC encoder on the same codec input (baseline) */
-    Emu emu(C, J, g_Pref);
+    PNA2DP_CONFIG pref = g_Pref;
+    if (J.latTarget) { pref.TargetLatencyMs = J.latTarget; pref.MaxLatencyMs = J.latMax; }
+    Emu emu(C, J, pref);
     StreamResult S = emu.Run();
     if (!S.error.empty()) { M.flags.push_back("SETUP: " + S.error); out.S = std::move(S); return out; }
     M.Set("bitrate_kbps", S.bitrate / 1000.0);
     if (C.cfg.Codec == PNA2DP_CODEC_SBC) { M.Set("sbc_bitpool", S.sbcBitpool); M.Set("sbc_frame_bytes", S.sbcFrameBytes); M.Set("sbc_fit_bitpool", S.fitBitpool); }
     M.Set("frames_per_packet", S.framesPerPacket);
-    if (S.trims) M.Set("trims", S.trims);
+    if (S.trims || J.minTrims >= 0) M.Set("trims", S.trims);
+    if (J.latTarget) { M.Set("latency_target_ms", J.latTarget); M.Set("latency_max_ms", J.latMax); }
+    if ((J.minTrims >= 0 && S.trims < (ULONG)J.minTrims) || (J.maxTrims >= 0 && S.trims > (ULONG)J.maxTrims))
+        M.flags.push_back(Sfmt("LATENCY PROFILE: %u latency trim(s) at %u / %u ms, expected %d..%d", S.trims, J.latTarget, J.latMax, J.minTrims, J.maxTrims));
     if (S.pauseUnsentFrames >= 0) {
         M.Set("pause_residual_ms", S.pauseResidualFrames * 1000.0 / C.engineRate);
         M.Set("pause_unsent_ms", S.pauseUnsentFrames * 1000.0 / C.engineRate);
-        if (S.pauseUnsentFrames) M.flags.push_back(Sfmt("PAUSE: %.1f ms of audio rendered before a pause stays unencoded", S.pauseUnsentFrames * 1000.0 / C.engineRate));
+        if (S.pauseUnsentFrames) M.flags.push_back(Sfmt("PAUSE: %.2f ms (%ld engine frames) of audio rendered before a pause stays in the converter or the encoder",
+                                                       S.pauseUnsentFrames * 1000.0 / C.engineRate, S.pauseUnsentFrames));
     }
     if (S.ringOverruns) M.flags.push_back(Sfmt("RING: %u overruns", S.ringOverruns));
     if (S.encodeErrors) M.flags.push_back(Sfmt("ENCODER: %u encode errors", S.encodeErrors));
@@ -1994,7 +2295,7 @@ static JobOut RunJob(const Job &J)
     if (S.oversizeDrops) M.flags.push_back(Sfmt("PACKET: %u encoded blocks dropped as larger than the MTU", S.oversizeDrops));
     if (S.ldacExtraPcm) M.flags.push_back(Sfmt("LDAC: plugin packet queue overflowed, %u PCM frames of dropped packets", S.ldacExtraPcm));
     AnalyzeConversion(C, J, S, M);
-    AnalyzeDecimator(C, J, S, M);
+    AnalyzeRateConverter(C, J, S, M);
     AnalyzeTonesPreCodec(J, S, M);
     if (J.selftest >= 1 && J.selftest <= 3 && S.pkts.size() > 20) {
         size_t k = S.pkts.size() * 2 / 5;
@@ -2036,15 +2337,17 @@ static JobOut RunJob(const Job &J)
             M.flags.push_back(Sfmt("PCM ACCOUNTING: codec input %llu frames, RTP timeline %llu frames", (unsigned long long)refFrames, (unsigned long long)rx.tlFrames));
     }
     if (J.repeat) {
-        Emu emu2(C, J, g_Pref);
+        Emu emu2(C, J, pref);
         StreamResult S2 = emu2.Run();
         bool same = S2.pkts.size() == S.pkts.size();
         for (size_t i = 0; same && i < S.pkts.size(); i++) {
             const auto &a = S.pkts[i].bytes, &b2 = S2.pkts[i].bytes;
             same = a.size() == b2.size() && (a.size() <= 12 || memcmp(a.data() + (CodecUsesRtp(C.cfg.Codec) ? 12 : 0), b2.data() + (CodecUsesRtp(C.cfg.Codec) ? 12 : 0), a.size() - (CodecUsesRtp(C.cfg.Codec) ? 12 : 0)) == 0);
         }
-        M.Set("deterministic", same ? 1 : 0);
+        bool sameConv = S2.convHash == S.convHash;
+        M.Set("deterministic", same && sameConv ? 1 : 0);
         if (!same) M.flags.push_back("DETERMINISM: the same input produced different packets");
+        if (!sameConv) M.flags.push_back("DETERMINISM: the same input converted differently");
     }
     if (!C.decodable) {
         if (C.cfg.Codec == PNA2DP_CODEC_LDAC) {
@@ -2070,7 +2373,7 @@ static JobOut RunJob(const Job &J)
     double fs = S.codecRate;
     size_t b = (size_t)(0.1 * fs), e = PN_MIN((size_t)refFrames, (size_t)((J.sig.dur - 0.02) * fs));
     bool periodic = SigHasTone(J.sig) || J.sig.kind == K_SQUARE || J.sig.kind == K_IMD || J.sig.kind == K_STEREO2 || J.sig.kind == K_SILENCE || J.sig.kind == K_IMPULSE ||
-        J.sig.kind == K_STEP || J.sig.kind == K_ALIAS;
+        J.sig.kind == K_STEP || J.sig.kind == K_ALIAS || J.sig.kind == K_STEPS;
     {
         std::lock_guard<std::mutex> lk(g_Mx);
         auto it = g_Delay.find(C.key);
@@ -2243,7 +2546,7 @@ static bool MakeSbc(const char *key, const char *label, PNA2DP_CONFIG pref, ULON
 
 int wmain(int argc, wchar_t **argv)
 {
-    std::string pluginDir, filter;
+    std::string pluginDir, filter, hashesOut, hashesCheck;
     unsigned threads = PN_MAX(2u, PN_MIN(16u, std::thread::hardware_concurrency()));
     for (int i = 1; i < argc; i++) {
         std::wstring a = argv[i];
@@ -2254,7 +2557,13 @@ int wmain(int argc, wchar_t **argv)
         else if (a == L"--threads") threads = (unsigned)atoi(next().c_str());
         else if (a == L"--filter") filter = next();
         else if (a == L"--keep") g_Keep = true;
-        else { fprintf(stderr, "usage: quality_test --plugins DIR --work DIR [--ffmpeg EXE] [--threads N] [--filter TEXT] [--keep]\n"); return 2; }
+        else if (a == L"--hashes-out") hashesOut = next();
+        else if (a == L"--hashes-check") hashesCheck = next();
+        else {
+            fprintf(stderr, "usage: quality_test --plugins DIR --work DIR [--ffmpeg EXE] [--threads N] [--filter TEXT] [--keep]\n"
+                            "                    [--hashes-out FILE] [--hashes-check FILE]\n");
+            return 2;
+        }
     }
     if (pluginDir.empty() || g_Work.empty()) { fprintf(stderr, "--plugins and --work are required\n"); return 2; }
     CreateDirectoryW(Widen(g_Work).c_str(), NULL);
@@ -2284,6 +2593,8 @@ int wmain(int argc, wchar_t **argv)
     /* ---- configurations ---- */
     PNA2DP_CONFIG dual = g_Pref; dual.Flags |= PNA2DP_CFG_DUAL_CHANNEL_PREFER;
     int kSony48, kSony44, kJoint48, kJoint44, kXq3, kXq2, kXqUnknown, kMono, kHost, kBp250, kSonyD96, kSonyD88;
+    int kSony44to48 = -1, kSony48to44 = -1, kSony96to44 = -1, kSony88to48 = -1;
+    int kBp250D88 = -1, kBp250D88to48 = -1;
     std::vector<int> kLow;
     MakeSbc("sbc-k-sony-dual53-48k", "kernel SBC, Sony caps, dual channel bp53, 48 kHz, MTU 895", dual, 48000, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 0, &kSony48);
     MakeSbc("sbc-k-sony-dual53-44k", "kernel SBC, Sony caps, dual channel bp53, 44.1 kHz, MTU 895", dual, 44100, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 0, &kSony44);
@@ -2304,13 +2615,24 @@ int wmain(int argc, wchar_t **argv)
         }
     }
     { PNA2DP_CONFIG p = g_Pref; p.Sbc.MaxBitpool = 250; p.Sbc.AllowBitpoolOverride = 1;
-      MakeSbc("sbc-k-joint-bp250-48k", "kernel SBC joint stereo bitpool 250 override, 48 kHz, MTU 895", p, 48000, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 0, &kBp250); }
+      MakeSbc("sbc-k-joint-bp250-48k", "kernel SBC joint stereo bitpool 250 override, 48 kHz, MTU 895", p, 48000, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 0, &kBp250);
+      /* review of 0.1.0.22 #1: one SBC frame per packet (128-frame blocks) behind the converter's longest delays */
+      MakeSbc("sbc-k-joint-bp250-88to44", "kernel SBC joint stereo bitpool 250 override (one frame per packet), engine 88.2 kHz -> 44.1 kHz 2:1",
+              p, 44100, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 88200, &kBp250D88);
+      MakeSbc("sbc-k-joint-bp250-88to48", "kernel SBC joint stereo bitpool 250 override (one frame per packet), engine 88.2 kHz (160/147 into 96 kHz, then 2:1)",
+              p, 48000, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 88200, &kBp250D88to48); }
     MakeSbc("sbc-host-joint53-48k", "SBC plugin (host ABI, S16 + TPDF dither), joint bp53, 48 kHz, MTU 895", g_Pref, 48000, 895, FALSE, kRadio3Dh5, PATH_HOST, sbcPlugin, 0, &kHost);
-    MakeSbc("sbc-k-sony-dual53-96to48", "kernel SBC Sony dual bp53, engine 96 kHz -> 48 kHz half-band decimator", dual, 48000, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 96000, &kSonyD96);
-    MakeSbc("sbc-k-sony-dual53-88to44", "kernel SBC Sony dual bp53, engine 88.2 kHz -> 44.1 kHz half-band decimator", dual, 44100, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 88200, &kSonyD88);
+    MakeSbc("sbc-k-sony-dual53-96to48", "kernel SBC Sony dual bp53, engine 96 kHz -> 48 kHz 2:1 decimator", dual, 48000, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 96000, &kSonyD96);
+    MakeSbc("sbc-k-sony-dual53-88to44", "kernel SBC Sony dual bp53, engine 88.2 kHz -> 44.1 kHz 2:1 decimator", dual, 44100, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 88200, &kSonyD88);
+    /* 0.1.0.22 #1: the polyphase stage alone and before the 2:1 stage */
+    MakeSbc("sbc-k-sony-dual53-44to48", "kernel SBC Sony dual bp53 at 48 kHz, engine 44.1 kHz (polyphase 160/147)", dual, 48000, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 44100, &kSony44to48);
+    MakeSbc("sbc-k-sony-dual53-48to44", "kernel SBC Sony dual bp53 at 44.1 kHz, engine 48 kHz (polyphase 147/160)", dual, 44100, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 48000, &kSony48to44);
+    MakeSbc("sbc-k-sony-dual53-96to44", "kernel SBC Sony dual bp53 at 44.1 kHz, engine 96 kHz (147/160 into 88.2 kHz, then 2:1)", dual, 44100, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 96000, &kSony96to44);
+    MakeSbc("sbc-k-sony-dual53-88to48", "kernel SBC Sony dual bp53 at 48 kHz, engine 88.2 kHz (160/147 into 96 kHz, then 2:1)", dual, 48000, 895, FALSE, kRadio3Dh5, PATH_KSBC, nullptr, 88200, &kSony88to48);
 
     std::vector<int> aacCfg, aptxCfg, ldacCfg;
     int kAacD96 = -1, kAptxHdD96 = -1, kAac48 = -1, kAptxHd48 = -1, kLdacHq48 = -1, kLdacHq48s16 = -1, kAptx48 = -1, kAptxLl48 = -1;
+    int kAac44to48 = -1, kAptxHd44to48 = -1, kAptxHd96to44 = -1, kLdac44to48 = -1, kLdac48to44 = -1;
     if (aac) {
         for (int vbr = 0; vbr < 2; vbr++) for (ULONG mtu : { 895u, 1017u }) for (ULONG rate : { 44100u, 48000u }) {
             std::vector<UCHAR> ie = { 0xC0, 0x01, 0x8C, (UCHAR)((vbr ? 0x80 : 0) | 0x04), 0xE2, 0x00 };
@@ -2325,6 +2647,8 @@ int wmain(int argc, wchar_t **argv)
                 kAac48 = idx;
                 c.key = "aac-cbr-895-96to48"; c.label = "AAC-LC CBR, MTU 895, engine 96 kHz -> 48 kHz decimator"; c.engineRate = 96000;
                 kAacD96 = AddConfig(c);
+                c.key = "aac-cbr-895-48k-from44"; c.label = "AAC-LC CBR, MTU 895, 48 kHz from a 44.1 kHz engine (S16 dithered)"; c.engineRate = 44100;
+                kAac44to48 = AddConfig(c);
             }
         }
     }
@@ -2348,30 +2672,42 @@ int wmain(int argc, wchar_t **argv)
                 kAptxHd48 = idx;
                 c.key = "aptxhd-96to48"; c.label = "aptX HD, engine 96 kHz -> 48 kHz decimator"; c.engineRate = 96000;
                 kAptxHdD96 = AddConfig(c);
+                c.key = "aptxhd-48k-from44"; c.label = "aptX HD 48 kHz from a 44.1 kHz engine (S24 rounded)"; c.engineRate = 44100;
+                kAptxHd44to48 = AddConfig(c);
+            }
+            if (f.codec == PNA2DP_CODEC_APTX_HD && rate == 44100) {
+                c.key = "aptxhd-44k-from96"; c.label = "aptX HD 44.1 kHz from a 96 kHz engine (147/160 into 88.2 kHz, then 2:1)"; c.engineRate = 96000;
+                kAptxHd96to44 = AddConfig(c);
             }
         }
     }
     if (ldac) {
         std::vector<UCHAR> ie = { 0x2D, 0x01, 0, 0, 0xAA, 0x00, 0x3C, 0x07 };
-        struct { const char *name; UCHAR eqmid; ULONG rate; ULONG fmtMask; ULONG mtu; } ld[] = {
-            { "ldac-hq-48k", PNA2DP_LDAC_EQMID_HQ, 48000, PNA2DP_FMT_S32, 895 },
-            { "ldac-sq-48k", PNA2DP_LDAC_EQMID_SQ, 48000, PNA2DP_FMT_S32, 895 },
-            { "ldac-mq-48k", PNA2DP_LDAC_EQMID_MQ, 48000, PNA2DP_FMT_S32, 895 },
-            { "ldac-hq-44k", PNA2DP_LDAC_EQMID_HQ, 44100, PNA2DP_FMT_S32, 895 },
-            { "ldac-hq-96k", PNA2DP_LDAC_EQMID_HQ, 96000, PNA2DP_FMT_S32, 895 },
-            { "ldac-hq-48k-mtu679", PNA2DP_LDAC_EQMID_HQ, 48000, PNA2DP_FMT_S32, 679 },
-            { "ldac-hq-48k-s16", PNA2DP_LDAC_EQMID_HQ, 48000, PNA2DP_FMT_S16, 895 },
+        struct { const char *name; UCHAR eqmid; ULONG rate; ULONG fmtMask; ULONG mtu; ULONG engine; } ld[] = {
+            { "ldac-hq-48k", PNA2DP_LDAC_EQMID_HQ, 48000, PNA2DP_FMT_S32, 895, 0 },
+            { "ldac-sq-48k", PNA2DP_LDAC_EQMID_SQ, 48000, PNA2DP_FMT_S32, 895, 0 },
+            { "ldac-mq-48k", PNA2DP_LDAC_EQMID_MQ, 48000, PNA2DP_FMT_S32, 895, 0 },
+            { "ldac-hq-44k", PNA2DP_LDAC_EQMID_HQ, 44100, PNA2DP_FMT_S32, 895, 0 },
+            { "ldac-hq-96k", PNA2DP_LDAC_EQMID_HQ, 96000, PNA2DP_FMT_S32, 895, 0 },
+            { "ldac-hq-48k-mtu679", PNA2DP_LDAC_EQMID_HQ, 48000, PNA2DP_FMT_S32, 679, 0 },
+            { "ldac-hq-48k-s16", PNA2DP_LDAC_EQMID_HQ, 48000, PNA2DP_FMT_S16, 895, 0 },
+            /* 0.1.0.22 #1: the EDIFIER MR5 case, LDAC HQ against the other Windows rate */
+            { "ldac-hq-48k-from44", PNA2DP_LDAC_EQMID_HQ, 48000, PNA2DP_FMT_S32, 679, 44100 },
+            { "ldac-hq-44k-from48", PNA2DP_LDAC_EQMID_HQ, 44100, PNA2DP_FMT_S32, 679, 48000 },
         };
         for (auto &l : ld) {
             PNA2DP_CONFIG p = g_Pref; p.Ldac.Eqmid = l.eqmid; p.Ldac.FormatMask = (UCHAR)l.fmtMask;
             ConfigDef c;
             c.key = l.name; c.label = Sfmt("LDAC EQMID %u, %.1f kHz, MTU %u, encoder input %s (libldac plugin; no decoder)", l.eqmid, l.rate / 1000.0, l.mtu, l.fmtMask == PNA2DP_FMT_S16 ? "S16" : "S32");
-            c.path = PATH_HOST; c.api = ldac; c.mtu = l.mtu; c.engineRate = l.rate; c.xq = FALSE; c.radio = kRadio3Dh5; c.decodable = false;
+            if (l.engine) c.label += Sfmt(", engine %.1f kHz", l.engine / 1000.0);
+            c.path = PATH_HOST; c.api = ldac; c.mtu = l.mtu; c.engineRate = l.engine ? l.engine : l.rate; c.xq = FALSE; c.radio = kRadio3Dh5; c.decodable = false;
             if (!SelectFromIe(A2DP_CODEC_VENDOR, ie, p, l.rate, 24, c.cfg)) { fprintf(stderr, "LDAC selection failed\n"); continue; }
             int idx = AddConfig(c);
             ldacCfg.push_back(idx);
             if (!strcmp(l.name, "ldac-hq-48k")) kLdacHq48 = idx;
             if (!strcmp(l.name, "ldac-hq-48k-s16")) kLdacHq48s16 = idx;
+            if (!strcmp(l.name, "ldac-hq-48k-from44")) kLdac44to48 = idx;
+            if (!strcmp(l.name, "ldac-hq-44k-from48")) kLdac48to44 = idx;
         }
     }
     (void)kLdacHq48s16;
@@ -2445,7 +2781,7 @@ int wmain(int argc, wchar_t **argv)
     std::vector<int> full = { kSony48, kSony44, kJoint48, kJoint44, kXq3, kXq2, kXqUnknown, kMono, kBp250, kHost };
     for (int i : aacCfg) full.push_back(i);
     for (int i : aptxCfg) full.push_back(i);
-    for (int i : ldacCfg) full.push_back(i);
+    for (int i : ldacCfg) if (g_Cfg[i].engineRate == g_Cfg[i].cfg.SampleRate) full.push_back(i);
     for (int c : full) for (auto &s : core) {
         int fmt = FMT_S16;
         if (g_Cfg[c].cfg.Codec == PNA2DP_CODEC_LDAC || (g_Cfg[c].cfg.Codec >= PNA2DP_CODEC_APTX && g_Cfg[c].cfg.Codec <= PNA2DP_CODEC_APTX_LL)) fmt = FMT_S24IN32;
@@ -2463,19 +2799,46 @@ int wmain(int argc, wchar_t **argv)
     for (int c : kLow) for (const char *n : { "pink_-20dBFSrms", "sine997_-6dBFS", "sine997_0dBFS", "bass60_0dBFS", "silence", "L997_R1499" }) add("codec", c, FindSig(n), FMT_S16, 0);
     for (int c : { kSonyFloor, kJointFloor, kAacFloor })
         for (const char *n : { "pink_-20dBFSrms", "sine997_-6dBFS", "sine997_-20dBFS", "sine997_0dBFS", "bass60_0dBFS", "silence", "L997_R1499", "sweep20-20k_-6dBFS" }) add("codec", c, FindSig(n), FMT_S16, 0);
-    /* decimator on: same codec, engine at twice the rate */
-    for (int c : { kSonyD96, kSonyD88, kAacD96, kAptxHdD96 }) {
+    /* the sample-rate converter (group "rate"): the same codecs with the engine at another rate
+     * (the 2:1 decimator of 0.1.0.21, 0.1.0.22's polyphase stage alone and before the 2:1 stage) */
+    const std::vector<int> rateCfg = { kSonyD96, kSonyD88, kAacD96, kAptxHdD96, kSony44to48, kSony48to44, kSony96to44, kSony88to48,
+                                       kAac44to48, kAptxHd44to48, kAptxHd96to44, kLdac44to48, kLdac48to44 };
+    for (int c : rateCfg) {
         if (c < 0) continue;
-        int fmt = g_Cfg[c].cfg.Codec == PNA2DP_CODEC_APTX_HD ? FMT_S24IN32 : FMT_S16;
+        ULONG codec = g_Cfg[c].cfg.Codec;
+        int fmt = codec == PNA2DP_CODEC_APTX_HD || codec == PNA2DP_CODEC_LDAC ? FMT_S24IN32 : FMT_S16;
         for (const char *n : { "pink_-20dBFSrms", "sine997_-1dBFS", "sine997_-6dBFS", "sine997_-60dBFS", "sweep20-20k_-6dBFS", "imd19k+20k", "bass60_0dBFS", "silence", "L997_R1499", "tone20k" }) {
             SigDef s = FindSig(n);
-            if (s.kind == K_PINK) { Job j; j.group = "codec"; j.cfg = c; j.sig = s; j.fmt = fmt; j.calibration = true; j.id = Sfmt("%s__%s__%s__%+.0fdB", g_Cfg[c].key.c_str(), s.name.c_str(), kFmts[fmt].name, 0.0); if (filter.empty() || j.id.find(filter) != std::string::npos) jobs.push_back(j); continue; }
-            add("decimator", c, s, fmt, 0);
+            if (s.kind == K_PINK) { Job j; j.group = "codec"; j.cfg = c; j.sig = s; j.fmt = fmt; j.calibration = true; j.repeat = g_Cfg[c].path == PATH_HOST ? 1 : 0; j.id = Sfmt("%s__%s__%s__%+.0fdB", g_Cfg[c].key.c_str(), s.name.c_str(), kFmts[fmt].name, 0.0); if (filter.empty() || j.id.find(filter) != std::string::npos) jobs.push_back(j); continue; }
+            add("rate", c, s, fmt, 0, {}, false, s.name == "sine997_-1dBFS" ? 1 : 0);
         }
-        SigDef al = FindSig("alias");
-        if (g_Cfg[c].engineRate == 88200) al.f0 = 27500;
-        add("decimator", c, al, fmt, 0);
-        for (int f : { FMT_S24IN32, FMT_F32 }) add("decimator", c, FindSig("sine997_-1dBFS"), f, 0);
+        PN_PCM_RATE_PLAN plan;
+        PnPcmRatePlan(g_Cfg[c].engineRate, g_Cfg[c].cfg.SampleRate, &plan);
+        if (plan.Decimate == 2) {   /* a tone above the 2:1 stage's output band */
+            SigDef al = FindSig("alias");
+            if (g_Cfg[c].engineRate == 88200) al.f0 = 27500;
+            add("rate", c, al, fmt, 0);
+        }
+        if (plan.Rs) add("rate", c, FindSig("image"), fmt, 0);
+        /* the alias-free band plan, through every converted pair: the tones whose alias or image lands
+         * at 22.5, 23, 23.5 and 23.9 kHz where the output has those frequencies (a 48 kHz output: the
+         * tones pass, 25.5 .. 24.1 kHz alias onto them, 21.6 .. 20.2 kHz of a 44.1 kHz source image onto
+         * them), else the tones 22.5 .. 23.9 kHz themselves (a 44.1 kHz output: aliases at 21.6 .. 20.2
+         * kHz); and a stepped sweep every 250 Hz from 20 kHz to 24 kHz (26 kHz for a 48 kHz output from
+         * 88.2 / 96 kHz), below the source's Nyquist frequency. Float input: the source adds no noise. */
+        {
+            const double fin = g_Cfg[c].engineRate, fout = g_Cfg[c].cfg.SampleRate;
+            std::vector<double> tones;
+            for (double t : { 22500.0, 23000.0, 23500.0, 23900.0 }) {
+                if (fout == 44100) tones.push_back(t);
+                else if (fin == 44100) tones.push_back(44100 - t);
+                else { tones.push_back(t); tones.push_back(fout - t); }
+            }
+            for (double t : tones) add("rate", c, TransitionTone(t), FMT_F32, 0);
+            double top = PN_MIN(fout == 48000 && fin > 48000 ? 26000.0 : 24000.0, fin / 2 - 100);
+            add("rate", c, TransitionSweep(20000, 20000 + kStepHz * floor((top - 20000) / kStepHz)), FMT_F32, 0);
+        }
+        for (int f : { FMT_S24IN32, FMT_F32 }) if (f != fmt) add("rate", c, FindSig("sine997_-1dBFS"), f, 0);
     }
     /* input formats x volumes through the production conversion */
     for (int c : { kSony48, kAac48, kAptxHd48, kLdacHq48 }) {
@@ -2499,7 +2862,7 @@ int wmain(int argc, wchar_t **argv)
     std::vector<Event> dropEv = { { 1.0, EV_HOSTDROP, 0 } };
     std::vector<Event> restartEv = { { 0.8, EV_RESTART, 200 } };
     std::vector<Event> pauseEv = { { 0.9, EV_PAUSE, 0 } };
-    for (int c : { kSony48, kHost, kAac48, kAptxHd48, kLdacHq48 }) {
+    for (int c : { kSony48, kHost, kAac48, kAptxHd48, kLdacHq48, kSony44to48, kSony96to44, kAac44to48, kAptxHd44to48, kLdac44to48 }) {
         if (c < 0) continue;
         int fmt = g_Cfg[c].cfg.Codec == PNA2DP_CODEC_SBC || g_Cfg[c].cfg.Codec == PNA2DP_CODEC_AAC ? FMT_S16 : FMT_S24IN32;
         add("fault-volume-ramps", c, ft, fmt, 0, volEv);
@@ -2510,16 +2873,53 @@ int wmain(int argc, wchar_t **argv)
         add("fault-pause", c, ft, fmt, 0, pauseEv);
         if (g_Cfg[c].path == PATH_HOST) add("fault-host-drop", c, ft, fmt, 0, dropEv);
     }
+    /* latency profiles (#5, config_policy.h): Music (150 / 450 ms) rides out the 330 ms stall
+     * that trims at Balanced; a 520 ms stall exceeds its maximum: exactly one trim, crossfaded
+     * (CLICK(pre-codec) scores it). Low latency (30 / 120 ms) trims by design. */
+    {
+        std::vector<Event> longStallEv = { { 0.8, EV_STALL, 520 } };
+        struct ProfileJob { const char *name; ULONG target, max; const std::vector<Event> *ev; int stallMs, minTrims, maxTrims; };
+        const ProfileJob profiles[] = {
+            { "music", 150, 450, &trimEv, 330, 0, 0 },
+            { "music", 150, 450, &longStallEv, 520, 1, 1 },
+            { "low", 30, 120, &trimEv, 330, 1, -1 },
+        };
+        for (int c : { kSony48, kLdacHq48 }) {
+            if (c < 0) continue;
+            int fmt = g_Cfg[c].cfg.Codec == PNA2DP_CODEC_SBC ? FMT_S16 : FMT_S24IN32;
+            for (const auto &p : profiles) {
+                Job j; j.group = std::string("profile-") + p.name; j.cfg = c; j.sig = ft; j.fmt = fmt; j.events = *p.ev;
+                j.latTarget = p.target; j.latMax = p.max; j.minTrims = p.minTrims; j.maxTrims = p.maxTrims;
+                j.id = Sfmt("%s__%s__%s__+0dB__profile-%s-stall%d", g_Cfg[c].key.c_str(), ft.name.c_str(), kFmts[fmt].name, p.name, p.stallMs);
+                if (filter.empty() || j.id.find(filter) != std::string::npos || j.group.find(filter) != std::string::npos) jobs.push_back(j);
+            }
+        }
+        /* Balanced (the default) is unchanged: the fault-trim jobs above trim once at 250 ms */
+        for (Job &j : jobs) if (j.group == "fault-trim") j.minTrims = j.maxTrims = 1;
+    }
     /* findings #1/#7: a pause whose hand-over completes an encoder block, the pump thread taking
      * it before PumpFinishStream (Emu::Pause race), at 16 pause instants 2 ms apart: every
      * residual phase of the 384-frame SBC and 256-frame LDAC blocks, half of AAC's */
-    for (int c : { kSony48, kHost, kAac48, kAptx48, kAptxHd48, kAptxLl48, kLdacHq48 }) {
+    for (int c : { kSony48, kHost, kAac48, kAptx48, kAptxHd48, kAptxLl48, kLdacHq48, kSony44to48, kAptxHd44to48 }) {
         if (c < 0) continue;
         int fmt = g_Cfg[c].cfg.Codec == PNA2DP_CODEC_SBC || g_Cfg[c].cfg.Codec == PNA2DP_CODEC_AAC ? FMT_S16 : FMT_S24IN32;
         for (int k = 0; k < 16; k++) {
             Job j; j.group = "fault-pause-race"; j.cfg = c; j.sig = ft; j.fmt = fmt; j.volDb = 0;
             j.events = { { 0.9 + 0.002 * k, EV_PAUSE, 1 } };
             j.id = Sfmt("%s__%s__%s__+0dB__fault-pause-race-%02d", g_Cfg[c].key.c_str(), ft.name.c_str(), kFmts[fmt].name, k);
+            if (filter.empty() || j.id.find(filter) != std::string::npos) jobs.push_back(j);
+        }
+    }
+    /* review of 0.1.0.22 #1: a pause with one SBC frame per packet behind the converter's longest
+     * delays (88.2 -> 44.1 kHz: 173 engine frames, 88.2 -> 48 kHz: 346), at 16 pause instants 0.6 ms
+     * apart (residual phases across the 256 / 236-frame blocks): the end of the fade must have left
+     * the converter and the SBC encoder (pause_unsent_ms counts both) before the stream goes idle */
+    for (int c : { kBp250D88, kBp250D88to48 }) {
+        if (c < 0) continue;
+        for (int k = 0; k < 16; k++) {
+            Job j; j.group = "fault-pause"; j.cfg = c; j.sig = ft; j.fmt = FMT_S16; j.volDb = 0;
+            j.events = { { 0.9 + 0.0006 * k, EV_PAUSE, 0 } };
+            j.id = Sfmt("%s__%s__%s__+0dB__fault-pause-%02d", g_Cfg[c].key.c_str(), ft.name.c_str(), kFmts[FMT_S16].name, k);
             if (filter.empty() || j.id.find(filter) != std::string::npos) jobs.push_back(j);
         }
     }
@@ -2625,6 +3025,56 @@ int wmain(int argc, wchar_t **argv)
         }
     }
 
+    /* ---- native bit-exactness (0.1.0.22 #1, requirement f): a job whose engine rate is its codec
+     * rate converts and packs exactly as the recorded baseline. Keys: job id + "#" + occurrence. ---- */
+    std::vector<std::string> hashKeys(results.size());
+    {
+        std::map<std::string, int> seen;
+        for (size_t i = 0; i < results.size(); i++) hashKeys[i] = results[i].job.id + "#" + std::to_string(seen[results[i].job.id]++);
+    }
+    if (!hashesOut.empty()) {
+        FILE *hf = NULL;
+        if (fopen_s(&hf, hashesOut.c_str(), "wb") || !hf) { fprintf(stderr, "cannot write %s\n", hashesOut.c_str()); return 2; }
+        fprintf(hf, "{\n\"comment\": \"quality_test --hashes-out: per job, FNV-1a 64 of every conversion output block and of every packet\",\n\"jobs\": {\n");
+        for (size_t i = 0; i < results.size(); i++)
+            fprintf(hf, "%s: [\"%016llx\", \"%016llx\"]%s\n", Json(hashKeys[i]).c_str(), (unsigned long long)results[i].S.convHash,
+                    (unsigned long long)results[i].S.pktHash, i + 1 < results.size() ? "," : "");
+        fprintf(hf, "}\n}\n");
+        fclose(hf);
+        printf("hashes of %zu jobs written to %s\n", results.size(), hashesOut.c_str());
+    }
+    std::string nativeReport;
+    if (!hashesCheck.empty()) {
+        std::vector<uint8_t> raw;
+        if (!ReadFileBytes(hashesCheck, raw)) { fprintf(stderr, "cannot read %s\n", hashesCheck.c_str()); return 2; }
+        std::string text(raw.begin(), raw.end());
+        std::map<std::string, std::pair<uint64_t, uint64_t>> base;
+        for (size_t pos = 0; (pos = text.find("\n\"", pos)) != std::string::npos;) {
+            size_t a = pos + 2, b = text.find('"', a);
+            if (b == std::string::npos) break;
+            unsigned long long hc = 0, hp = 0;
+            if (sscanf_s(text.c_str() + b, "\": [\"%llx\", \"%llx\"]", &hc, &hp) == 2) base[text.substr(a, b - a)] = { hc, hp };
+            pos = b;
+        }
+        size_t checked = 0, differ = 0, missing = 0;
+        for (size_t i = 0; i < results.size(); i++) {
+            const ConfigDef &C = g_Cfg[results[i].job.cfg];
+            if (C.engineRate != C.cfg.SampleRate || !results[i].S.error.empty()) continue;
+            auto it = base.find(hashKeys[i]);
+            if (it == base.end()) { missing++; continue; }
+            checked++;
+            bool conv = it->second.first == results[i].S.convHash, pkt = it->second.second == results[i].S.pktHash;
+            results[i].M.Set("native_bit_exact", conv && pkt ? 1 : 0);
+            if (conv && pkt) continue;
+            differ++;
+            results[i].M.flags.push_back(Sfmt("NATIVE BIT-EXACT: the %s differ from the baseline %s", !conv && !pkt ? "conversion output and the packets" :
+                                              !conv ? "conversion output" : "packets", hashesCheck.c_str()));
+        }
+        nativeReport = Sfmt("native bit-exactness: %zu native-rate job(s) checked against %s, %zu differ, %zu not in the baseline",
+                            checked, hashesCheck.c_str(), differ, missing);
+        if (!checked) globalFlags.push_back("NATIVE BIT-EXACT: no native-rate job matched the baseline " + hashesCheck);
+    }
+
     /* ---- report ---- */
     std::string jsonPath = g_Work + "\\results.json";
     FILE *jf = NULL;
@@ -2651,8 +3101,9 @@ int wmain(int argc, wchar_t **argv)
         for (size_t i = 0; i < all.size(); i++) {
             JobOut &r = *all[i];
             if (!r.M.flags.empty()) flagged++;
-            fprintf(jf, "  {\"id\": %s, \"group\": %s, \"config\": %s, \"signal\": %s, \"format\": %s, \"volume_db\": %g, \"metrics\": {",
-                    Json(r.job.id).c_str(), Json(r.job.group).c_str(), Json(r.config).c_str(), Json(r.job.sig.name).c_str(), Json(kFmts[r.job.fmt].name).c_str(), r.job.volDb);
+            fprintf(jf, "  {\"id\": %s, \"group\": %s, \"config\": %s, \"signal\": %s, \"format\": %s, \"volume_db\": %g, \"conv_hash\": \"%016llx\", \"pkt_hash\": \"%016llx\", \"metrics\": {",
+                    Json(r.job.id).c_str(), Json(r.job.group).c_str(), Json(r.config).c_str(), Json(r.job.sig.name).c_str(), Json(kFmts[r.job.fmt].name).c_str(), r.job.volDb,
+                    (unsigned long long)r.S.convHash, (unsigned long long)r.S.pktHash);
             for (size_t k = 0; k < r.M.m.size(); k++) fprintf(jf, "%s%s: %s", k ? ", " : "", Json(r.M.m[k].first).c_str(), JsonNum(r.M.m[k].second).c_str());
             fprintf(jf, "}, \"flags\": [");
             for (size_t k = 0; k < r.M.flags.size(); k++) fprintf(jf, "%s%s", k ? ", " : "", Json(r.M.flags[k]).c_str());
@@ -2670,6 +3121,7 @@ int wmain(int argc, wchar_t **argv)
     printf("ran %zu jobs + %zu baselines in %.1f s; %zu job(s) with defect flags; results: %s\n", jobs.size(), baselines.size(), (t1 - t0) / 1000.0, flagged, jsonPath.c_str());
     printf("SBC XQ vs plain dual channel on the Sony caps (ff ff 02 35), MTU 895:\n%s", xqReport.c_str());
     printf("ABR ladders after stream start (floor %u bps):\n%s", g_Pref.AbrFloorBps, ladderReport.c_str());
+    if (!nativeReport.empty()) printf("%s\n", nativeReport.c_str());
     for (auto &r : results) for (auto &f : r.M.known) printf("KNOWN %s: %s\n", r.job.id.c_str(), f.c_str());
     for (auto &r : results) for (auto &f : r.M.flags) printf("FLAG %s: %s\n", r.job.id.c_str(), f.c_str());
     for (auto &f : globalFlags) printf("FLAG global: %s\n", f.c_str());

@@ -36,6 +36,7 @@
 #include "pnaudio.h"
 #include "pnretry.h"
 #include "pnhealth.h"
+#include "config_policy.h"
 #include <memory>
 #include "bootdlg.h"
 #include <uxtheme.h>
@@ -102,6 +103,7 @@ struct Session {
                             PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_HD) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_LL);
         status.Size = sizeof(status); status.RemoteAddress = 0xE8EC4A123456ull; wcscpy_s(status.RemoteName, L"WH-1000XM5 (demo)");
         status.State = PNA2DP_STATE_STREAMING; status.Codec = PNA2DP_CODEC_LDAC; status.SampleRate = 48000; status.Channels = 2; status.BitsPerSample = 24;
+        status.EngineSampleRate = 48000;
         status.BitrateBps = 660000; status.MaxBitrateBps = 990000; status.MediaMtu = 1005; status.SinkReportedDelayUs = 150000; status.EstimatedLatencyUs = 212000;
         status.Flags = PNA2DP_STATUS_FLAG_AUDIO_ACTIVE | PNA2DP_STATUS_FLAG_DELAY_REPORTING | PNA2DP_STATUS_FLAG_RADIO_IN_RANGE; status.AvdtpVersion = 0x0103; status.RemoteSeid = 4; status.EncoderOwner = 2;
         caps.Size = sizeof(caps); caps.SdpProfileVersion = 0x0103; caps.SdpSupportedFeatures = 0x000F; caps.SepCount = 4;
@@ -170,6 +172,18 @@ static std::wstring GetText(HWND dlg, int id)
 }
 static ULONG GetUInt(HWND dlg, int id) { return (ULONG)_wtol(GetText(dlg, id).c_str()); }
 static void SetUInt(HWND dlg, int id, ULONG v) { SetDlgItemInt(dlg, id, v, FALSE); }
+
+/* Transport page profile selector: item order and text (config_policy.h profiles) */
+static const ULONG kProfileOrder[] = { PN_LATENCY_PROFILE_MUSIC, PN_LATENCY_PROFILE_BALANCED, PN_LATENCY_PROFILE_LOW, PN_LATENCY_PROFILE_CUSTOM };
+static const wchar_t *ProfileItemText(ULONG profile)
+{
+    switch (profile) {
+    case PN_LATENCY_PROFILE_MUSIC: return L"Music - more buffering, fewer quality drops";
+    case PN_LATENCY_PROFILE_BALANCED: return L"Balanced - default";
+    case PN_LATENCY_PROFILE_LOW: return L"Low latency - video and games";
+    default: return L"Custom";
+    }
+}
 static bool Checked(HWND dlg, int id) { return IsDlgButtonChecked(dlg, id) == BST_CHECKED; }
 static void Check(HWND dlg, int id, bool v) { CheckDlgButton(dlg, id, v ? BST_CHECKED : BST_UNCHECKED); }
 static void EnableItem(HWND dlg, int id, bool v)
@@ -507,6 +521,8 @@ private:
     void LoadAptx();    void SaveAptx(PNA2DP_CONFIG &c);
     void LoadLdac();    void SaveLdac(PNA2DP_CONFIG &c);    void UpdateLdacBitrate();
     void LoadTransport(); void SaveTransport(PNA2DP_CONFIG &c);
+    void SyncLatencyProfile();          /* selects the profile the two edit boxes match (else Custom) */
+    void ApplyLatencyProfileChoice();   /* the chosen profile's values into the edit boxes and sliders */
     void LoadSink();
     void LoadDriver();
     void LoadReadiness();
@@ -1059,7 +1075,9 @@ void Panel::OnInit()
     sl = GetDlgItem(m_page[PG_TRANSPORT], IDC_TR_TARGET_SLIDER);
     SendMessageW(sl, TBM_SETRANGE, TRUE, MAKELPARAM(20, 400)); SendMessageW(sl, TBM_SETTICFREQ, 20, 0);
     sl = GetDlgItem(m_page[PG_TRANSPORT], IDC_TR_MAX_SLIDER);
-    SendMessageW(sl, TBM_SETRANGE, TRUE, MAKELPARAM(40, 1000)); SendMessageW(sl, TBM_SETTICFREQ, 50, 0);
+    SendMessageW(sl, TBM_SETRANGE, TRUE, MAKELPARAM(40, PN_CONFIG_MAX_LATENCY_MS)); SendMessageW(sl, TBM_SETTICFREQ, 50, 0);
+    cb = GetDlgItem(m_page[PG_TRANSPORT], IDC_TR_PROFILE);
+    for (ULONG profile : kProfileOrder) ComboBox_AddString(cb, ProfileItemText(profile));
     SendMessageW(GetDlgItem(m_page[PG_TRANSPORT], IDC_TR_VOLUME_SPIN), UDM_SETRANGE32, (WPARAM)(INT_PTR)-96, 0);
 
     lv = GetDlgItem(m_page[PG_SINK], IDC_SINK_LIST);
@@ -1073,8 +1091,9 @@ void Panel::OnInit()
 
     /* explanatory notes (too long for the resource compiler's 256 character limit) */
     SetText(m_page[PG_SBC], IDC_SBC_NOTE,
-        L"Leave a group empty to accept whatever the headset supports. The driver intersects your selection with the headset's capabilities and the sample rate of the Windows audio engine "
-        L"(44.1 kHz for most players, 48 kHz for games and calls). Bitpool changes are applied in band while streaming; everything else triggers a renegotiation.");
+        L"Leave a group empty to accept whatever the headset supports. The driver intersects your selection with the headset's capabilities and prefers the sample rate of the "
+        L"Windows audio engine (44.1 kHz for most players, 48 kHz for games and calls); a rate the headset lacks is converted in the driver. "
+        L"Bitpool changes are applied in band while streaming; everything else triggers a renegotiation.");
     SetText(m_page[PG_AAC], IDC_AAC_NOTE,
         L"AAC-LC is negotiated using the headset's MPEG-2 or MPEG-4 capability. The selected bitrate is limited by the headset's advertised maximum. "
         L"AAC needs the codec host service with the AAC plugin (Fraunhofer FDK).");
@@ -1645,7 +1664,7 @@ bool Panel::CollectConfig(PNA2DP_CONFIG &c)
     if (c.TargetLatencyMs < 20) c.TargetLatencyMs = 20;
     if (c.TargetLatencyMs > 400) c.TargetLatencyMs = 400;
     if (c.MaxLatencyMs < c.TargetLatencyMs + 20) c.MaxLatencyMs = c.TargetLatencyMs + 20;
-    if (c.MaxLatencyMs > 1000) c.MaxLatencyMs = 1000;
+    if (c.MaxLatencyMs > PN_CONFIG_MAX_LATENCY_MS) c.MaxLatencyMs = PN_CONFIG_MAX_LATENCY_MS;
     if (c.Sbc.MaxBitpool > 250) c.Sbc.MaxBitpool = 250;
     if (c.Sbc.MaxBitpool && c.Sbc.MinBitpool > c.Sbc.MaxBitpool) c.Sbc.MinBitpool = c.Sbc.MaxBitpool;
     c.EnabledCodecMask |= PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);
@@ -1912,7 +1931,7 @@ void Panel::LoadStatus()
     HWND d = m_page[PG_STATUS];
     bool guard = m_loading; m_loading = true;
     if (!m_s.open) {
-        const int ids[] = { IDC_ST_DEVICE, IDC_ST_ADDRESS, IDC_ST_STATE, IDC_ST_CODEC, IDC_ST_FORMAT, IDC_ST_ENCODER, IDC_ST_BITRATE, IDC_ST_LATENCY, IDC_ST_SINKDELAY, IDC_ST_MTU,
+        const int ids[] = { IDC_ST_DEVICE, IDC_ST_ADDRESS, IDC_ST_STATE, IDC_ST_CODEC, IDC_ST_FORMAT, IDC_ST_ENGINE, IDC_ST_ENCODER, IDC_ST_BITRATE, IDC_ST_LATENCY, IDC_ST_SINKDELAY, IDC_ST_MTU,
                             IDC_ST_AVDTP, IDC_ST_SEID, IDC_ST_FLAGS, IDC_ST_LASTERR, IDC_ST_PCM, IDC_ST_PACKETS, IDC_ST_BYTES, IDC_ST_FRAMES, IDC_ST_DROPPED, IDC_ST_WRITEFAIL,
                             IDC_ST_TRIMS, IDC_ST_QUEUE, IDC_ST_TXTIME, IDC_ST_ABR, IDC_ST_HOSTRTT, IDC_ST_HOSTTO, IDC_ST_DRIVERVER, IDC_ST_ENCODERS };
         for (int id : ids) SetText(d, id, L"-");
@@ -1931,12 +1950,14 @@ void Panel::LoadStatus()
         SetText(d, IDC_ST_ADDRESS, pn::BtAddressText(s.RemoteAddress));
         SetText(d, IDC_ST_STATE, pn::StateName(s.State));
         SetTextF(d, IDC_ST_CODEC, L"%s%s", pn::CodecName(s.Codec), (s.Flags & PNA2DP_STATUS_FLAG_ABR_ACTIVE) ? L" (ABR reduced)" : L"");
-        if (s.SampleRate) SetTextF(d, IDC_ST_FORMAT, L"%u Hz, %u ch, %u-bit in", s.SampleRate, s.Channels, s.BitsPerSample); else SetText(d, IDC_ST_FORMAT, L"-");
+        // The Windows rate has its own row: with it, the format line did not fit the value column.
+        if (s.SampleRate) SetText(d, IDC_ST_FORMAT, pn::StreamFormatText(s, false)); else SetText(d, IDC_ST_FORMAT, L"-");
+        SetText(d, IDC_ST_ENGINE, pn::EngineRateText(s));
         SetText(d, IDC_ST_ENCODER, s.EncoderOwner == 1 ? L"kernel (SBC)" : s.EncoderOwner == 2 ? L"codec host plugin" : L"-");
         if (s.BitrateBps) SetTextF(d, IDC_ST_BITRATE, L"%u kbps (ceiling %u kbps)", s.BitrateBps / 1000, s.MaxBitrateBps / 1000); else SetText(d, IDC_ST_BITRATE, L"-");
         SetTextF(d, IDC_ST_LATENCY, L"%u ms estimated end to end", s.EstimatedLatencyUs / 1000);
-        if (s.Flags & PNA2DP_STATUS_FLAG_DELAY_REPORTING) SetTextF(d, IDC_ST_SINKDELAY, L"%u.%u ms reported by the headset", s.SinkReportedDelayUs / 1000, (s.SinkReportedDelayUs / 100) % 10);
-        else SetText(d, IDC_ST_SINKDELAY, L"no delay reporting");
+        if (s.SinkReportedDelayUs) SetTextF(d, IDC_ST_SINKDELAY, L"%u.%u ms reported by the headset", s.SinkReportedDelayUs / 1000, (s.SinkReportedDelayUs / 100) % 10);
+        else SetText(d, IDC_ST_SINKDELAY, L"not reported; a per-codec default is assumed");
         SetTextF(d, IDC_ST_MTU, L"%u bytes", s.MediaMtu);
         SetTextF(d, IDC_ST_AVDTP, L"%x.%x", s.AvdtpVersion >> 8, s.AvdtpVersion & 0xFF);
         SetTextF(d, IDC_ST_SEID, L"%u", s.RemoteSeid);
@@ -1954,7 +1975,8 @@ void Panel::LoadStatus()
         SetTextF(d, IDC_ST_ABR, L"level %u, %u down, %u up", t.AbrLevel, t.AbrDowngrades, t.AbrUpgrades);
         SetTextF(d, IDC_ST_HOSTRTT, L"%u us", t.HostRoundTripAvgUs);
         SetText(d, IDC_ST_HOSTTO, Thousands(t.HostTimeouts));
-        SetTextF(d, IDC_ST_DRIVERVER, L"PN-A2DP %u.%u.%u (ABI %u)", m_s.ver.DriverVersion >> 24, (m_s.ver.DriverVersion >> 16) & 0xFF, m_s.ver.DriverVersion & 0xFFFF, m_s.ver.AbiVersion);
+        // Packed as major.minor.build; shown in the four-part form of the INF and the releases (0.1.0.23).
+        SetTextF(d, IDC_ST_DRIVERVER, L"PN-A2DP %u.%u.0.%u (ABI %u)", m_s.ver.DriverVersion >> 24, (m_s.ver.DriverVersion >> 16) & 0xFF, m_s.ver.DriverVersion & 0xFFFF, m_s.ver.AbiVersion);
         std::wstring enc = L"kernel:";
         for (ULONG c = 1; c < PNA2DP_CODEC_MAX; c++) if (m_s.ver.KernelCodecMask & PNA2DP_CODEC_BIT(c)) { enc += L" "; enc += pn::CodecName(c); }
         enc += L"   codec host:";
@@ -2290,6 +2312,7 @@ void Panel::LoadTransport()
     SetUInt(d, IDC_TR_TARGET_EDIT, c.TargetLatencyMs);
     SendMessageW(GetDlgItem(d, IDC_TR_MAX_SLIDER), TBM_SETPOS, TRUE, c.MaxLatencyMs);
     SetUInt(d, IDC_TR_MAX_EDIT, c.MaxLatencyMs);
+    SyncLatencyProfile();
     Check(d, IDC_TR_ABR, (c.Flags & PNA2DP_CFG_ABR_ENABLE) != 0);
     SetUInt(d, IDC_TR_ABRFLOOR, c.AbrFloorBps / 1000);
     SetUInt(d, IDC_TR_RECONNECT, c.ReconnectDelayMs);
@@ -2323,6 +2346,32 @@ void Panel::SaveTransport(PNA2DP_CONFIG &c)
     /* only an edited value is written back; otherwise the (fractional) value stays as loaded */
     if (ok && db != m_volumeLoaded / 65536) { if (db > 0) db = 0; if (db < -96) db = -96; c.VolumeDb16 = db * 65536; m_volumeEdited = true; }
     else c.VolumeDb16 = m_volumeLoaded;
+}
+
+void Panel::SyncLatencyProfile()
+{
+    HWND d = m_page[PG_TRANSPORT];
+    ULONG target = GetUInt(d, IDC_TR_TARGET_EDIT), maxMs = GetUInt(d, IDC_TR_MAX_EDIT);
+    ULONG profile = PnLatencyProfileOf(target, maxMs);
+    for (int i = 0; i < (int)_countof(kProfileOrder); i++) if (kProfileOrder[i] == profile) ComboBox_SetCurSel(GetDlgItem(d, IDC_TR_PROFILE), i);
+    if (profile == PN_LATENCY_PROFILE_CUSTOM) SetText(d, IDC_TR_PROFILE_DESC, L"Your own values.");
+    else SetTextF(d, IDC_TR_PROFILE_DESC, L"Target %u ms, max %u ms", target, maxMs);
+}
+
+void Panel::ApplyLatencyProfileChoice()
+{
+    HWND d = m_page[PG_TRANSPORT];
+    int sel = ComboBox_GetCurSel(GetDlgItem(d, IDC_TR_PROFILE));
+    ULONG target, maxMs;
+    if (sel >= 0 && sel < (int)_countof(kProfileOrder) && PnLatencyProfileValues(kProfileOrder[sel], &target, &maxMs)) {
+        bool guard = m_loading; m_loading = true;
+        SendMessageW(GetDlgItem(d, IDC_TR_TARGET_SLIDER), TBM_SETPOS, TRUE, target);
+        SetUInt(d, IDC_TR_TARGET_EDIT, target);
+        SendMessageW(GetDlgItem(d, IDC_TR_MAX_SLIDER), TBM_SETPOS, TRUE, maxMs);
+        SetUInt(d, IDC_TR_MAX_EDIT, maxMs);
+        m_loading = guard;
+    }
+    SyncLatencyProfile();   /* Custom keeps the values and says so */
 }
 
 void Panel::LoadSink()
@@ -2667,6 +2716,8 @@ INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
     if (page == m_page[PG_TRANSPORT]) {
         if (id == IDC_TR_TARGET_EDIT && code == EN_CHANGE) SendMessageW(GetDlgItem(page, IDC_TR_TARGET_SLIDER), TBM_SETPOS, TRUE, GetUInt(page, IDC_TR_TARGET_EDIT));
         if (id == IDC_TR_MAX_EDIT && code == EN_CHANGE) SendMessageW(GetDlgItem(page, IDC_TR_MAX_SLIDER), TBM_SETPOS, TRUE, GetUInt(page, IDC_TR_MAX_EDIT));
+        if (id == IDC_TR_PROFILE && code == CBN_SELCHANGE) ApplyLatencyProfileChoice();
+        else if ((id == IDC_TR_TARGET_EDIT || id == IDC_TR_MAX_EDIT) && code == EN_CHANGE) SyncLatencyProfile();
     }
     SetDirty(true);
     return TRUE;
@@ -2717,8 +2768,8 @@ INT_PTR Panel::OnPageScroll(HWND page, HWND ctl)
         return TRUE;
     }
     if (page == m_page[PG_SBC] && id == IDC_SBC_MAX_SLIDER) { SetUInt(page, IDC_SBC_MAX_EDIT, pos); UpdateSbcBitrate(); }
-    else if (page == m_page[PG_TRANSPORT] && id == IDC_TR_TARGET_SLIDER) SetUInt(page, IDC_TR_TARGET_EDIT, pos);
-    else if (page == m_page[PG_TRANSPORT] && id == IDC_TR_MAX_SLIDER) SetUInt(page, IDC_TR_MAX_EDIT, pos);
+    else if (page == m_page[PG_TRANSPORT] && id == IDC_TR_TARGET_SLIDER) { SetUInt(page, IDC_TR_TARGET_EDIT, pos); SyncLatencyProfile(); }
+    else if (page == m_page[PG_TRANSPORT] && id == IDC_TR_MAX_SLIDER) { SetUInt(page, IDC_TR_MAX_EDIT, pos); SyncLatencyProfile(); }
     else { m_loading = guard; return FALSE; }
     m_loading = guard;
     SetDirty(true);

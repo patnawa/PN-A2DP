@@ -423,6 +423,26 @@ static void TestTrimCrossfade()
     for (ULONG f = 1; f < 1024; ++f) worst = PN_MAX(worst, std::abs(after[f * 2] - after[(f - 1) * 2]));
     int natural = (int)std::ceil(16000.0 * 2 * pi * 1000.0 / 48000.0);   /* ~2095 */
     CHECK(worst <= natural + 32000 / (int)(fade + 1) + 2);
+    CHECK(!PnPcmFadePending(&s2));
+
+    /* a stall trims again before anything was converted (Low latency: every ~90 ms): the
+     * pending crossfade keeps its source, which continues what was played last (PumpTrim) */
+    PN_PCM_STATE s3 = {};
+    s3.FadeOut = (const UCHAR*)&ring[played * 2]; s3.FadeFrames = fadeFrames;   /* first trim */
+    CHECK(PnPcmFadePending(&s3));
+    ULONG oldSource = played + 2999;         /* head of the second drop: opposite phase to the last sample played */
+    ULONG cut2 = played + 6000 + 12;         /* kept audio after the second trim */
+    std::vector<SHORT> after2(1024 * 2);
+    PnConvertPcmEx(&s3, (UCHAR*)&ring[cut2 * 2], 1024 * 4, 2, 16, 16, FALSE, (UCHAR*)after2.data(), 1024 * 4, PNA2DP_FMT_S16, 2, 32768);
+    worst = std::abs(after2[0] - ring[(played - 1) * 2]);
+    for (ULONG f = 1; f < 1024; ++f) worst = PN_MAX(worst, std::abs(after2[f * 2] - after2[(f - 1) * 2]));
+    CHECK(worst <= natural + 32000 / (int)(fade + 1) + 2);
+    /* 0.1.0.21 replaced the source with the head of the second drop (audio that followed
+     * dropped audio): the first sample steps by most of the amplitude */
+    PN_PCM_STATE old = {};
+    old.FadeOut = (const UCHAR*)&ring[oldSource * 2]; old.FadeFrames = fadeFrames;
+    PnConvertPcmEx(&old, (UCHAR*)&ring[cut2 * 2], 1024 * 4, 2, 16, 16, FALSE, (UCHAR*)after2.data(), 1024 * 4, PNA2DP_FMT_S16, 2, 32768);
+    CHECK(std::abs(after2[0] - ring[(played - 1) * 2]) > 4 * natural);
 }
 
 /* P10: link congestion only; trims caused by the link reduce at once; reductions jump
@@ -823,12 +843,12 @@ static void TestSbcS32Chain()
     CHECK(same);
 }
 
-/* frequency response of the half-band table (double, test only) */
-static double HalfbandGainDb(double f /* cycles per input sample */)
+/* frequency response of a 2:1 FIR table (double, test only) */
+static double Dec2GainDb(const PN_DEC2_TABLE *d, double f /* cycles per input sample */)
 {
     const double pi = 3.14159265358979323846;
-    double h = 0.5;
-    for (ULONG j = 0; j < PN_HB_HALF; ++j) h += 2.0 * g_PnHalfbandQ28[j] / 268435456.0 * std::cos(2 * pi * f * (2 * j + 1));
+    double h = d->Coef[0] / 268435456.0;
+    for (ULONG k = 1; k <= d->Center; ++k) h += 2.0 * d->Coef[k] / 268435456.0 * std::cos(2 * pi * f * k);
     return 20.0 * std::log10(PN_MAX(std::fabs(h), 1e-15));
 }
 
@@ -851,30 +871,34 @@ static std::vector<LONG> Decimate(const std::vector<LONG> &in, ULONG outFmtBytes
     return out;
 }
 
-/* P12/C8: 2:1 half-band decimator for 96 -> 48 kHz and 88.2 -> 44.1 kHz. */
-static void TestHalfbandDecimator()
+/* P12/C8: the 2:1 decimator for 96 -> 48 kHz and 88.2 -> 44.1 kHz (0.1.0.22: alias-free FIRs, the
+ * stopband from fs_out / 2; a state zeroed with Decimate 2 takes g_PnDec88, valid at both rates). */
+static void TestDecimator2to1()
 {
     const double pi = 3.14159265358979323846;
-    /* the table: DC gain exactly 1, ripple, stopband */
-    LONGLONG sum = 1ll << 27;
-    for (ULONG j = 0; j < PN_HB_HALF; ++j) sum += 2ll * g_PnHalfbandQ28[j];
-    CHECK(sum == (1ll << 28));
-    double ripple = 0, stop = -1000;
-    for (int i = 0; i <= 2000; ++i) ripple = PN_MAX(ripple, std::fabs(HalfbandGainDb(0.225 * i / 2000.0)));   /* to 0.45 fs_out */
-    for (int i = 0; i <= 2000; ++i) stop = PN_MAX(stop, HalfbandGainDb(0.275 + 0.225 * i / 2000.0));         /* from 0.55 fs_out */
-    printf("half-band decimator: passband ripple %.4f dB to 0.45 fs_out, stopband %.1f dB from 0.55 fs_out\n", ripple, stop);
-    CHECK(ripple < 0.01);
-    CHECK(stop <= -60.0);
+    /* the tables: DC gain exactly 1, ripple to 20 kHz, stopband from fs_out / 2 */
+    for (const PN_DEC2_TABLE *d : { &g_PnDec96, &g_PnDec88 }) {
+        const double fin = d == &g_PnDec96 ? 96000.0 : 88200.0;
+        LONGLONG sum = d->Coef[0];
+        for (ULONG k = 1; k <= d->Center; ++k) sum += 2ll * d->Coef[k];
+        CHECK(sum == (1ll << 28) && d->Taps == 2 * d->Center + 1);
+        double ripple = 0, stop = -1000;
+        for (int i = 0; i <= 2000; ++i) ripple = PN_MAX(ripple, std::fabs(Dec2GainDb(d, 20000.0 / fin * i / 2000.0)));   /* to 20 kHz */
+        for (int i = 0; i <= 2000; ++i) stop = PN_MAX(stop, Dec2GainDb(d, 0.25 + 0.25 * i / 2000.0));                    /* from fs_out / 2 */
+        printf("2:1 decimator %.1f kHz: passband ripple %.6f dB to 20 kHz, stopband %.1f dB from fs_out / 2\n", fin / 1000.0, ripple, stop);
+        CHECK(ripple < 0.01);
+        CHECK(stop <= -110.0);
+    }
 
     /* output frames: 2 in -> 1 out; an odd frame waits for its partner across blocks */
     {
         PN_PCM_STATE st = {}; st.Decimate = 2;
         LONG in[8] = {}, out[8];
         CHECK(PnConvertPcmEx(&st, (UCHAR*)in, 8 * 4, 1, 32, 32, FALSE, (UCHAR*)out, sizeof(out), PNA2DP_FMT_S32, 1, 32768) == 4 * 4);
-        CHECK(PnConvertPcmEx(&st, (UCHAR*)in, 3 * 4, 1, 32, 32, FALSE, (UCHAR*)out, sizeof(out), PNA2DP_FMT_S32, 1, 32768) == 1 * 4 && st.HbPhase == 1);
-        CHECK(PnConvertPcmEx(&st, (UCHAR*)in, 1 * 4, 1, 32, 32, FALSE, (UCHAR*)out, sizeof(out), PNA2DP_FMT_S32, 1, 32768) == 1 * 4 && st.HbPhase == 0);
+        CHECK(PnConvertPcmEx(&st, (UCHAR*)in, 3 * 4, 1, 32, 32, FALSE, (UCHAR*)out, sizeof(out), PNA2DP_FMT_S32, 1, 32768) == 1 * 4 && st.DecPhase == 1);
+        CHECK(PnConvertPcmEx(&st, (UCHAR*)in, 1 * 4, 1, 32, 32, FALSE, (UCHAR*)out, sizeof(out), PNA2DP_FMT_S32, 1, 32768) == 1 * 4 && st.DecPhase == 0);
         /* an output buffer smaller than the input consumes exactly the frames it writes */
-        CHECK(PnConvertPcmEx(&st, (UCHAR*)in, 8 * 4, 1, 32, 32, FALSE, (UCHAR*)out, 3 * 4, PNA2DP_FMT_S32, 1, 32768) == 3 * 4 && st.HbPhase == 0);
+        CHECK(PnConvertPcmEx(&st, (UCHAR*)in, 8 * 4, 1, 32, 32, FALSE, (UCHAR*)out, 3 * 4, PNA2DP_FMT_S32, 1, 32768) == 3 * 4 && st.DecPhase == 0);
     }
 
     /* DC: exact after the filter has filled */
@@ -883,7 +907,7 @@ static void TestHalfbandDecimator()
         PN_PCM_STATE st = {}; st.Decimate = 2;
         CHECK(PnConvertPcmEx(&st, (UCHAR*)dc.data(), 4096 * 4, 2, 16, 16, FALSE, (UCHAR*)out.data(), 2048 * 4, PNA2DP_FMT_S16, 2, 32768) == 2048 * 4);
         bool exact = true;
-        for (ULONG f = PN_HB_TAPS; f < 2048; ++f) exact = exact && out[f * 2] == 16000 && out[f * 2 + 1] == 16000;
+        for (ULONG f = PN_DEC2_88_TAPS; f < 2048; ++f) exact = exact && out[f * 2] == 16000 && out[f * 2 + 1] == 16000;
         CHECK(exact);
     }
 
@@ -1635,6 +1659,85 @@ static void TestAudioQualityFixes()
     }
 }
 
+/* 0.1.0.22 #1, requirement (f): every native-rate conversion stays bit-exact. One FNV-1a 64 over
+ * the output of a fixed input set through every native combination: input formats (S16, S24,
+ * S24-in-32, S32, F32 with over-range, NaN and Inf), targets (S16 with and without dither, S24,
+ * S32, F32), stereo / mono both ways, unity, -6 dB, gain ramps and mute, a trim crossfade, a
+ * fade-in start and digital silence, in uneven blocks. The constant was recorded from pcm.cpp
+ * before the rate converter existed (the 0.1.0.21 conversion code). */
+static ULONGLONG GoldenFnv(ULONGLONG h, const void *p, size_t n)
+{
+    const UCHAR *b = (const UCHAR *)p;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 0x100000001B3ull; }
+    return h;
+}
+
+static void TestNativeConversionGolden()
+{
+    const ULONGLONG expected = 0x48aab6e64ad2c171ull;   /* pcm.cpp of 0.1.0.21 (bd164af) */
+    ULONG random = 0x601DE11u;
+    auto next = [&]() { random ^= random << 13; random ^= random >> 17; random ^= random << 5; return random; };
+    struct InFmt { ULONG Container, Valid; BOOLEAN Float; };
+    const InFmt fmts[] = { {16, 16, FALSE}, {24, 24, FALSE}, {32, 24, FALSE}, {32, 32, FALSE}, {32, 32, TRUE} };
+    const ULONG targets[] = { PNA2DP_FMT_S16, PNA2DP_FMT_S24, PNA2DP_FMT_S32, PNA2DP_FMT_F32 };
+    const ULONG blocks[] = { 384, 1, 7, 128, 383, 1024, 2, 640 };
+    /* gain per block: unity, -6 dB, a ramp down, mute, a ramp up, unity */
+    const ULONG gains[] = { 32768, 16423, 16423, 9830, 0, 0, 23198, 32768 };
+    ULONGLONG h = 0xCBF29CE484222325ull;
+    ULONG combos = 0;
+    for (const InFmt &f : fmts) for (ULONG target : targets) for (ULONG inCh = 1; inCh <= 2; ++inCh) for (ULONG outCh = 1; outCh <= 2; ++outCh)
+    for (ULONG variant = 0; variant < 4; ++variant) {
+        /* variant 0: zeroed state; 1: dither on; 2: fade-in start (PnPcmStateReset); 3: trim crossfade + dither */
+        if (variant != 0 && variant != 2 && target != PNA2DP_FMT_S16) continue;
+        ULONG bps = f.Container / 8, frameBytes = inCh * bps;
+        std::vector<UCHAR> in(2048 * frameBytes), fade(192 * frameBytes), out(2048 * 2 * 4);
+        auto fill = [&](std::vector<UCHAR> &buf, ULONG frames, BOOLEAN silent) {
+            for (ULONG i = 0; i < frames * inCh; ++i) {
+                UCHAR *s = buf.data() + i * bps;
+                if (silent) { memset(s, 0, bps); continue; }
+                if (f.Float) {
+                    ULONG r = next(), bits;
+                    float v = (float)((LONG)(r >> 1) - 0x40000000) / (float)0x30000000;   /* about +-1.33 */
+                    memcpy(&bits, &v, 4);
+                    if ((r & 0x3f) == 1) bits = 0x7fc00000;                     /* NaN */
+                    else if ((r & 0x3f) == 2) bits = (r & 0x80) ? 0xff800000 : 0x7f800000;   /* -+Inf */
+                    else if ((r & 0x3f) == 3) bits = 0x40a00000;                /* 5.0: over the +-4.0 limit */
+                    else if ((r & 0x3f) == 4) bits = 0x00000001;                /* denormal */
+                    else if ((r & 0x3f) == 5) bits = 0x80000000;                /* -0.0 */
+                    memcpy(s, &bits, 4);
+                } else {
+                    ULONG r = next();
+                    memcpy(s, &r, bps);
+                }
+            }
+        };
+        PN_PCM_STATE st;
+        if (variant == 2) PnPcmStateReset(&st, 1, TRUE);
+        else memset(&st, 0, sizeof(st));
+        st.Dither = variant == 1 || variant == 3;
+        for (ULONG b = 0; b < PN_ARRAYSIZE(blocks); ++b) {
+            ULONG frames = blocks[b];
+            fill(in, frames, b == 5);   /* block 5: digital silence */
+            if (variant == 3 && b == 2) {
+                fill(fade, 192, FALSE);
+                st.FadeOut = fade.data(); st.FadeFrames = 192; st.FadePos = 0;
+            }
+            ULONG outBytes = PnConvertPcmEx(&st, in.data(), frames * frameBytes, inCh, f.Container, f.Valid, f.Float, out.data(), (ULONG)out.size(),
+                                            target, outCh, gains[b]);
+            h = GoldenFnv(h, &outBytes, sizeof(outBytes));
+            h = GoldenFnv(h, out.data(), outBytes);
+        }
+        /* a capped output buffer converts the frames it has room for */
+        ULONG capped = PnConvertPcmEx(&st, in.data(), 300 * frameBytes, inCh, f.Container, f.Valid, f.Float, out.data(), 100 * outCh * 4, target, outCh, 32768);
+        h = GoldenFnv(h, &capped, sizeof(capped));
+        h = GoldenFnv(h, out.data(), capped);
+        combos++;
+    }
+    printf("native conversion golden: %u combinations, FNV-1a 64 %016llx\n", combos, (unsigned long long)h);
+    CHECK(combos == 200);
+    CHECK(h == expected);
+}
+
 static void TestQualityReviewP()
 {
     TestSbcXqRule();
@@ -1646,17 +1749,222 @@ static void TestQualityReviewP()
     TestAudioQualityFixes();
 }
 
+/* 0.1.0.22 #2: one source of defaults, validation and the save rule (config_policy.h). */
+static void TestConfigPolicy()
+{
+    PNA2DP_CONFIG d;
+    PnConfigDefaults(&d);
+    CHECK(d.Size == sizeof(d) && d.Version == PNA2DP_ABI_VERSION);
+    CHECK(d.Ldac.Eqmid == PNA2DP_LDAC_EQMID_HQ && d.Ldac.AbrEnable == 1 && d.Ldac.FormatMask == 0);   /* was SQ */
+    CHECK(d.Aac.BitrateBps == 320000 && d.Aac.Vbr == 0);                                              /* was 0 / VBR */
+    CHECK(d.Sbc.MaxBitpool == 0 && d.Sbc.MinBitpool == 2 && !d.Sbc.ChannelModeMask);
+    CHECK(!(d.Flags & (PNA2DP_CFG_DUAL_CHANNEL_PREFER | PNA2DP_CFG_SBC_XQ)));                         /* known issue #31 */
+    CHECK(d.Flags == (PNA2DP_CFG_ABR_ENABLE | PNA2DP_CFG_APPLY_LIVE | PNA2DP_CFG_SUSPEND_ON_SCO | PNA2DP_CFG_DELAY_REPORTING |
+                      PNA2DP_CFG_SOFTWARE_VOLUME | PNA2DP_CFG_AUTO_QUALITY));
+    CHECK(d.CodecPriority[0] == PNA2DP_CODEC_LDAC && d.CodecPriority[1] == PNA2DP_CODEC_APTX_HD && d.CodecPriority[2] == PNA2DP_CODEC_AAC &&
+          d.CodecPriority[3] == PNA2DP_CODEC_APTX && d.CodecPriority[4] == PNA2DP_CODEC_APTX_LL && d.CodecPriority[5] == PNA2DP_CODEC_SBC && !d.CodecPriority[6]);
+    CHECK(d.TargetLatencyMs == 60 && d.MaxLatencyMs == 250 && d.AbrFloorBps == 128000 && d.ReconnectDelayMs == 2000 && d.VolumeDb16 == 0);
+    PNA2DP_CONFIG v = d;
+    CHECK(PnConfigValidate(&v) && !memcmp(&v, &d, sizeof(v)));   /* the driver stores the defaults as they are */
+    /* the validation is the driver's (unchanged clamps, max 500 = ring 600 - headroom 100) */
+    v = d; v.TargetLatencyMs = 5; v.MaxLatencyMs = 1000;
+    CHECK(PnConfigValidate(&v) && v.TargetLatencyMs == 20 && v.MaxLatencyMs == 500);
+    static_assert(PN_CONFIG_MAX_LATENCY_MS == 600 - PN_RING_HEADROOM_MS, "the latency ceiling stays below the ring");
+    v = d; v.TargetLatencyMs = 450; v.MaxLatencyMs = 300;
+    CHECK(PnConfigValidate(&v) && v.TargetLatencyMs == 400 && v.MaxLatencyMs == 420);
+    v = d; v.Size = 4;
+    CHECK(!PnConfigValidate(&v));
+    v = d; v.Ldac.Eqmid = 9; v.Flags = PNA2DP_CFG_AUTO_QUALITY; v.Ldac.AbrEnable = 0; v.EnabledCodecMask = 0;
+    CHECK(PnConfigValidate(&v) && v.Ldac.Eqmid == PNA2DP_LDAC_EQMID_SQ && (v.Flags & PNA2DP_CFG_ABR_ENABLE) && v.Ldac.AbrEnable &&
+          (v.Flags & PNA2DP_CFG_SOFTWARE_VOLUME) && v.EnabledCodecMask == PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC));
+
+    /* DeviceStart saves the defaults only where nothing is stored: never over a saved
+     * configuration it cannot read (another ABI, a rejected value, an I/O error) */
+    CHECK(PnConfigShouldSaveDefaults((LONG)0xC0000034L));    /* STATUS_OBJECT_NAME_NOT_FOUND */
+    CHECK(PnConfigShouldSaveDefaults((LONG)0xC000003AL));    /* STATUS_OBJECT_PATH_NOT_FOUND */
+    CHECK(!PnConfigShouldSaveDefaults((LONG)0xC0000004L));   /* STATUS_INFO_LENGTH_MISMATCH */
+    CHECK(!PnConfigShouldSaveDefaults((LONG)0xC000000DL));   /* STATUS_INVALID_PARAMETER */
+    CHECK(!PnConfigShouldSaveDefaults((LONG)0xC000009AL));   /* STATUS_INSUFFICIENT_RESOURCES */
+    CHECK(!PnConfigShouldSaveDefaults((LONG)0x80000005L));   /* STATUS_BUFFER_OVERFLOW */
+    CHECK(!PnConfigShouldSaveDefaults(0));
+}
+
+/* 0.1.0.22 #5: latency profiles are a target / max pair; all fit the ring unchanged. */
+static void TestLatencyProfiles()
+{
+    const ULONG expect[4][2] = { {0, 0}, {30, 120}, {60, 250}, {150, 450} };
+    for (ULONG p = PN_LATENCY_PROFILE_LOW; p <= PN_LATENCY_PROFILE_MUSIC; p++) {
+        ULONG t = 0, m = 0;
+        CHECK(PnLatencyProfileValues(p, &t, &m) && t == expect[p][0] && m == expect[p][1]);
+        CHECK(PnLatencyProfileOf(t, m) == p);
+        PNA2DP_CONFIG c;
+        PnConfigDefaults(&c);
+        PnApplyLatencyProfile(&c, p);
+        CHECK(c.TargetLatencyMs == t && c.MaxLatencyMs == m);
+        PNA2DP_CONFIG v = c;
+        CHECK(PnConfigValidate(&v) && !memcmp(&v, &c, sizeof(v)));
+        ULONG et, em;
+        PnEffectiveLatencyMs(t, m, 600, &et, &em);
+        CHECK(et == t && em == m);                    /* the pump applies them as configured */
+    }
+    ULONG t = 7, m = 8;
+    CHECK(!PnLatencyProfileValues(PN_LATENCY_PROFILE_CUSTOM, &t, &m) && !PnLatencyProfileValues(9, &t, &m) && t == 7 && m == 8);
+    CHECK(PnLatencyProfileOf(90, 333) == PN_LATENCY_PROFILE_CUSTOM);
+    CHECK(PnLatencyProfileOf(150, 451) == PN_LATENCY_PROFILE_CUSTOM && PnLatencyProfileOf(80, 300) == PN_LATENCY_PROFILE_CUSTOM);
+    PNA2DP_CONFIG c;
+    PnConfigDefaults(&c);
+    c.TargetLatencyMs = 90; c.MaxLatencyMs = 333;
+    PnApplyLatencyProfile(&c, PN_LATENCY_PROFILE_CUSTOM);
+    CHECK(c.TargetLatencyMs == 90 && c.MaxLatencyMs == 333);
+    PnConfigDefaults(&c);
+    CHECK(PnLatencyProfileOf(c.TargetLatencyMs, c.MaxLatencyMs) == PN_LATENCY_PROFILE_BALANCED);   /* the default */
+
+    /* SBC packets: ~target/3 per packet up to 80 ms, so Music does not make 50 ms packets */
+    CHECK(PnSbcPackingTargetMs(30) == 30 && PnSbcPackingTargetMs(60) == 60 && PnSbcPackingTargetMs(80) == 80 && PnSbcPackingTargetMs(150) == 80);
+    CHECK(PnSbcPacking(119, 2667, PnSbcPackingTargetMs(150), 882, 13, 0) == PnSbcPacking(119, 2667, 80, 882, 13, 0));
+}
+
+/* 0.1.0.22 #5: the ABR rules scale with the buffer. Target <= 60 ms: the 0.1.0.21 rules
+ * exactly (gate 0). A larger target lets the backlog absorb a hiccup: SLOW needs a backlog
+ * over the gate, and a backlog the link is draining is no congestion. */
+static void TestAbrProfileGate()
+{
+    CHECK(PnAbrSoftGateUs(60) == 0 && PnAbrSoftGateUs(30) == 0 && PnAbrSoftGateUs(20) == 0);
+    CHECK(PnAbrSoftGateUs(150) == 90000 && PnAbrSoftGateUs(61) == 1000 && PnAbrSoftGateUs(400) == 340000);
+    PN_ABR_SAMPLE s = AbrSample(3, 0, 80000, 18);
+    s.TargetLatencyUs = 150000; s.SoftGateUs = PnAbrSoftGateUs(150); s.RingStartUs = 40000; s.RingEndUs = 80000;
+    CHECK(PnAbrReasons(&s) == 0);                                   /* slow writes, backlog under the gate */
+    s.BacklogPeakUs = 120000; s.RingEndUs = 120000;
+    CHECK(PnAbrReasons(&s) == PNA2DP_QUALITY_REASON_SLOW);
+    s.Slow = 0; s.DeliveredMediaUs = 200000;                        /* under real time, queue full */
+    CHECK(PnAbrReasons(&s) == PNA2DP_QUALITY_REASON_SLOW);
+    s.BacklogPeakUs = 80000; s.RingEndUs = 80000;
+    CHECK(PnAbrReasons(&s) == 0);
+    s = AbrSample(3, 0, 200000);
+    s.TargetLatencyUs = 150000; s.SoftGateUs = 90000; s.RingStartUs = 150000; s.RingEndUs = 200000;
+    CHECK(PnAbrReasons(&s) == PNA2DP_QUALITY_REASON_BACKLOG);       /* growing backlog over the target */
+    s.RingStartUs = 300000; s.RingEndUs = 200000; s.BacklogPeakUs = 300000; s.DeliveredMediaUs = 400000;
+    CHECK(PnAbrReasons(&s) == 0);                                   /* draining: the link has spare capacity */
+    s.RingEndUs = 291000;
+    CHECK(PnAbrReasons(&s) == PNA2DP_QUALITY_REASON_BACKLOG);       /* shrinking less than 10 ms is not draining */
+    s.RingEndUs = 200000; s.Trims = 1;
+    CHECK(PnAbrReasons(&s) == PNA2DP_QUALITY_REASON_BACKLOG);       /* a trim emptied the ring, not the link */
+    s.Trims = 0; s.Failed = 1; s.Pressure = 1;
+    CHECK(PnAbrReasons(&s) == (PNA2DP_QUALITY_REASON_FAILED | PNA2DP_QUALITY_REASON_PRESSURE));   /* losses always count */
+    /* gate 0 (Balanced, Low latency): draining or not, the 0.1.0.21 rules */
+    s = AbrSample(3, 0, 300000, 18);
+    s.RingStartUs = 300000; s.RingEndUs = 100000;
+    CHECK(PnAbrReasons(&s) == (PNA2DP_QUALITY_REASON_BACKLOG | PNA2DP_QUALITY_REASON_SLOW));
+    s = AbrSample(0, 0, 0, 2);
+    CHECK(PnAbrReasons(&s) == PNA2DP_QUALITY_REASON_SLOW);
+}
+
+/* A link carrying LDAC (990 / 660 / 330 kbps) in 10 ms steps, observed every 250 ms as the
+ * pump does: the ring holds ~10 ms while the link keeps up; it grows during a stall or while
+ * the link is slower than the stream; the latency guard trims to the target over the max. */
+struct LinkSim {
+    ULONG trims = 0, downgrades = 0, peakBacklogMs = 0, firstDowngradeMs = 0, finalBps = 0;
+};
+static LinkSim SimulateLink(ULONG TargetMs, ULONG MaxMs, bool ProfileRules, double CapacityX, ULONG StallMs, ULONG StallEveryMs,
+                            double DegradedX, ULONG DegradeAtMs, ULONG DurationMs)
+{
+    const ULONG ladder[3] = { 990000, 660000, 330000 }, maxLevel = 2;
+    const double base = 10;
+    ULONG effTarget, effMax;
+    PnEffectiveLatencyMs(TargetMs, MaxMs, 600, &effTarget, &effMax);
+    LinkSim r;
+    PN_QUALITY_WINDOW w = {};
+    ULONG level = 0;
+    double backlog = base, lastRing = base;
+    PN_ABR_SAMPLE s = {};
+    double delivered = 0, bits = 0, busy = 0;
+    bool stalledBefore = false;
+    for (ULONG t = 10; t <= DurationMs; t += 10) {
+        double rate = ladder[level];
+        double cap = (DegradeAtMs && t > DegradeAtMs ? DegradedX : CapacityX) * ladder[0];
+        bool stall = StallMs && StallEveryMs && t > StallEveryMs / 2 && (t % StallEveryMs) > 0 && (t % StallEveryMs) <= StallMs;
+        bool full;
+        if (stall) {
+            backlog += 10; full = true; stalledBefore = true;
+        } else {
+            double can = 10.0 * cap / rate, want = backlog + 10 - base;
+            double sent = can < want ? can : want;
+            full = can < want;
+            backlog += 10 - sent;
+            delivered += sent; bits += sent * rate / 1000.0;
+            busy += full ? 10000.0 : sent * rate / cap * 1000.0;
+            s.Completed += (ULONG)(sent / 5 + 0.5);      /* ~5 ms of LDAC per write */
+            if (stalledBefore) { s.Slow++; s.Stalls++; s.Completed++; stalledBefore = false; }   /* the write the stall held */
+        }
+        if (full) { s.QueueFull++; if (backlog * 1000 > s.BacklogPeakUs) s.BacklogPeakUs = (ULONG)(backlog * 1000); }
+        if (backlog > r.peakBacklogMs) r.peakBacklogMs = (ULONG)backlog;
+        if (backlog > effMax) { backlog = effTarget; s.Trims++; r.trims++; }
+        if (t % 250 == 0) {
+            s.ElapsedMs = 250; s.TargetLatencyUs = effTarget * 1000;
+            s.DeliveredMediaUs = (ULONGLONG)(delivered * 1000); s.DeliveredBits = (ULONGLONG)bits; s.BusyUs = (ULONGLONG)busy;
+            if (ProfileRules) {
+                s.SoftGateUs = PnAbrSoftGateUs(effTarget);
+                s.RingStartUs = (ULONG)(lastRing * 1000); s.RingEndUs = (ULONG)(backlog * 1000);
+            }
+            lastRing = backlog;
+            ULONG reasons = 0;
+            int change = PnAbrDecide(&w, &s, ladder, TRUE, level, maxLevel, &reasons);
+            if (change > 0) {
+                level = PN_MIN(level + (ULONG)change, maxLevel); r.downgrades++;
+                if (!r.firstDowngradeMs && t > DegradeAtMs) r.firstDowngradeMs = t - DegradeAtMs;
+            } else if (change < 0) level--;
+            s = {}; delivered = bits = busy = 0;
+        }
+    }
+    r.finalBps = ladder[level];
+    return r;
+}
+
+static void TestLatencyProfileLink()
+{
+    /* a link with 25% spare capacity and a 300 ms radio stall every 8 s, for 120 s */
+    LinkSim bal = SimulateLink(60, 250, true, 1.25, 300, 8000, 0, 0, 120000);
+    LinkSim music = SimulateLink(150, 450, true, 1.25, 300, 8000, 0, 0, 120000);
+    LinkSim musicLegacy = SimulateLink(150, 450, false, 1.25, 300, 8000, 0, 0, 120000);
+    CHECK(bal.trims >= 1 && bal.downgrades >= 1);              /* Balanced: trim at 250 ms, urgent downgrade */
+    CHECK(music.trims == 0 && music.downgrades == 0);          /* Music rides it out at full quality */
+    CHECK(music.peakBacklogMs <= 310);
+    CHECK(musicLegacy.downgrades >= 1);                        /* the 0.1.0.21 rules downgrade even with the larger buffer */
+    /* the 0.1.0.21 rules at the Balanced target behave exactly as the new code */
+    LinkSim balLegacy = SimulateLink(60, 250, false, 1.25, 300, 8000, 0, 0, 120000);
+    CHECK(balLegacy.trims == bal.trims && balLegacy.downgrades == bal.downgrades && balLegacy.finalBps == bal.finalBps);
+    /* sustained congestion: the link drops to 0.8x the top rung after 10 s */
+    LinkSim balSlow = SimulateLink(60, 250, true, 1.25, 0, 0, 0.8, 10000, 40000);
+    LinkSim musicSlow = SimulateLink(150, 450, true, 1.25, 0, 0, 0.8, 10000, 40000);
+    CHECK(balSlow.firstDowngradeMs && balSlow.firstDowngradeMs <= 1500);
+    CHECK(musicSlow.firstDowngradeMs && musicSlow.firstDowngradeMs <= 2500 && musicSlow.trims == 0);
+    CHECK(balSlow.finalBps <= 0.8 * 990000 && musicSlow.finalBps <= 0.8 * 990000);
+    /* Low latency: the 0.1.0.21 rules at a 30 ms target */
+    LinkSim low = SimulateLink(30, 120, true, 1.25, 300, 8000, 0, 0, 120000);
+    CHECK(low.trims >= 1 && low.downgrades >= 1);
+    printf("Latency profiles, 1.25x link with a 300 ms stall every 8 s for 120 s: Balanced %u trims, %u downgrades; "
+           "Music %u trims, %u downgrades, peak backlog %u ms (0.1.0.21 rules: %u downgrades); Low latency %u trims. "
+           "Link at 0.8x: Balanced downgrades after %u ms, Music after %u ms with %u trims\n",
+           bal.trims, bal.downgrades, music.trims, music.downgrades, music.peakBacklogMs, musicLegacy.downgrades, low.trims,
+           balSlow.firstDowngradeMs, musicSlow.firstDowngradeMs, musicSlow.trims);
+}
+
 static void TestLaneP3()
 {
     TestReview2P();
     TestSbcPacking();
     TestDither();
     TestSbcS32Chain();
-    TestHalfbandDecimator();
+    TestDecimator2to1();
     TestAbrStallNotThroughput();
     TestDitherDigitalSilence();
     TestReview4P();
     TestQualityReviewP();
+    TestConfigPolicy();
+    TestLatencyProfiles();
+    TestAbrProfileGate();
+    TestLatencyProfileLink();
+    TestNativeConversionGolden();
 }
 
 static void TestLaneP()

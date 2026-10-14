@@ -83,7 +83,7 @@ typedef struct _PN_CODEC_CHOICE_INPUT {
     ULONG                   PreferredBits;
     BOOLEAN                 Conservative;    /* AUTO_QUALITY on an adapter without EDR */
     /* corrected transport */
-    BOOLEAN                 AllowHalfRate;   /* the pump decimates 2:1 (96000 -> 48000) */
+    ULONG                   RateConvert;     /* PN_RATECONV_*: engine rates the pump bridges (C8, #1) */
     UCHAR                   OwnRemoteSeid;   /* remote SEP of our own current stream, 0 = none */
     const PN_REJECTED_SET  *Rejected;
 } PN_CODEC_CHOICE_INPUT;
@@ -103,12 +103,18 @@ static inline const AVDTP_LOCAL_SEP *PnLocalSepForCodec(const AVDTP_LOCAL_SEP *S
     return NULL;
 }
 
-/* Stream rate for an engine rate: the engine rate itself, or (C8) exactly half of a 96 /
- * 88.2 kHz engine rate when the pump decimates 2:1 and the sink lacks the full rate. */
-static inline ULONG PnStreamRateFor(ULONG SinkRateMask, ULONG EngineRate, BOOLEAN AllowHalfRate)
+/* Stream rate for an engine rate: the engine rate itself whenever the sink takes it (nothing to
+ * convert); else what RateConvert bridges: exactly half of a 96 / 88.2 kHz engine rate (C8,
+ * PN_RATECONV_HALF and up), then 44.1 or 48 kHz, the engine rate's own family first (44.1 for
+ * 44.1 / 88.2 kHz, 48 for 48 / 96 kHz; PN_RATECONV_ANY, 0.1.0.22 #1); else EngineRate, which the
+ * sink lacks: the caller's selection fails, as before. */
+static inline ULONG PnStreamRateFor(ULONG SinkRateMask, ULONG EngineRate, ULONG RateConvert)
 {
-    if ((SinkRateMask & A2dpHzToRateMask(EngineRate)) || !AllowHalfRate) return EngineRate;
-    if ((EngineRate == 96000 || EngineRate == 88200) && (SinkRateMask & A2dpHzToRateMask(EngineRate / 2))) return EngineRate / 2;
+    if (SinkRateMask & A2dpHzToRateMask(EngineRate)) return EngineRate;
+    BOOLEAN family44 = EngineRate % 11025 == 0;
+    const ULONG candidates[3] = { EngineRate / 2, family44 ? 44100u : 48000u, family44 ? 48000u : 44100u };
+    for (ULONG i = 0; i < 3; i++)
+        if ((SinkRateMask & A2dpHzToRateMask(candidates[i])) && PnRateConvertible(EngineRate, candidates[i], RateConvert)) return candidates[i];
     return EngineRate;
 }
 
@@ -128,12 +134,14 @@ static inline BOOLEAN PnTrySep(const PN_CODEC_CHOICE_INPUT *In, const AVDTP_REMO
     if (PnRejectedContains(In->Rejected, Codec, R->Seid)) return FALSE;   /* T4: refused in this session */
     A2DP_CODEC_CAPS caps;
     if (!A2dpParseCaps(R->MediaCodecType, R->CodecCaps, R->CodecCapsLength, &caps, NULL, NULL)) return FALSE;
-    ULONG rate = In->PreferredRate;
+    ULONG rate = In->PreferredRate, bits = In->PreferredBits;
     if (In->RestrictRate) {
-        rate = PnStreamRateFor(caps.RateMask, In->PreferredRate, In->AllowHalfRate);
+        rate = PnStreamRateFor(caps.RateMask, In->PreferredRate, In->RateConvert);
         caps.RateMask &= A2dpHzToRateMask(rate);
+        /* converted audio carries more than 16 bits: LDAC's automatic encoder input takes S32 */
+        if (rate != In->PreferredRate && bits < 24) bits = 24;
     }
-    if (!A2dpSelectConfig(&caps, In->Config, rate, In->PreferredBits, Cfg)) return FALSE;
+    if (!A2dpSelectConfig(&caps, In->Config, rate, bits, Cfg)) return FALSE;
     if (In->Conservative && !A2dpConstrainBasicRadio(Cfg)) return FALSE;
     return TRUE;
 }
@@ -207,14 +215,56 @@ typedef struct _PN_FORMAT_INPUT {
     BOOLEAN                  Conservative;
     AVDTP_STREAM_STATE       StreamState;
     BOOLEAN                  RemoteConfigured;   /* corrected transport: the receiver configured it */
-    BOOLEAN                  AllowHalfRate;      /* C8: the pump decimates 2:1 */
+    ULONG                    RateConvert;        /* PN_RATECONV_*: engine rates the pump bridges (C8, #1) */
+    BOOLEAN                  Streamed;           /* the stream carried audio (pump started) since it was configured */
 } PN_FORMAT_INPUT;
+
+/* TRUE when PnPlanStreamFormat keeps the stream at its own rate and the pump bridges the engine
+ * rate to it (PN_RATECONV_ANY, 0.1.0.22 #1): no RECONFIGURE when Windows switches between 44.1
+ * and 48 kHz on a stream that has already played. A stream that has carried no audio since it was
+ * configured (the receiver's own SET_CONFIGURATION, or ours with no audio open) is not bridged:
+ * a RECONFIGURE before its first START interrupts nothing, so it goes to the engine's own rate
+ * (review #1, #3, #4). A hi-res engine rate (above 48 kHz) the sink takes natively still gets its
+ * own stream. A bridged stream stays at its rate until it is configured again (codec upgrade,
+ * renegotiation, reconnect). */
+static inline BOOLEAN PnStreamBridged(const PN_FORMAT_INPUT *In, BOOLEAN Parsed, ULONG SinkRateMask)
+{
+    ULONG engine = In->AudioRate, active = In->Active->SampleRate;
+    BOOLEAN native = Parsed && (SinkRateMask & A2dpHzToRateMask(engine));
+    return In->RateConvert >= PN_RATECONV_ANY && In->Streamed && engine != active && PnRateConvertible(engine, active, In->RateConvert) &&
+           !(native && engine > 48000);
+}
+
+/* The stream format at one stream rate (PnPlanStreamFormat). */
+static inline PN_FORMAT_ACTION PnPlanStreamFormatAt(const PN_FORMAT_INPUT *In, BOOLEAN Parsed, const A2DP_CODEC_CAPS *Caps, ULONG Rate,
+                                                    A2DP_CODEC_CONFIG *Cfg)
+{
+    *Cfg = *In->Active;
+    A2DP_CODEC_CAPS caps = *Caps;
+    BOOLEAN selected = Parsed && (caps.RateMask & A2dpHzToRateMask(Rate));
+    if (selected && Cfg->Codec == PNA2DP_CODEC_SBC) {
+        caps.RateMask &= A2dpHzToRateMask(Rate);
+        selected = A2dpSelectConfig(&caps, In->Config, Rate, In->AudioValidBits, Cfg);
+        if (selected && In->Conservative) selected = A2dpConstrainBasicRadio(Cfg);
+    } else if (selected) {
+        Cfg->SampleRate = Rate;
+        A2dpSerializeConfig(Cfg);
+    }
+    if (selected && PnStreamFormatNeedsUpdate(In->Active->Codec, In->Active->SampleRate, In->Active->ChannelMode,
+                                              Cfg->SampleRate, Cfg->ChannelMode))
+        return (In->RemoteConfigured && In->StreamState == AvdtpStateConfigured) ? PnFormatWaitOpenReconfigure : PnFormatReconfigure;
+    if (!selected && In->Active->SampleRate != Rate) return PnFormatReselect;
+    return PnFormatKeep;
+}
 
 /* A receiver-initiated SBC stream may ignore the saved channel preference: select from
  * the sink's actual capabilities before comparing stream formats; in-band bitrate
  * reductions never need a reconfiguration. RECONFIGURE needs an Open stream: a stream the
  * receiver configured waits for the receiver's OPEN (T3) instead of being dropped, one we
- * configured ourselves is aborted and configured again. */
+ * configured ourselves is aborted and configured again. A bridged stream (PnStreamBridged) that
+ * needs a RECONFIGURE anyway, for a channel-mode preference, is reconfigured to the engine's own
+ * stream rate instead: the same interruption, and the conversion ends (review #1, #3). With
+ * PN_RATECONV_NONE or _HALF the decisions are those of 0.1.0.21. */
 static inline PN_FORMAT_ACTION PnPlanStreamFormat(const PN_FORMAT_INPUT *In, A2DP_CODEC_CONFIG *Cfg)
 {
     AVDTP_STREAM_STATE st = In->StreamState;
@@ -224,21 +274,15 @@ static inline PN_FORMAT_ACTION PnPlanStreamFormat(const PN_FORMAT_INPUT *In, A2D
     const AVDTP_REMOTE_SEP *r = In->Remote;
     A2DP_CODEC_CAPS caps = {};
     BOOLEAN parsed = r && A2dpParseCaps(r->MediaCodecType, r->CodecCaps, r->CodecCapsLength, &caps, NULL, NULL);
-    ULONG rate = parsed ? PnStreamRateFor(caps.RateMask, In->AudioRate, In->AllowHalfRate) : In->AudioRate;
-    BOOLEAN selected = parsed && (caps.RateMask & A2dpHzToRateMask(rate));
-    if (selected && Cfg->Codec == PNA2DP_CODEC_SBC) {
-        caps.RateMask &= A2dpHzToRateMask(rate);
-        selected = A2dpSelectConfig(&caps, In->Config, rate, In->AudioValidBits, Cfg);
-        if (selected && In->Conservative) selected = A2dpConstrainBasicRadio(Cfg);
-    } else if (selected) {
-        Cfg->SampleRate = rate;
-        A2dpSerializeConfig(Cfg);
-    }
-    if (selected && PnStreamFormatNeedsUpdate(In->Active->Codec, In->Active->SampleRate, In->Active->ChannelMode,
-                                              Cfg->SampleRate, Cfg->ChannelMode))
-        return (In->RemoteConfigured && st == AvdtpStateConfigured) ? PnFormatWaitOpenReconfigure : PnFormatReconfigure;
-    if (!selected && In->Active->SampleRate != rate) return PnFormatReselect;
-    return PnFormatKeep;
+    ULONG rate = parsed ? PnStreamRateFor(caps.RateMask, In->AudioRate, In->RateConvert) : In->AudioRate;
+    if (!PnStreamBridged(In, parsed, caps.RateMask)) return PnPlanStreamFormatAt(In, parsed, &caps, rate, Cfg);
+    PN_FORMAT_ACTION bridged = PnPlanStreamFormatAt(In, parsed, &caps, In->Active->SampleRate, Cfg);
+    if (bridged != PnFormatReconfigure && bridged != PnFormatWaitOpenReconfigure) return bridged;
+    A2DP_CODEC_CONFIG own;
+    PN_FORMAT_ACTION action = PnPlanStreamFormatAt(In, parsed, &caps, rate, &own);
+    if (action != PnFormatReconfigure && action != PnFormatWaitOpenReconfigure) return bridged;   /* the engine rate fails: as bridged */
+    *Cfg = own;
+    return action;
 }
 
 /* ---- Media pump vs stream state ------------------------------------------------- */
@@ -1045,11 +1089,15 @@ static inline ULONG PnDefaultSinkDelayUs(ULONG Codec)
 }
 
 /* Sink delay for the current stream (C2). ReportedTenthsMs: last AVDTP DELAYREPORT of
- * this stream. A report counts only when delay reporting was negotiated for it (T6). */
+ * this stream. The acceptor stores a report only for the stream's own SEID and the value is
+ * reset with every configuration (T6), so a received report is this stream's real delay and
+ * is used even when delay reporting was not negotiated: some sinks (the EDIFIER MR5 on its
+ * LDAC SEP) report without offering the capability. DelayNegotiated only documents the case. */
 static inline ULONG PnSinkDelayUs(BOOLEAN StreamActive, BOOLEAN DelayNegotiated, BOOLEAN ReportReceived,
                                   ULONG ReportedTenthsMs, ULONG Codec)
 {
+    (void)DelayNegotiated;
     if (!StreamActive) return 0;
-    if (DelayNegotiated && ReportReceived) return ReportedTenthsMs * 100;
+    if (ReportReceived) return ReportedTenthsMs * 100;
     return PnDefaultSinkDelayUs(Codec);
 }
