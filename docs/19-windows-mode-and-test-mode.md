@@ -1,6 +1,6 @@
 # Windows mode and Test Mode: which one do I need?
 
-A plain-language guide for application 0.1.0.34 and custom driver 0.1.0.21.
+A plain-language guide for application 0.1.0.36 and custom driver 0.1.0.23.
 PN-A2DP can be used in two ways. You choose the way **per speaker or headphone**,
 and you can change your mind later.
 
@@ -30,6 +30,7 @@ it only when the PC is switched into **Test Mode** and prepared as described bel
 | Bitrate and codec controls | Not available | Per-codec settings, priorities and automatic quality |
 | Live quality (bitrate graph, drops, packet health) | Not available | Quality tab |
 | Volume, mute, output information | Audio tab | Integrated with Windows audio controls |
+| Sound format (Sound settings > Default Format) | Used by Windows | Used since driver 0.1.0.23 (earlier PN drivers normally ran at 48 kHz); converted in the driver when the receiver lacks that rate |
 | Check my audio and diagnostic export | Device and output checks | Adds codec, encoder, service and transport checks |
 | Connect / Disconnect buttons | Yes | Yes |
 | **What it needs** | | |
@@ -234,6 +235,15 @@ disappears after the restart.
 **A speaker I just paired uses the PN driver, but I wanted Windows mode.**
 Select it and choose **Driver > Use Windows mode**.
 
+**Does PN driver mode use the sound format I choose in Windows?**
+Yes, since driver 0.1.0.23 (release v0.1.0.36). Choose it under **Sound > the speaker >
+Properties > Advanced > Default Format**, as in Windows mode. Earlier PN drivers made
+Windows' shared-mode engine use the driver's first listed format (normally 48 kHz)
+whatever was chosen. If the receiver supports the chosen rate it is
+used directly; otherwise the driver converts it. Close and reopen the applications that
+play sound after a change: some (for example Chromium-based browsers such as Brave) keep
+their audio stream open while paused and use the new format only after they reopen it.
+
 **When will PN driver mode work without Test Mode?**
 When a Microsoft-signed driver is released. There is no date yet.
 
@@ -256,6 +266,9 @@ When a Microsoft-signed driver is released. There is no date yet.
   โปรแกรม anti-cheat หรือ DRM บางตัวอาจไม่ทำงาน และ BitLocker อาจถาม recovery key
   หลังเปลี่ยน Secure Boot ถ้าในอนาคตไดรเวอร์ได้ลายเซ็นของ Microsoft จะไม่ต้องใช้
   Test Mode และไม่ต้องปิดระบบป้องกันอีก (ยังไม่มีกำหนด)
+- ตั้งแต่ไดรเวอร์ 0.1.0.23 (v0.1.0.36) PN driver mode ใช้รูปแบบเสียงที่เลือกใน Sound > ลำโพง >
+  Properties > Advanced > Default Format เหมือน Windows mode (รุ่นก่อนบังคับเป็น 48 kHz) ถ้าลำโพง
+  ไม่รองรับอัตรานั้น ไดรเวอร์จะแปลงให้ หลังเปลี่ยนให้ปิดแล้วเปิดโปรแกรมเล่นเสียงใหม่
 - ถ้าไม่แน่ใจ หรือใช้เครื่องของที่ทำงาน ให้เริ่มที่ **Windows mode**
 - เปลี่ยนโหมดของแต่ละลำโพงที่แท็บ **Driver**: **Use Windows mode** หรือ
   **Use PN-A2DP driver** (ปุ่มหลังจะทำงานเมื่อ Test Mode ON ทั้งตอนนี้และหลังบูตครั้งถัดไป,

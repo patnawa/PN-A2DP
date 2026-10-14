@@ -34,14 +34,14 @@ a connected one, then any PN-A2DP device. An existing selection is kept across r
 
 | Tab | What it shows / changes |
 |---|---|
-| Status | Live connection state (an idle receiver with signalling up shows as **Connected**; the driver state is `PNA2DP_STATE_DISCOVERING`), codec, format, encoder owner, bitrate and ceiling, estimated latency, sink delay report, MTU, AVDTP version, flags, last NTSTATUS; transport statistics (packets, bytes, drops, queue depth, write completion time, ABR level, codec host round trip); driver version, codec host service state, encoders available. Refreshes on every driver event (pended `WAIT_EVENT` IOCTL on a worker thread) and once a second. |
+| Status | Live connection state (an idle receiver with signalling up shows as **Connected**; the driver state is `PNA2DP_STATE_DISCOVERING`), codec, format, encoder owner, bitrate and ceiling, estimated latency, sink delay report, MTU, AVDTP version, flags, last NTSTATUS (the format line names the Windows rate when it is converted; the sink delay reads "reported by the headset" or "not reported; a per-codec default is assumed"); transport statistics (packets, bytes, drops, queue depth, write completion time, ABR level, codec host round trip); driver version, codec host service state, encoders available. Refreshes on every driver event (pended `WAIT_EVENT` IOCTL on a worker thread) and once a second. |
 | Quality | Background audio checks with suggested settings, a live bitrate chart and recent transport counters, and a local diagnostic export that omits device identifiers. Also available in Windows mode with explicit telemetry limits. See [audio diagnostics](14-audio-diagnostics.md). |
 | Codecs | Live codec/rate/bitrate, receiver support, live state, and saved or edited settings. Activate selected puts a supported codec first and applies it with SBC fallback. Auto quality + codecs restores automatic selection. The preset picker is a loader, not an indicator of saved settings. SBC cannot be disabled. |
 | SBC | Max bitpool (slider, or the headset's maximum), min bitpool, bitpool override, dual channel preference, **SBC XQ** checkbox (dual channel, 16 blocks, 8 subbands at the bitpool plain dual channel gets, packed to the radio's EDR packets; it overrides the mode, block and subband choices), rate / channel mode / block / subband / allocation masks, live bitrate estimate at 44.1 and 48 kHz. |
 | AAC | Target and peak bitrate or sink maximum, VBR, AAC-LC, afterburner, rate and channel masks. HE-AAC is not advertised. |
 | aptX | Rate and channel masks for aptX, aptX HD (plus 16/24-bit input) and aptX LL (plus target buffer level). |
 | LDAC | Quality (HQ / SQ / MQ / adaptive), ABR step-down, encoder input format, rate and channel masks, bitrate preview. |
-| Transport | Target and maximum buffer (sliders), ABR on/off and floor, reconnect delay, persisted volume, behaviour flags (suspend on SCO, auto start, delay reports, expose all rates, software volume). |
+| Transport | Listening profile (Music 150 / 450 ms, Balanced 60 / 250 ms, Low latency 30 / 120 ms, Custom; application 0.1.0.35, released in 0.1.0.36) above the target and maximum buffer sliders (maximum 40..500 ms), ABR on/off and floor, reconnect delay, persisted volume, behaviour flags (suspend on SCO, auto start, delay reports, expose all rates, software volume). |
 | Headset | AVDTP version, SDP features, every remote SEP decoded (rates, channels, blocks, bitpool, AAC object types and bitrate, services) with the raw IEs. |
 | Adapter | Actual radio name/address, Classic EDR capability, live health, effective bitrate range and observation counters. Auto quality + codecs detects receiver support and enables adapter-aware limits with live adaptation. |
 | Driver | Driver, provider, version, INF, status, **Use PN-A2DP driver** / **Use Windows mode** / **Rescan**. Labelled Test Mode, Secure Boot and Memory Integrity lights; **Requirements...** explains blocked activation. **Windows Security** opens Core isolation; **Windows / Test Mode...** manages next-start Test Mode with confirmation and manual restart. Staged package with stage/remove, codec host service controls and installed plugins. |
@@ -234,6 +234,72 @@ the local gain path is used when receiver-volume integration is unavailable.
 * Build: stale catalogs were embedded around a rebuilt unsigned driver; `install.ps1`
   assigned to the read-only `$host` and skipped `freeaptx.dll`; non-ASCII checkout paths
   broke the installer resource script; a missing plugin submodule aborted the package.
+
+### Control panel 0.1.0.35: latency profiles and best-quality presets
+
+- **Transport** has a **Listening profile** selector: Music (150 / 450 ms, rides out
+  interference without lowering quality), Balanced (60 / 250 ms, the default), Low latency
+  (30 / 120 ms, video and games) and Custom. Choosing a profile sets both buffer values;
+  editing a value or moving a slider selects the matching profile or Custom. The maximum
+  slider runs 40..500 ms, the driver's limit (it showed 1000), and the panel clamps to it.
+- Presets match the new driver defaults (driver 0.1.0.22: LDAC HQ, AAC up to 320 kbps CBR,
+  SBC at the receiver's maximum). **Best quality** keeps the receiver's maximum SBC bitpool
+  (it forced 53) and uses Music buffering (it used 80 / 300 ms). **Balanced (driver
+  defaults)** is now named **Driver defaults (best quality, balanced buffering)**; the preset
+  list is wider so the name fits. **Low latency** uses the Low latency profile.
+- Exported settings name the profile (`latency.profile=music`); `latency=` and
+  `maxlatency=` are written only for Custom. `pna2dpctl set` accepts `latency.profile=` and
+  `preset=best|defaults|lowlatency|compat|sbcxq`, and `pna2dpctl config` prints the profile.
+  `preset=balanced` and `preset=low` are refused with a hint: they are latency profile words,
+  and a preset replaces the whole configuration (codec order, SBC XQ / dual channel, auto
+  start); use `latency.profile=` for buffering only (0.1.0.22 review #5).
+- Existing devices keep their saved settings; Auto quality + codecs or a preset moves them
+  to the new defaults. See [maximum audio quality](20-max-audio-quality.md).
+- With driver 0.1.0.22 converting the sample rate, **Status** has a **Windows rate** row
+  under **Format** ("48000 Hz, converted to 44100 Hz", or "44100 Hz, no conversion") and the
+  flag **rate converted** (**rate converted (2:1)** for the 2:1 stage alone).
+  `pna2dpctl status` puts the Windows rate on its format line ("44100 Hz (Windows 48000 Hz,
+  converted), 2 ch, 32-bit in"), and the diagnostic export adds the Windows rate and the
+  status flags.
+- The first 0.1.0.36 build showed that combined line on the panel too, and it did not fit
+  the value column: the end of the line was cut off (found by the owner on the MR5). The
+  Windows rate now has its own row, and the Connection values are wider, so every Status
+  value fits at the panel's minimum window size; `build/check-panel-text-fit.ps1` checks
+  this against a running panel. The Driver line shows the four-part version (0.1.0.23). The SBC page note no longer says the Windows rate restricts
+  the selection: a rate the receiver lacks is converted.
+
+The selector, the wider preset list and the status line were built and checked in code
+only; the panel was not run for this change during development. The selector and the
+preset list on a real display remain an open check
+([maximum audio quality](20-max-audio-quality.md#hardware-checks-still-to-do)).
+
+### Control panel 0.1.0.36 / driver 0.1.0.23: released as v0.1.0.36
+
+Application 0.1.0.35 and driver 0.1.0.22 were intermediate builds; everything above ships in
+[v0.1.0.36](releases/v0.1.0.36.md) together with these changes:
+
+- **Sink delay label.** **Status** shows the receiver's delay report whenever one arrives,
+  "N ms reported by the headset", and otherwise "not reported; a per-codec default is
+  assumed" (it showed "no delay reporting" and ignored a report sent without negotiation).
+  `pna2dpctl status` prints "sink reports N ms" with "(reported without delay-reporting
+  negotiation)" or "(not reported; a per-codec default is assumed)". Driver 0.1.0.23 uses
+  such a report in the end-to-end estimate; the EDIFIER MR5's went from 209 to about
+  401 ms.
+- **Defaults.** A newly seen device starts at the driver's best-quality defaults (LDAC HQ,
+  AAC up to 320 kbps CBR, SBC at the receiver's maximum, Balanced buffering). A device with
+  saved settings keeps them; **Auto quality + codecs**, **Best quality** or **Driver
+  defaults** moves it.
+- **Windows format.** With driver 0.1.0.23, Windows uses the format chosen in **Sound >
+  device > Properties > Advanced > Default Format** (earlier PN drivers made Windows'
+  shared-mode engine use the driver's first listed format, normally 48 kHz). An application picks up a new format only when it reopens its stream;
+  Chromium-based browsers keep theirs open while paused, so close and reopen them. A change
+  during playback is bridged by the converter, and the **Windows rate** row on **Status**
+  then shows, for example, "48000 Hz, converted to 44100 Hz".
+- On hardware (EDIFIER MR5, driver 0.1.0.23): the converted format line, the delay report
+  and the **Music** profile applied while playing were observed; see
+  [maximum audio quality](20-max-audio-quality.md#hardware-results-14-october-2026). The
+  profile was applied and the status read with `pna2dpctl`, so this does not count as a
+  check of the Transport selector or the preset list.
 
 ### Control panels 0.1.0.31-0.1.0.34: Connect and Disconnect, tab order, SBC XQ
 

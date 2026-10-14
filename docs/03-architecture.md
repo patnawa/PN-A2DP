@@ -58,23 +58,38 @@ and `02-windows-bluetooth-audio-internals.md`.
 2. The pump thread (priority 18) wakes when a PCM write completes an encoder block, on
    write completions and on codec-host work, with a 4 ms safety tick. It converts the
    ring data to the encoder's input format (S16/S24/S32/F32; software volume with a
-   ramp across one block; TPDF dither for 16-bit host input; exact 2:1 decimation when
-   the engine runs at twice the codec rate) and either encodes SBC in the kernel from
-   24-bit-precision input or ships blocks to the codec host.
+   ramp across one block; TPDF dither for 16-bit host input) and, when the engine rate
+   is not the codec rate, to the codec rate (since driver 0.1.0.22: a fixed-point
+   polyphase stage and / or a 2:1 FIR, 44.1 / 48 / 88.2 / 96 kHz to 44.1 / 48 kHz, Q28
+   coefficients, 64-bit accumulators, alias-free: at least 122 dB stopband from the lower of
+   the input and output Nyquist frequencies; see `20-max-audio-quality.md`), and either
+   encodes SBC in the kernel from
+   24-bit-precision input or ships blocks to the codec host. Each block takes exactly the
+   engine frames that make one encoder block (`PnPcmInputFramesFor`); the ring, trims and
+   `PcmFramesConsumed` stay in engine frames, RTP time in codec frames, and the
+   converter's delay (at most 199 engine frames, 2.07 ms) is part of the reported latency.
 3. Encoded frames are wrapped per codec (RTP header + 1-byte frame header for SBC and
    LDAC, RTP only for AAC and aptX HD, bare for aptX and aptX LL) and written to the
    L2CAP media channel with a bounded number of writes in flight.
 4. A latency guard trims the ring when it exceeds `MaxLatencyMs` (at most 500 ms;
-   the trim crossfades over 4 ms). The ABR controller watches each write's own send
+   the trim crossfades over 4 ms; a further trim before that crossfade has started keeps
+   it, since 0.1.0.22). The ABR controller watches each write's own send
    time, TX-queue-full events, failures and backlog, lowers the bitrate ladder
    (SBC bitpool, LDAC EQMID, AAC bitrate) after congestion caused by the link and raises
    it again after 30 seconds of continuously healthy traffic. Idle time does not count.
-   SBC bitpool and LDAC EQMID changes are in band and need no AVDTP signalling. See
-   `10-adapter-quality.md`.
+   SBC bitpool and LDAC EQMID changes are in band and need no AVDTP signalling. The
+   target / maximum pair is a latency profile (driver 0.1.0.22, `config_policy.h`): Music
+   150 / 450 ms, Balanced 60 / 250 ms (default), Low latency 30 / 120 ms. Above a 60 ms
+   target the ABR lets the ring absorb a hiccup: slow writes count only once the backlog
+   passes target - 60 ms, and a backlog the link is draining is not congestion. The ring
+   is drained at once while the link keeps up, so the steady-state delay is the same for
+   every profile. See `10-adapter-quality.md` and `20-max-audio-quality.md`.
 5. Latency reaches Windows through the presentation position: PCM in the ring, at the
    codec host, in queued results and in L2CAP writes, plus one write's measured send
    time, plus the sink delay (the AVDTP delay report, or a per-codec default when the
-   receiver does not report). The position changes smoothly (at most 1 % of real time),
+   receiver does not report; since driver 0.1.0.23 a report is used even when delay
+   reporting was not negotiated, as the EDIFIER MR5 sends one on its LDAC stream without
+   offering the capability). The position changes smoothly (at most 1 % of real time),
    never goes backwards within a run and resets at a stream start or stop. `GetHWLatency`
    reports zero: this software endpoint has no DMA FIFO, and a non-zero value made
    Windows' format probes fail.
@@ -96,6 +111,7 @@ want:
    signalling up?   -> AvdtpConnectSignalling (+ best-effort SDP for the AVDTP version)
    capabilities?    -> DISCOVER + GET_(ALL_)CAPABILITIES, cache, publish to user mode
    rate mismatch?   -> SUSPEND / RECONFIGURE to the engine's rate when the sink allows it
+                       (not for a stream that has played and the converter bridges)
    idle?            -> choose codec (priority list x enabled x encoder available x sink SEP)
                        SET_CONFIGURATION (+ delay reporting), OPEN, connect media channel
    open?            -> start pump, START
@@ -131,8 +147,32 @@ work requests). SEPs the sink reports in use are tried last, and a (codec, SEID)
 the sink refused is skipped for the rest of the session. `A2dpSelectConfig` intersects
 the sink capabilities with user preferences and the engine's current sample rate and
 bit depth, preferring the engine rate so that no resampling is needed, and 24-bit input
-for LDAC and aptX HD. A 96 or 88.2 kHz engine may use a sink at exactly half that rate
-through the pump's 2:1 decimator; no other rate conversion exists.
+for LDAC and aptX HD. Since driver 0.1.0.22 the engine rate no longer decides the codec:
+when the sink lacks it, the stream takes 44.1 or 48 kHz (the engine rate's own family
+first, exactly half of 96 / 88.2 kHz first of all) and the pump converts
+(`PnStreamRateFor`, `PN_RATECONV_ANY`); LDAC's automatic input is then 32-bit. A Windows format change the converter can bridge keeps a stream that has already played
+(no AVDTP RECONFIGURE, `PnStreamBridged`), except a hi-res engine rate above 48 kHz the
+sink takes natively. A stream that has carried no audio since it was configured (the
+receiver's own SET_CONFIGURATION, or ours made with no audio open) goes to the engine rate
+before its first START, since a RECONFIGURE then interrupts nothing; a RECONFIGURE needed
+anyway (a channel-mode preference) also targets the engine rate (0.1.0.22 review). 32
+and 16 kHz engine rates, 176.4 / 192 kHz and conversion up to 88.2 / 96 kHz are not
+bridged.
+
+**The engine format is the user's choice.** Format negotiation with Windows no longer
+steers the engine rate. Until driver 0.1.0.23 the wave filter answered
+`KSPROPERTY_PIN_PROPOSEDATAFORMAT2` with the first entry of its format table (48 kHz);
+Windows uses a driver's answer to that property as the engine format and ignores the
+user's Default Format, so every PN endpoint's shared-mode engine ran at that first entry
+(48 kHz unless the active stream rate was 96 / 88.2 / 32 / 16 kHz). The property is no longer
+supported (`KSPROPERTY_PIN_PROPOSEDATAFORMAT`, the format check, remains), so Windows
+opens the format selected in **Sound > device > Properties > Advanced > Default Format**.
+The codec choice above then follows that rate: natively when the sink has it, through the
+converter otherwise. A receiver's own SET_CONFIGURATION at another rate is still
+reconfigured to the engine rate before the first START (for example the Sony's 44.1 kHz
+offer under a 48 kHz engine ends at 48 kHz dual channel, bitpool 53); a format change after
+the stream has played is bridged by the converter instead of renegotiating Bluetooth. An
+application sees a new format only when it reopens its stream.
 
 ## 5. User-mode interface
 
@@ -165,10 +205,10 @@ need LocalSystem.
 
 * Sink role (PC as a Bluetooth speaker) through the `{0000110a-...}` PDO and a capture
   pin; the SBC decoder already exists in `common/sbc`.
-* General kernel resampler for sinks that cannot run at the engine's rate. Today the
-  format table offers 16-bit 48/44.1 kHz always and other rates only when an enabled
-  sink codec supports them; exact 2:1 decimation (96 -> 48, 88.2 -> 44.1 kHz) is the only
-  conversion.
+* Sample-rate conversion beyond the 44.1 / 48 kHz outputs (to 88.2 / 96 kHz, from 32 or
+  16 kHz, from 176.4 / 192 kHz). The converter (driver 0.1.0.22 onwards) covers every Windows
+  rate the render pin offers by default (48 and 44.1 kHz) and the hi-res rates up to
+  96 kHz; the format table is unchanged.
 * FastStream / aptX LL bidirectional back-channel.
 * HLK test pass and attestation-signed releases.
 

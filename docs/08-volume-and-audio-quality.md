@@ -48,7 +48,8 @@ report transport waits, packet drops and late WaveRT timer callbacks.
 LDAC ABR reductions are relative to the configured quality ceiling. A configured SQ
 or MQ stream can no longer rise to higher quality in response to congestion. Its
 per-codec ABR switch is honored. Automatic selection starts at HQ and backs off when
-necessary; AAC targets up to 320 kbps while respecting a lower receiver limit.
+necessary; AAC targets up to 320 kbps while respecting a lower receiver limit. Since
+driver 0.1.0.22 these are also the defaults of a newly seen device (see below).
 Driver 0.1.0.19 also caps AAC so every access unit fits one media packet (about
 300 kbps at 44.1 kHz with an MTU of 895); see below.
 
@@ -56,8 +57,8 @@ Driver 0.1.0.19 also caps AAC so every access unit fits one media packet (about
 AAC/aptX plugin vectors for FFmpeg. The plugin matrix covers LDAC encoding at all
 supported input formats, quality levels and sample rates. Independent LDAC decoding
 remains unverified. LDAC SQ and HQ have played on one physical receiver (EDIFIER MR5,
-driver 0.1.0.20; see [testing](06-testing-plan.md)); AAC and aptX-family receivers
-remain untested.
+driver 0.1.0.20; LDAC at 44.1 kHz native and bridged from 48 kHz on driver 0.1.0.23; see
+[testing](06-testing-plan.md)); AAC and aptX-family receivers remain untested.
 
 ## Driver 0.1.0.19 and 0.1.0.20: ramps, crossfades, dither and 24-bit SBC input
 
@@ -88,7 +89,7 @@ receiver. See [driver review fixes](18-driver-review-fixes.md).
   unfaded first; the engine's end of stream ends the sound the same way. A stream start
   fades in only when the audio it discards ended in a signal (an outage), not after the
   engine's silence while the receiver kept the stream suspended.
-- **Headroom.** Float input over full scale, a crossfade and the 2:1 decimator's
+- **Headroom.** Float input over full scale, a crossfade and the rate converter's
   overshoot are carried in 64 bits until the volume has been applied and saturated once:
   at reduced volume, overs no longer clip, also inside a fade. A NaN or infinite float
   sample repeats the channel's last finite sample; a run of them fades to silence over 32
@@ -110,8 +111,9 @@ receiver. See [driver review fixes](18-driver-review-fixes.md).
   instead of rounding away.
 - **2:1 decimation.** A 96 or 88.2 kHz Windows format can feed a receiver at 48 or
   44.1 kHz through a fixed-point half-band filter (passband ripple 0.0009 dB to
-  0.45 fs_out, stopband at least -80 dB from 0.55 fs_out). No other rate conversion
-  exists.
+  0.45 fs_out, stopband at least -80 dB from 0.55 fs_out). Since driver 0.1.0.22 this is
+  part of the sample-rate converter, with alias-free 2:1 FIRs instead of the half-band (see
+  below).
 - **Silence for unwritten packets.** If the Windows engine has not written a packet by the
   time it plays, the driver sends silence rather than stale buffer contents and counts it
   as a starved packet ([audio diagnostics](14-audio-diagnostics.md)).
@@ -156,3 +158,81 @@ Known limits, deliberately unchanged:
 - **aptX high-frequency overload** (for example 19 + 20 kHz at -1 dBFS) is inherent to
   the codec; FFmpeg's own aptX encoder gives the same result.
 - The dual-channel SBC ABR floor is described in [automatic adapter quality](10-adapter-quality.md).
+
+## Driver 0.1.0.22: best-quality defaults, latency profiles and repeated trims
+
+- **Defaults.** A device without a saved configuration starts each codec at its best
+  level, with ABR as the safety net: LDAC HQ (990 / 909 kbps; was SQ), AAC at the sink's
+  maximum up to 320 kbps CBR (was the sink maximum with VBR allowed), SBC at the
+  receiver's maximum bitpool, aptX HD before aptX (both unchanged). The SBC channel-mode default is
+  unchanged: dual channel would reach the distorted dual-channel ABR floor (#31). Saved
+  settings are never replaced by the defaults; before, a stored configuration the driver
+  could not read was overwritten at the next start.
+- **Latency profiles.** Music (150 / 450 ms), Balanced (60 / 250 ms, default) and Low
+  latency (30 / 120 ms). Music keeps a hiccup's backlog instead of trimming it and lets the
+  ABR treat a draining backlog as healthy, so a short radio stall no longer costs a trim and
+  an LDAC HQ to SQ step. The steady-state delay is the same for every profile; only the
+  delay after a hiccup grows, which players that use the presentation position absorb.
+- **Repeated trims in one stall.** A stall long enough to trim twice (Low latency after
+  about 90 ms, Balanced after about 440 ms) replaced the first trim's crossfade source
+  before it had played, and the splice stepped (-10.5 dB re tone on SBC in the quality
+  harness). A crossfade that has not started now keeps its source.
+- **Sample-rate converter.** The pump converts any Windows rate of 44.1, 48, 88.2 or
+  96 kHz to a 44.1 or 48 kHz stream in fixed point (Q28 Kaiser-windowed linear-phase
+  filters, 64-bit accumulators, one rounding at the end) with an **alias-free band plan**:
+  passband 0..20 kHz flat within 0.000012 dB per stage (0.000021 dB through a cascade),
+  stopband from the lower of the input and output Nyquist frequencies (22.05 kHz whenever
+  44.1 kHz is involved, 24 kHz for 96 and 88.2 to 48 kHz) at least 122.0 dB down, so no alias
+  or image of any input frequency comes out above -122 dB (the 2:1 stages are 195- and
+  347-tap FIRs, since a half-band filter is -6 dB at the output's Nyquist frequency; 88.2 to
+  48 and 96 to 44.1 kHz first convert into 96 / 88.2 kHz with a short polyphase stage, 150 dB
+  design, then use that rate's 2:1 FIR). THD+N of a 997 Hz -1 dBFS tone -140.4 dB from 24-bit
+  input (the input's own dither is -140.5 dB) and -148.9 dB from float, latency at most
+  2.07 ms (96 to 44.1 kHz; reported to players), CPU at most about 4.9 ms per second of
+  stereo audio (96 to 44.1 kHz), measured on exactly the scalar code the driver runs (the
+  multiply loops carry no vector-ISA dispatch, and the build refuses a driver image that
+  has any). The codec now follows the priority list rather than the Windows rate (an
+  aptX HD or LDAC receiver at 48 kHz only is used from a 44.1 kHz engine instead of falling
+  back to SBC), and a Windows change between 44.1 and 48 kHz keeps a stream that has played instead of
+  renegotiating it; a stream that has not played yet goes to the Windows rate first. Every path at the engine's own rate is bit-identical to 0.1.0.21.
+  The 2:1 half-band (103 taps, 80 dB from 0.55 fs_out) was replaced by the alias-free FIRs:
+  24-bit 96 to 48 kHz SNR against the ideal 99.6 to 141.1 dB.
+- **Converted streams round to 24 bits** (aptX HD input) and take LDAC's 32-bit input;
+  native streams keep their exact 0.1.0.21 output. A stream that starts mid-programme on a
+  converted path fades in before the filters, so the filters' delay cannot turn the fade
+  into a step (found with aptX HD in the quality harness).
+- **A pause on a converted stream** pads enough silence for the converter's delay and a
+  short block on top of the codec's own flush, so the end of the fade-out leaves the
+  converter and the encoder (SBC needs 73 more codec frames, aptX 90, AAC 1600) before the
+  stream goes idle; with one SBC frame per packet the last ~0.7 ms of the fade used to stay
+  in the encoder and play after the resume.
+
+Details, simulations and verification: [maximum audio quality](20-max-audio-quality.md).
+
+## Driver 0.1.0.23: the Windows format and the real headset delay
+
+Driver 0.1.0.22 was an intermediate build; everything in the previous section ships in
+driver 0.1.0.23 (v0.1.0.36), which adds two fixes found on the EDIFIER MR5:
+
+- **The Windows Default Format is honoured.** Every earlier PN driver proposed its first
+  listed format (normally 48 kHz) to Windows, and Windows' shared-mode engine used that
+  instead of the format chosen under
+  **Sound > device > Properties > Advanced > Default Format**, so a 44.1 kHz source was
+  resampled by Windows and sent at 48 kHz. Now Windows opens the chosen format, and the
+  stream runs at that rate natively when the receiver supports it (the MR5: LDAC at
+  44.1 kHz, 909 kbps) and through the converter otherwise. A format change reaches an
+  application when it reopens its stream; Chromium-based browsers keep theirs open while
+  paused. A change during playback keeps the Bluetooth stream and is bridged: on the MR5,
+  switching Windows to 24-bit, 48000 Hz while LDAC played at 44.1 kHz gave
+  "44100 Hz (Windows 48000 Hz, converted)", no reconnect, and the owner heard no crackle.
+- **Delay reports are used without negotiation.** The end-to-end latency, which players
+  use for A/V sync through the presentation position, now includes the receiver's own
+  delay report even when delay reporting was not negotiated. The MR5 reports about
+  364..396 ms on its LDAC stream without offering the capability; its estimate went from
+  209 ms (the 200 ms LDAC default) to about 401 ms.
+
+The MR5 session on driver 0.1.0.23 (including the **Music** profile applied while playing)
+had 0 drops, write failures, latency trims and ring overflows. Not tested on hardware: SBC,
+AAC and aptX through the converter, 88.2 / 96 kHz Windows formats, the 48 to 44.1 kHz
+switch during playback, pause and resume on a converted stream, interference sessions with
+any profile and the Low latency profile. See [hardware results](20-max-audio-quality.md#hardware-results-14-october-2026).

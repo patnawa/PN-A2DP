@@ -1,5 +1,133 @@
 # Testing and verification
 
+## Release v0.1.0.36, application 0.1.0.36 / driver 0.1.0.23 (2026-10-14)
+
+Full record: [maximum audio quality](20-max-audio-quality.md); release notes:
+[v0.1.0.36](releases/v0.1.0.36.md). The section below (application 0.1.0.35 / driver
+0.1.0.22, intermediate builds, never published) holds the software record of the round.
+
+**Software.** `core_test` **58,106** checks, 0 failures (lane T6 now checks that a delay
+report is used without negotiation); quality harness **1,252** jobs and 24 FFmpeg
+baselines (1,276 in all), including 81 alias-free transition jobs; **0** defect flags, 0
+global flags (known issue #31 within its bounds); all **905** native-rate jobs bit-identical to the
+0.1.0.21 baseline. Final release run: `verify.ps1 -Sign -Sanitize -Interop` (see the
+release record).
+
+**Hardware** (Windows 11 build 26300, Qualcomm FastConnect 7800, EDIFIER MR5):
+
+| Action | Driver | Observed result |
+|---|---|---|
+| LDAC HQ at a 48 kHz Windows format | 0.1.0.22 | 990 kbps, native, 0 drops |
+| Default Format set to 44.1 kHz | 0.1.0.22 | **Defect:** no effect, Windows' engine stayed at 48 kHz (the driver answered `KSPROPERTY_PIN_PROPOSEDATAFORMAT2` with 48 kHz). Fixed in 0.1.0.23 |
+| Latency estimate | 0.1.0.22 | **Defect:** 209 ms with the 200 ms LDAC default, although the MR5 sends delay reports (its LDAC SEP lacks the delay-reporting capability). Fixed in 0.1.0.23 |
+| Install of 0.1.0.23 over 0.1.0.22 with audio stopped | 0.1.0.23 | No reboot needed |
+| Default Format 44.1 kHz | 0.1.0.23 | Engine opened at 44.1 kHz; LDAC negotiated at 44.1 kHz natively, 909 kbps; a 12-second WASAPI test stream drained fully |
+| Music playback | 0.1.0.23 | Delay report of 396 ms used; end-to-end estimate about 401 ms |
+| Default Format switched to 24-bit, 48000 Hz during playback | 0.1.0.23 | LDAC stayed at 44.1 kHz, the converter bridged 48 to 44.1 kHz, status "44100 Hz (Windows 48000 Hz, converted)", no reconnect; owner heard no crackle |
+| Music profile applied during playback | 0.1.0.23 | Applied live without interruption |
+| Whole session | 0.1.0.23 | 0 drops, 0 write failures, 0 latency trims, 0 ring overflows |
+
+Note for testers: Chromium-based browsers (for example Brave) keep their audio stream
+open while paused, so a Default Format change reaches them only after they reopen it.
+
+Not covered: the Sony CMT-SBT40D on 0.1.0.22 / 0.1.0.23 (switched off); SBC, AAC and aptX
+through the converter; 96 / 88.2 kHz Windows formats; the 48 to 44.1 kHz switch during
+playback; pause and resume on a converted stream; the auto-start case (a reconnect
+configured at LDAC 48 kHz before a first 44.1 kHz playback must reconfigure); a 2.4 GHz
+interference session with any profile; the Low latency profile on a receiver; the
+new-device defaults on a freshly paired receiver; the Transport tab's selector and preset
+list on a real display; an upgrade from v0.1.0.34 (driver 0.1.0.21); long sessions;
+sleep/wake; Driver Verifier and HLK; Secure Boot or Memory Integrity (HVCI) on.
+
+## Maximum audio quality, application 0.1.0.35 / driver 0.1.0.22 (2026-10-13)
+
+Full record: [maximum audio quality](20-max-audio-quality.md): best-quality defaults (#2),
+latency profiles (#5) and the sample-rate converter (#1).
+
+**Software only; nothing installed and no receiver used.**
+
+- **Second review (2026-10-14)**, see [maximum audio quality](20-max-audio-quality.md#second-review-14-october-2026-pause-drain-and-kernel-cpu):
+  a pause on a converted stream pads the converter's delay and a short block on top of the
+  codec's flush (the end of the fade could stay in the SBC encoder with one frame per
+  packet); the cascades run their polyphase stage first (88.2 -> 96 -> 48 and 96 -> 88.2 ->
+  44.1 kHz) and the multiply loops are scalar by construction, so the worst conversion costs
+  4.90 ms per second of stereo audio in the code the driver runs (10.5 ms before); the build
+  rejects a driver with vector-ISA dispatch. Red first: the exhaustive pause-drain model
+  failed (474,299 cases short of the converter, 988,932 of the codec's delay), 10 of 32 new
+  harness pause jobs flagged, and the dispatch check failed on `pcm.obj`, then `sbc.obj`.
+  After: `core_test` 58,105 checks, 0 failures; every unit test and interop script passes;
+  quality harness 1252 jobs and 24 FFmpeg baselines, 0 defect flags, 905 native-rate jobs
+  bit-identical; every target builds with no warnings, `/analyze` 23 (baseline 23);
+  `gen-resampler-coeffs.py --check` current (version 4).
+
+- **Alias-free band plan (2026-10-14)**, see [maximum audio quality](20-max-audio-quality.md#alias-free-band-plan-14-october-2026):
+  the owner's specification (no alias or image above -110 dB, stopband from the lower
+  Nyquist frequency) replaced the converter's tables: 2:1 FIRs of 195 / 347 taps instead of
+  the half-band, 173 / 188 taps per polyphase phase. Red first: the new transition probes
+  failed 84 `core_test` checks and flagged 65 of 81 harness transition jobs against the old
+  tables. After: `core_test` 57,884 checks, 0 failures (stopband 122.0..122.9 dB on the
+  whole band by FFT, transition probes -124.1 dB or lower); `sbc_test`, `plugin_test`,
+  `pnctl_test`, `secure_path_test` 24, `health_test` 73, `service_failure_test` 21,
+  `process_wait_test` 13, `boot_mode_test` 40 pass; interop 19 / 0 and 28 / 0; quality
+  harness 1220 jobs and 24 FFmpeg baselines, 0 defect flags, 905 native-rate jobs
+  bit-identical; every target builds with no warnings, `/analyze` 23 (baseline 23);
+  `gen-resampler-coeffs.py --check` current.
+
+- **Review fixes (2026-10-14)**, see [maximum audio quality](20-max-audio-quality.md#review-fixes-14-october-2026):
+  a rate is bridged only for a stream that has played, so a receiver's own configuration
+  and an auto-start configuration go to the Windows rate (the Sony's 44.1 kHz offer under
+  48 kHz: 48 kHz dual channel, 672 kbps); transition-band probes; `preset=balanced` /
+  `preset=low` refused. Red first: 12 `core_test` checks and 1 `pnctl_test` check. After:
+  `core_test` 57,607 checks, 0 failures; quality harness 1147 jobs, 0 defect flags, 905
+  native-rate jobs bit-identical; every other test, interop script and build as below.
+
+- **Baselines first** (before any converter code): `core_test`'s native conversion golden
+  (FNV-1a 64 over 200 native combinations of input format, target, channels, gain, ramps,
+  crossfade, fade-in, silence and block sizes) was recorded from the 0.1.0.21 `pcm.cpp`, and
+  the quality harness recorded a hash of every conversion output block and every packet of
+  all 959 jobs (`--hashes-out`, `tools/audio-test/native-baseline-0.1.0.21.json`; RTP
+  sequence numbers and timestamps relative to the stream's first, since `RtpInit` draws
+  them at random). A second run matched all 905 native-rate jobs.
+- **Red first:** the plan restricted to equal and 2:1 rates failed 28 of the new rate
+  converter checks before the run stopped on empty output; the policy with `PN_RATECONV_ANY` reduced to the 0.1.0.21 rules failed
+  15; `pnctl_test` did not compile without `StreamFormatText`; the input-side fade-in
+  check failed 12 times against an output ramp; and the pause-drain simulation shows 48
+  cases where 0.1.0.21's single extra block leaves rendered audio in the converter. Also red
+  before green for #2 / #5: `pnctl_test` failed 6 checks against the 0.1.0.34 tools,
+  `core_test` did not compile against the 0.1.0.21 ABR policy, and the Low latency harness
+  jobs flagged a pre-existing click when one stall trims twice.
+- After the changes: `core_test` **57,577** checks, 0 failures, including the native
+  golden unchanged (`48aab6e64ad2c171`) and lane R: the tables (exact phase sums, overflow
+  bound, regeneration from the design within 1.5 LSB, ripple 0.000018 dB, stopband 119.0 /
+  119.7 dB, half-band 121.1 dB), the plan, exact framing for 10,000 block sizes per pair,
+  a double-precision model of the definition (within 0.5 LSB of S32, 1.23 in the cascades),
+  saturation of a +-4.0 worst case, THD+N (-139.9 dB from 24-bit, -145.9 dB from float),
+  tones 100 Hz..20 kHz within 0.00001 dB, alias / image rejection 128.8 dB, the group delay
+  to 0.01 frame, bit-identical output for every random block split tested, the state rules ported from the
+  half-band tests, the pause drain and the CPU cost (0.13..0.25 % of one core). Lane T
+  checks the stream rate, the codec choice and the bridge rule, and that NONE / HALF still
+  decide as 0.1.0.21 over 20,000 random inputs.
+- `pnctl_test`, `sbc_test`, `plugin_test`, `health_test`, `secure_path_test`,
+  `service_failure_test`, `process_wait_test`, `boot_mode_test` pass; `test-interop.py`
+  19 / 0, `test-plugin-interop.py` 28 / 0.
+- Quality harness **1139** jobs (+24 FFmpeg baselines), **0** defect flags (known issue #31
+  within its bounds); **905 native-rate jobs bit-identical** to the 0.1.0.21 baseline, and
+  they and the 24 FFmpeg baselines report metrics identical to the run before the change. The new group
+  "rate" (13 configurations, the polyphase stage alone and after the half-band, kernel SBC,
+  AAC, aptX HD, LDAC) checks the converter's output against the analytic signal, THD+N,
+  level, alias / image rejection, 1 ms windows, digital silence and rate accounting;
+  fault and pause-race jobs run through the converter too.
+- All targets build with no warnings: driver Release (`/WX`, InfVerif, ApiValidator) and
+  Debug, `/analyze` at its baseline of 23, host, plugins, plugin tests, tests, CLI, panel,
+  quality harness. `build/verify.ps1` was not run.
+
+Hardware still to do: a new pairing of the EDIFIER MR5 (or the Driver defaults preset)
+starting at LDAC HQ; LDAC HQ at 44.1 and at 48 kHz Windows formats (native, no conversion),
+then a Windows rate change while playing (bridged, no renegotiation); the Sony SBC 48 kHz path unchanged; Music against Balanced in a 2.4 GHz
+interference session. (LDAC HQ at both Windows formats and the 44.1 to 48 kHz change while
+playing were done on 14 October; see the v0.1.0.36 section above. The other items remain
+open.)
+
 ## Review fixes, application 0.1.0.34 / driver 0.1.0.21 (2026-10-13)
 
 Full record: [driver review fixes](18-driver-review-fixes.md).
@@ -409,7 +537,10 @@ package is backed up under `out/verification/previous-driver` on this machine.
    and real SEPs reported by pna2dpctl caps.
 3. Play through PN-A2DP; verify audible output and increasing packet/frame counters.
    Exercise pause/resume, volume/mute and supported shared/exclusive formats. The driver
-   has no resampler: the selected codec/sink must support the engine's sample rate.
+   converts 44.1 / 48 / 88.2 / 96 kHz Windows formats to a 44.1 / 48 kHz codec rate; check
+   the panel's **Windows rate** row ("48000 Hz, converted to 44100 Hz") or the
+   `pna2dpctl status` format line ("(Windows N Hz, converted)") and exercise both native and
+   converted formats.
 4. Exercise live SBC bitpool/ABR and each codec supported by an actual receiver. An encoder
    ABI test does not establish A2DP interoperability or aptX LL latency.
 5. Stop/crash/restart the codec host during playback; verify SBC fallback and recovery.

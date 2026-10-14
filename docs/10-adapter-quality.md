@@ -13,7 +13,12 @@ and adapter policy. This preserves volume, buffering and the configured bitrate 
   Each radio query has a two-second timeout. Failed queries remain unknown.
 - Intersects receiver codec capabilities with available encoders and the Windows
   audio stream's sample rate. A codec's presence in the program does not mean the
-  receiver supports it.
+  receiver supports it. Since driver 0.1.0.22 the Windows rate is preferred but no longer
+  required: when the receiver lacks it, the codec runs at 44.1 or 48 kHz and the driver
+  converts the rate (44.1 / 48 / 88.2 / 96 kHz Windows formats), so the codec priority
+  decides, not the Windows format. Since driver 0.1.0.23 the Windows rate is the user's
+  **Default Format** choice in Sound settings; earlier PN drivers made Windows' shared-mode
+  engine use the driver's first listed format (normally 48 kHz) whatever was chosen.
 - Starts at the configured quality ceiling on EDR-capable or unknown radios.
   The automatic button selects LDAC HQ, AAC-LC up to 320 kbps, and the receiver's
   SBC limit without forcing an unsupported bitpool. A confirmed Basic Rate-only
@@ -43,7 +48,10 @@ The adapter checkbox enables this policy while keeping manually chosen codec
 ceilings. Disabling the checkbox keeps those ceilings and permits manual ABR
 control. Disabling ABR in the panel also disables automatic adapter policy.
 Existing saved configurations retain their choice until automatic mode is enabled;
-new device defaults enable it. `pna2dpctl set autoquality=1` enables policy without
+new device defaults enable it. Since driver 0.1.0.22 the defaults start every codec at
+its best level (LDAC HQ, AAC up to 320 kbps CBR, SBC at the receiver's maximum bitpool),
+with ABR as the safety net, and a device's saved settings are never replaced by the
+defaults ([maximum audio quality](20-max-audio-quality.md)). `pna2dpctl set autoquality=1` enables policy without
 resetting codec settings. To turn off adaptation explicitly, set both
 `autoquality=0 abr=0`; `abrfloor=128000` specifies the floor in bits per second.
 
@@ -53,7 +61,13 @@ and stay at 357 kbps despite a saved dual-channel preference; a PN-initiated
 connection with the same settings reached 672 kbps. Before playback, the driver
 now selects from the receiver's advertised capabilities at the Windows stream's
 rate and applies the existing adapter limit. Stream reconfiguration compares rate
-and SBC channel mode, leaving automatic in-band bitrate reductions alone.
+and SBC channel mode, leaving automatic in-band bitrate reductions alone. Since driver 0.1.0.22 a stream that has already played is not
+reconfigured when Windows changes to a rate the converter bridges. A receiver's own
+configuration is still moved to the Windows rate before playback, with the saved channel
+mode: the Sony's 44.1 kHz joint-stereo offer under a 48 kHz Windows format becomes 48 kHz
+dual channel, bitpool 53, 672 kbps, as with 0.1.0.21. (The first 0.1.0.22 build kept the
+receiver's 44.1 kHz, reconfigured it to dual channel at 44.1 kHz, 617 kbps, and converted;
+the review fixed this.)
 
 ## Driver 0.1.0.19 changes (software-verified only)
 
@@ -152,6 +166,47 @@ audio-quality harness records it (THD+N -48.4 dB at -6 dBFS, pink-noise SNR 8.4 
 burst +15.6 dB) and fails if it measures worse. Joint stereo at the same rate measures
 -62.6 dB THD+N.
 
+## Driver 0.1.0.22: latency profiles scale the congestion rules
+
+The buffer settings are offered as latency profiles: **Music** 150 / 450 ms,
+**Balanced** 60 / 250 ms (the default, unchanged) and **Low latency** 30 / 120 ms, or any
+custom pair (panel Transport tab, `pna2dpctl set latency.profile=music`). The steady-state
+delay is the same for all of them, because the ring is drained at once while the link keeps
+up; the profile decides how much backlog a hiccup may leave before the latency guard trims.
+
+A bigger buffer only helps if the ABR does not treat its backlog as congestion. Above a
+60 ms target, two rules change (Balanced and Low latency keep the 0.1.0.21 rules exactly):
+
+- a *slow* reason counts only while the TX queue was full and the backlog exceeded
+  target - 60 ms (90 ms for Music);
+- a window whose backlog shrank by at least 10 ms without a trim is *draining*: the link
+  has spare capacity again, so neither *backlog* nor *slow* counts.
+
+Failures, drops, the urgent rule for a trim, the 1-second confirmation, the 2-second
+spacing and recovery are unchanged. In the `core_test` link simulation (LDAC, a link with
+25 % spare capacity and a 300 ms stall every 8 seconds, 120 seconds), Balanced trims 14
+times and lowers the bitrate twice; Music never trims or lowers it, with a peak backlog
+of 310 ms. When the link falls to 0.8 times the HQ bitrate, Balanced lowers it after
+1.0 s and Music after 1.25 s, without a trim. These are simulations. On hardware (EDIFIER
+MR5, LDAC, driver 0.1.0.23) Music was applied while playing without interruption, and the
+session had no drops, write failures or latency trims; no interference session has been
+run with any profile, and Low latency has not been tried on a receiver. SBC packets stay
+sized for at most an 80 ms target, so Music does not make 50 ms packets. Details:
+[maximum audio quality](20-max-audio-quality.md).
+
+## Driver 0.1.0.23: converted streams and delay reports
+
+Driver 0.1.0.22 was an intermediate build; the profiles and the converter ship in driver
+0.1.0.23 (v0.1.0.36). The congestion rules see a converted stream like a native one: the
+ring, trims and backlog are counted in Windows (engine) frames, and the converter adds at
+most 2.07 ms of reported latency. A Windows format change during playback is bridged by
+the converter, so it no longer interrupts the stream with a renegotiation.
+
+The end-to-end latency estimate now uses the receiver's AVDTP delay report even when
+delay reporting was not negotiated (the EDIFIER MR5 reports about 364..396 ms on LDAC
+without offering the capability; its estimate went from 209 to about 401 ms). The
+estimate does not feed the ABR rules, which watch only the transport.
+
 ## Limits and interpretation
 
 Bluetooth version, manufacturer ID, LE features and PHY rate cannot establish
@@ -172,8 +227,8 @@ bounded queue, latency guard and encoder-failure fallback remain active.
 
 Automatic quality does not add codecs to the receiver, create lossless bandwidth,
 or guarantee uninterrupted playback under all conditions. On physical receivers here,
-only the Sony's SBC path and the EDIFIER MR5's LDAC path (SQ and HQ) have been
-exercised, without congestion. Other codecs have software negotiation, policy, encoder
+only the Sony's SBC path and the EDIFIER MR5's LDAC path (SQ and HQ, 44.1 and 48 kHz) have
+been exercised, without congestion. Other codecs have software negotiation, policy, encoder
 and decoder regression coverage.
 
 ## Implementation and verification

@@ -59,6 +59,30 @@ show an unavailable cause. Events survive observation interruptions for the same
 receiver; selecting another receiver clears them. This is an observation history,
 not a complete driver trace. The dialog is a snapshot; reopen it to refresh.
 
+A codec rate that differs from the Windows rate (driver 0.1.0.22 and later) is not a fault: the
+driver converts it with at most 2.07 ms of added latency (part of the reported latency)
+and no measurable loss (THD+N below -139 dB from 24-bit sources, no alias or image above
+-122 dB). The status shows both rates. It happens when the receiver lacks the Windows rate, or
+when Windows changed its rate after the stream had played; a stream that has not played
+yet is moved to the Windows rate before the sound starts (0.1.0.22 review). A conversion it cannot do (from 32 or 16 kHz, from 176.4 / 192 kHz, or up to
+88.2 / 96 kHz) still selects another codec or renegotiates, as before.
+
+The format line then names both rates, for example **"44100 Hz (Windows 48000 Hz,
+converted), 2 ch, 32-bit in"**: the receiver still runs at 44.1 kHz and the driver converts
+Windows' 48 kHz (seen on the EDIFIER MR5 with driver 0.1.0.23 after Windows was switched to
+48 kHz during playback). Since driver 0.1.0.23 the Windows rate is the format chosen under
+**Sound > device > Properties > Advanced > Default Format**; earlier PN drivers made Windows'
+shared-mode engine use the driver's first listed format (normally 48 kHz) whatever was chosen. If the Windows rate shown is not the one you chose, the
+playing application has not reopened its stream yet (Chromium-based browsers keep it open
+while paused): close and reopen it.
+
+With the Music latency profile (driver 0.1.0.22), a short stall can show a growing peak
+audio backlog (`pna2dpctl quality`) without a congestion reason or a bitrate change: the
+buffer absorbs it, and a backlog the link is draining is not counted. Trims
+(`pna2dpctl stats`, latency trims) and reductions then appear only when a stall outlasts
+the 450 ms maximum or the link stays slower than the stream. `pna2dpctl config` shows the
+active profile.
+
 After at least ten seconds of persistent trouble on aptX, aptX HD or aptX LL,
 **Use adaptive SBC** can become available. It requires current observations,
 receiver/encoder SBC support and no unsaved edits. Clicking it saves SBC first in
@@ -75,7 +99,9 @@ them 0.
 |---|---|---|
 | `PNA2DP_STATUS_FLAG_REMOTE_SUSPENDED` (0x200) | The receiver suspended the stream; the driver waits instead of restarting it at once | Status page flags: "suspended by receiver" |
 | `PNA2DP_STATUS_FLAG_UNREACHABLE` (0x400) | Link lost or media stalled without an answer; the driver is retrying | Status page flags: "receiver unreachable" |
-| `PNA2DP_STATUS_FLAG_HALF_RATE` (0x800) | The engine runs at twice the codec rate and the 2:1 decimator is active | Status page flags: "2:1 rate conversion" |
+| `PNA2DP_STATUS_FLAG_HALF_RATE` (0x800) | The engine runs at twice the codec rate and the 2:1 stage alone converts it | Status page flags: "rate converted (2:1)" ("2:1 rate conversion" from a 0.1.0.21 driver) |
+| `PNA2DP_STATUS_FLAG_RATE_CONVERTED` (0x1000, driver 0.1.0.22) | The stream runs through the sample-rate converter: the Windows rate differs from the codec rate | Status page flags: "rate converted"; Windows rate row "44100 Hz, converted to 48000 Hz"; `pna2dpctl status` format line "48000 Hz (Windows 44100 Hz, converted), ..." |
+| `PNA2DP_STATUS.EngineSampleRate` (driver 0.1.0.22, former reserved word) | The Windows audio engine's rate while a stream is open, else 0 | Status page format line, `pna2dpctl status`, diagnostic export ("Windows rate") |
 | `PNA2DP_STATS.WaveStarvedPackets` | Packets the Windows engine had not written in time; sent as faded silence | `pna2dpctl stats`: "starved packets" |
 | `PNA2DP_STATS.RingOverflowEvents` | PCM ring overruns: the oldest audio was discarded (events, not bytes) | `pna2dpctl stats`: "overflows" |
 | `PNA2DP_STATS.FragmentedPackets` | AAC access units that needed more than one RTP packet | `pna2dpctl stats`: "AAC fragmented sends" |
@@ -84,9 +110,18 @@ them 0.
 `PNA2DP_STATS.Underruns` keeps its historical name but counts latency-guard trims
 (shown as "latency trims"); WaveRT starvation is `WaveStarvedPackets`.
 
-`SinkReportedDelayUs` is the receiver's AVDTP delay report and is 0 when none was
-negotiated or received (driver 0.1.0.20 and later). `EstimatedLatencyUs` still adds a
-per-codec default sink delay when the receiver does not report one.
+`SinkReportedDelayUs` is the receiver's AVDTP delay report for the current stream and is
+0 when none was received. Drivers 0.1.0.20 to 0.1.0.22 also left it 0, and ignored the
+report, when delay reporting had not been negotiated; driver 0.1.0.23 uses a report
+whenever the receiver sends one (the EDIFIER MR5 sends about 364..396 ms on its LDAC stream
+without offering the capability). `EstimatedLatencyUs` adds the report, or a per-codec
+default sink delay when there is none.
+
+| Status page sink delay | `pna2dpctl status` | Meaning |
+|---|---|---|
+| "N ms reported by the headset" | "sink reports N ms" | The receiver reported its delay, with delay reporting negotiated |
+| "N ms reported by the headset" | "sink reports N ms (reported without delay-reporting negotiation)" | The receiver reported its delay although delay reporting was not negotiated; it is used (driver 0.1.0.23) |
+| "not reported; a per-codec default is assumed" | "sink reports 0.0 ms", plus "(not reported; a per-codec default is assumed)" when delay reporting was not negotiated | No report: the estimate uses the codec's default (SBC and aptX 150 ms, AAC and aptX HD 180 ms, LDAC 200 ms, aptX LL 60 ms) |
 
 In application 0.1.0.34 the driver state `PNA2DP_STATE_DISCOVERING` is shown as
 **Connected** in the panel, `pna2dpctl`, quality events and the diagnostic export. The

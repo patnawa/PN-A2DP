@@ -12,6 +12,16 @@ re-measured, and the Sony was not re-tested after 0.1.0.19. See
 [hardware results](#hardware-results-2026-10-13) and
 [remaining verification](#remaining-verification).
 
+The follow-up round, released as [v0.1.0.36](releases/v0.1.0.36.md) (driver 0.1.0.23 /
+application 0.1.0.36, after the unpublished intermediate builds 0.1.0.22 / 0.1.0.35), is
+recorded in [maximum audio quality](20-max-audio-quality.md): best-quality defaults,
+latency profiles, an alias-free sample-rate converter, a fix for repeated latency trims in
+one stall, and two fixes found on the EDIFIER MR5. Its converter replaces the 103-tap
+half-band described below. Driver 0.1.0.23 also changes two behaviours recorded here:
+Windows now uses the user's Default Format (the driver no longer answers
+`KSPROPERTY_PIN_PROPOSEDATAFORMAT2`), and `SinkReportedDelayUs` carries a delay report
+even when delay reporting was not negotiated.
+
 ## Summary
 
 - A full review of the driver, codec host and build produced about 40 findings:

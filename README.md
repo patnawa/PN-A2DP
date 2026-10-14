@@ -7,7 +7,7 @@
 A Windows Bluetooth audio control panel with automatic codec selection,
 adaptive quality, and diagnostics you can understand.
 
-**Windows 10 / 11 · x64 · Control panel v0.1.0.34 · MIT project license**
+**Windows 10 / 11 · x64 · Control panel v0.1.0.36 · MIT project license**
 
 [Get started](#get-started) · [Choose a mode](#choose-a-mode) · [Codec support](#codec-support) · [Documentation](#documentation)
 
@@ -29,7 +29,16 @@ The dashboard reports observed transport health; it does not measure acoustic qu
   available encoders, and choose automatically or set your own priorities.
 - **Start high and adapt.** Automatic quality respects the receiver's limits and
   your configured ceilings, reducing supported variable bitrates during sustained
-  congestion and recovering after healthy traffic.
+  congestion and recovering after healthy traffic. New devices start every codec at
+  its best level (LDAC HQ, AAC up to 320 kbps, SBC at the receiver's maximum).
+- **Pick a listening profile.** Music buffers more so radio hiccups do not lower the
+  quality, Balanced is the default, and Low latency suits video and games.
+- **Any Windows rate, best codec.** A fixed-point, alias-free sample-rate converter
+  (passband flat to 20 kHz, at least 122 dB stopband from the lower Nyquist frequency, no
+  alias or image above -122 dB, THD+N below -139 dB) bridges 44.1, 48, 88.2 and 96 kHz
+  Windows formats to the codec's 44.1 or 48 kHz, so the best codec the receiver offers is
+  used and a Windows format change during playback does not renegotiate the stream (the
+  Windows rate is still used natively whenever the receiver supports it).
 - **Switch per device.** Use the Windows Bluetooth audio driver or the PN-A2DP
   driver for each paired receiver, with readiness checks and clear restart status.
 - **Export useful diagnostics.** Save a local text report that omits device names,
@@ -70,10 +79,10 @@ a self-signed certificate does not replace that requirement. See the
 
 ## Get started
 
-Download the [v0.1.0.34 experimental release](https://github.com/patnawa/PN-A2DP/releases/tag/v0.1.0.34)
-([release notes](docs/releases/v0.1.0.34.md)) and choose the **Windows-mode installer**
+Download the [v0.1.0.36 experimental release](https://github.com/patnawa/PN-A2DP/releases/tag/v0.1.0.36)
+([release notes](docs/releases/v0.1.0.36.md)) and choose the **Windows-mode installer**
 for use without Test Mode. The separate **Test Mode installer** contains custom driver
-0.1.0.21; stop playback before installing it, and follow the
+0.1.0.23; stop playback and close the panel before installing it, and follow the
 [setup and recovery guide](docs/17-test-mode-release-guide.md), including certificate
 verification and the explicit developer option. SHA-256 checksums accompany the
 downloads. A private repository's release requires repository access.
@@ -121,13 +130,15 @@ the receiver and an available encoder. Windows mode uses Windows' own selection.
 | **AAC-LC** | FDK AAC plugin; bitrate controls and adaptation | Software tests and independent decoding |
 | **aptX / aptX HD** | libfreeaptx plugin; fixed codec bitrates | Software tests and independent decoding |
 | **aptX Low Latency** | aptX encoder with LL negotiation and transport support | Software checks; receiver interoperability and latency remain unverified |
-| **LDAC** | Sony libldac plugin; quality levels and adaptive bitrate | Encoder and parameter tests, and LDAC SQ / HQ (990 kbps) playback on one physical receiver (EDIFIER MR5); independent decoding remains outstanding |
+| **LDAC** | Sony libldac plugin; quality levels and adaptive bitrate | Encoder and parameter tests, and LDAC SQ / HQ (990 kbps at 48 kHz, 909 kbps at 44.1 kHz) playback on one physical receiver (EDIFIER MR5); independent decoding remains outstanding |
 
 Automatic quality uses measured transport behavior as well as reported adapter
 capabilities. Bluetooth version and EDR support alone do not establish usable
-bandwidth. Fixed-rate aptX codecs cannot be reduced in-band. The driver does not
-resample: the Windows audio engine rate must be supported by the selected codec
-and receiver. AAC support is LC; HE-AAC is not advertised.
+bandwidth. Fixed-rate aptX codecs cannot be reduced in-band. Since driver 0.1.0.23 the
+driver converts a Windows rate the codec or receiver lacks (44.1 / 48 / 88.2 / 96 kHz to
+44.1 / 48 kHz; streams at the Windows rate are not touched); other conversions (from 32 or
+16 kHz, from 176.4 / 192 kHz, up to 88.2 / 96 kHz) are not done. AAC support is LC; HE-AAC
+is not advertised.
 
 Read more about [automatic adapter quality](docs/10-adapter-quality.md) and
 [codec licensing](docs/05-codec-licensing.md).
@@ -136,6 +147,20 @@ Redistribution bundles include full codec notices and corresponding source
 archives. This does not establish patent clearance or product certification.
 Before publishing free binaries or selling the program, see the
 [release-readiness audit and costs](docs/15-commercial-readiness.md).
+
+## Audio quality
+
+In PN driver mode, Windows now plays at the format you choose under **Sound > device >
+Properties > Advanced > Default Format** (earlier PN drivers made Windows' shared-mode
+engine use the driver's first listed format, normally 48 kHz, instead);
+reopen your player after changing it. When the receiver supports that rate it is used
+natively. Otherwise, or when you change the format while music plays, a fixed-point,
+linear-phase, alias-free sample-rate converter in the driver bridges the rates (at least
+122 dB alias and image rejection, flat to 20 kHz, about 2 ms of added latency) without
+reconnecting the receiver. New devices start every codec at its best level (devices you
+already use keep their saved settings), and a **listening profile** (Music, Balanced, Low
+latency) on the **Transport** tab sets how much buffering rides out radio hiccups.
+Details: [maximum audio quality](docs/20-max-audio-quality.md).
 
 ## Build and verify the full project
 
@@ -152,23 +177,32 @@ Follow the [signing and installation guide](docs/04-build-sign-install.md) befor
 attempting PN driver activation. The optional `-Interop` checks require Python
 and FFmpeg on `PATH`.
 
-The verification suite (34 checks) covers codec negotiation, AVDTP parsing and
+The verification suite covers codec negotiation, AVDTP parsing and
 reassembly, PCM conversion, RTP, configuration handling, diagnostics, service
-operations, Windows-mode behavior, and installer signing checks. It includes 57,229
-core checks also run under AddressSanitizer, 50,000 malformed packet inputs, a codec
-plugin parameter matrix, independent FFmpeg decoding of SBC, AAC and the aptX family,
-and an end-to-end audio-quality harness (977 jobs) that flags clicks, gaps, clipping
-and accounting errors. Build it with `.\build\build.ps1 -Target quality-tests`;
-`verify.ps1 -Interop` runs it.
+operations, Windows-mode behavior, and installer signing checks. It includes the
+core checks (58,106 for v0.1.0.36) also run under AddressSanitizer, 50,000 malformed
+packet inputs, a codec plugin parameter matrix, independent FFmpeg decoding of SBC, AAC
+and the aptX family, and an end-to-end audio-quality harness (for v0.1.0.36, 1,252 jobs
+and 24 FFmpeg baselines, 1,276 in all, with 0 defect flags and known issue #31 within its
+bounds, including the sample-rate converter's alias, distortion and bit-exactness checks) that
+flags clicks, gaps, clipping and accounting errors. Build it with
+`.\build\build.ps1 -Target quality-tests`; `verify.ps1 -Interop` runs it. The release
+run's results are in the [release notes](docs/releases/v0.1.0.36.md).
 
 **Hardware tested:** Windows 11 build 26300 and Qualcomm FastConnect 7800 with two
-receivers. Sony CMT-SBT40D: SBC at 672 kbps, reconnects, volume, mute, and audible
-playback. EDIFIER MR5: LDAC SQ and HQ (990 kbps) without drops, reconnects, and an
-owner listening check without crackle. The latest driver, 0.1.0.21, has had install
-and Connect / Disconnect checks; its playback was not re-measured. AAC and aptX
-receivers, Driver Verifier/HLK, sleep/wake and broader power/PnP stress coverage remain
-work in progress. See the [test record and remaining coverage](docs/06-testing-plan.md)
-and the [driver review record](docs/18-driver-review-fixes.md).
+receivers. Sony CMT-SBT40D (driver 0.1.0.19): SBC at 672 kbps, reconnects, volume, mute,
+and audible playback. EDIFIER MR5: LDAC SQ and HQ (990 kbps) without drops, reconnects,
+and an owner listening check without crackle (driver 0.1.0.20). On the released driver
+0.1.0.23 the MR5 played LDAC at 44.1 kHz natively as chosen in Windows' Default Format;
+switching Windows to 48 kHz during playback was bridged by the converter without a
+reconnect and with no crackle heard; its own delay report gave an end-to-end estimate of
+about 401 ms; the Music profile applied live; the session had no drops, write failures or
+latency trims. The Sony was not re-tested on 0.1.0.23. AAC and aptX receivers, codecs
+other than LDAC through the converter, the 48 to 44.1 kHz switch and pause/resume on a
+converted stream, interference sessions, Driver Verifier/HLK, sleep/wake and broader
+power/PnP stress coverage remain work in progress. See the
+[test record and remaining coverage](docs/06-testing-plan.md) and the
+[maximum audio quality record](docs/20-max-audio-quality.md).
 
 <details>
 <summary><strong>Repository layout</strong></summary>
@@ -202,6 +236,7 @@ docs/              Architecture, installation, and validation notes
 | [Architecture](docs/03-architecture.md) | Driver, codec host, plugins, and control interfaces |
 | [Testing](docs/06-testing-plan.md) | Reproducible checks, hardware results, and open coverage |
 | [Driver review fixes](docs/18-driver-review-fixes.md) | Review, audio-quality and Connect / Disconnect changes in driver 0.1.0.21 / app 0.1.0.34, with evidence and limits |
+| [Maximum audio quality](docs/20-max-audio-quality.md) | Best-quality defaults, latency profiles (Music / Balanced / Low latency), the alias-free sample-rate converter, the Default Format and delay-report fixes, and the hardware results of driver 0.1.0.23 / app 0.1.0.36 |
 | [Test Mode release guide](docs/17-test-mode-release-guide.md) | Download verification, Test Mode setup, installation and rollback |
 
 ## Contributing
