@@ -1,5 +1,62 @@
 # Testing and verification
 
+## Release v0.1.0.38, application 0.1.0.38 / driver 0.1.0.25 (2026-10-15)
+
+Full record: [speaker delay and lip-sync](21-speaker-delay-and-lip-sync.md); release notes:
+[v0.1.0.38](releases/v0.1.0.38.md). Driver 0.1.0.24 and application 0.1.0.37 were
+intermediate builds, installed on the test PC only.
+
+**Software.** `verify.ps1 -Sign -Sanitize -Interop` passed all **36** software checks (34 at
+v0.1.0.36; new: `speaker-delay-analysis` and `asan-speaker-delay-analysis`).
+
+- `core_test` **58,271** checks, 0 failures. New: `TestRemoteConfiguredQuality` (lane P: a
+  receiver-chosen LDAC, AAC and SBC configuration takes the saved quality, bitrate, CBR /
+  VBR and bitpool within the receiver's range, keeps the receiver's IEs except AAC's mode
+  and bitrate, and the basic-rate budget); `TestTSinkDelay` (lane T: the ABI layout, the
+  plausibility floor per codec, the MR5's 25 / 364 ms reports, a fixed delay for one codec
+  or any codec, the packed setting, and the presentation position following a live change
+  without a backward step or a jump); the speaker-delay setting in `TestConfigPolicy`.
+- `latency_test` (new, `build.ps1 -Target latency-tests`) **151** checks, also under
+  AddressSanitizer: the measurement's analysis on synthetic recordings (known delays
+  including the MR5's 267.6 ms late and 98.6 ms early, noise, missing chirps, reflections,
+  hum, clock and timestamp jitter, alias candidates, the moved lag range, several
+  microphone channels, a delay change during the run, spreads above 20 ms, no clock, no
+  recording, 8 and 11.025 kHz microphones) and the conversion of a run into a speaker
+  delay. It plays and records nothing.
+- `pnctl_test`: the sample-rate decoder for every codec, the speaker-delay texts and keys,
+  export and import, presets and automatic codecs keeping the speaker delay, the expected
+  applied delay.
+- Quality harness **1,252** jobs and 24 FFmpeg baselines (1,276 in all), **0** defect flags,
+  0 global flags (known issue #31 within its bounds); all **905** native-rate jobs
+  bit-identical to the 0.1.0.21 baseline.
+
+**Hardware** (Windows 11 build 26300, Qualcomm FastConnect 7800, EDIFIER MR5; microphone: a
+USB-C headset microphone, 48 kHz mono float, raw mode):
+
+| Action | Driver | Observed result |
+|---|---|---|
+| The MR5 reconnects by itself | 0.1.0.23 | **Defect:** LDAC at 660 kbps (ceiling 660, SQ) under an HQ preference. Fixed in 0.1.0.24 |
+| PN-started stream | 0.1.0.24 | LDAC 48 kHz at 990 kbps (ABR range 330-990) |
+| Power cycle of the MR5, receiver-initiated stream | 0.1.0.24 | 990 kbps, ceiling 990; 0 drops in steady streaming |
+| The MR5's own 96 kHz setting enabled | 0.1.0.24 / 0.1.0.25 | LDAC offered at 44.1 / 48 / 96 kHz (IE ending `34 07`, was `30 07`); `pna2dpctl caps` "rates 44.1k, 48k, 96k"; the stream followed the 48 kHz Windows format |
+| Delay reports against a microphone | before 0.1.0.25 | Reports 25.0 ms (right after the MR5 set up the stream) and 364.0 ms (later). Sound 267.6 ms after the clock with 25 ms applied (8 chirps within 3.5 ms), 86-99 ms before it with 364 ms |
+| 10 normal stream starts | 0.1.0.25 | Speaker delay 267, 326, 297, 329, 282, 324, 340, 330, 304, 306 ms (median about 315 ms); chirp spreads 2-9 ms within a stream; one 693 ms outlier, the first run right after a browser had been playing. Balanced vs Music: no meaningful difference; no ring overflows, latency trims or transport waits |
+| Fixed 315 ms for LDAC (`pna2dpctl set -d 1 sinkdelay=315 sinkdelay.codec=ldac`) | 0.1.0.25 | Two checks: sound 27.4 ms early and 16.8 ms late (8 of 8 chirps, spreads 7.9 / 3.2 ms); status estimate 317 ms |
+| Panel **Measure with microphone** | 0.1.0.25 | Progress texts through "Listening for the last chirp..."; result "Measured 306 ms (8 of 8 chirps, spread 10 ms). Apply changes to use it."; another run 316 ms. The owner's first attempt showed no result (not explained; the driver's last error then was 0xC00000B5, Device Timeout) |
+| `build/check-panel-text-fit.ps1`, Status page | 0.1.0.25 | 94 texts, 0 cut off at normal and minimum size when idle; with four flags and a long Last error, those two rows end in an ellipsis at the minimum size (by design) |
+| `build/check-panel-text-fit.ps1`, Headset page (no stream, Fixed 290 ms) | 0.1.0.25 | 28 texts, 0 cut off at normal and minimum size |
+| Microphone self-check: the headset's earbud against its own microphone | - | 51 ms for that USB device's playback and recording together (8 chirps within 0.6 ms): each measurement can read up to about 50 ms high |
+| Fixed 290 ms for LDAC (the owner's choice, about 25 ms below the median) | 0.1.0.25 | Sound 0.5 ms after the clock (8 of 8 chirps, spread 5.6 ms) |
+| SBC on the MR5 (LDAC disabled for the test, then restored) | 0.1.0.25 | Real delay 265 and 340 ms; the speaker reports 250 ms: no faster than LDAC |
+| Wired reference: the PC's 3.5 mm line-out into the MR5's analog input | - | 67.1 ms after that output's clock (8 chirps within 0.4 ms), including the microphone's timing |
+| Installs of 0.1.0.24 and 0.1.0.25 over the earlier build, audio stopped | 0.1.0.24 / 0.1.0.25 | No reboot |
+
+Not covered: the microphone measurement with any other speaker or microphone;
+receiver-initiated AAC, aptX and SBC configurations (SBC on the MR5 was measured for its
+delay only); LDAC at 96 kHz; a single-step upgrade from v0.1.0.36; the Sony
+CMT-SBT40D on these drivers; long sessions; sleep/wake; Driver Verifier and HLK; Secure
+Boot or Memory Integrity (HVCI) on; and the open items of v0.1.0.36 below.
+
 ## Release v0.1.0.36, application 0.1.0.36 / driver 0.1.0.23 (2026-10-14)
 
 Full record: [maximum audio quality](20-max-audio-quality.md); release notes:
@@ -540,7 +597,10 @@ package is backed up under `out/verification/previous-driver` on this machine.
    converts 44.1 / 48 / 88.2 / 96 kHz Windows formats to a 44.1 / 48 kHz codec rate; check
    the panel's **Windows rate** row ("48000 Hz, converted to 44100 Hz") or the
    `pna2dpctl status` format line ("(Windows N Hz, converted)") and exercise both native and
-   converted formats.
+   converted formats. Measure the speaker delay from silence a few times (**Headset >
+   Measure with microphone** or `pna2dpctl measure-delay`), set the middle value as the
+   fixed delay, and check that a new measurement puts the sound within a few tens of
+   milliseconds of the clock.
 4. Exercise live SBC bitpool/ABR and each codec supported by an actual receiver. An encoder
    ABI test does not establish A2DP interoperability or aptX LL latency.
 5. Stop/crash/restart the codec host during playback; verify SBC fallback and recovery.

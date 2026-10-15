@@ -209,7 +209,7 @@ Known limits, deliberately unchanged:
 
 Details, simulations and verification: [maximum audio quality](20-max-audio-quality.md).
 
-## Driver 0.1.0.23: the Windows format and the real headset delay
+## Driver 0.1.0.23: the Windows format and the headset's delay report
 
 Driver 0.1.0.22 was an intermediate build; everything in the previous section ships in
 driver 0.1.0.23 (v0.1.0.36), which adds two fixes found on the EDIFIER MR5:
@@ -230,6 +230,11 @@ driver 0.1.0.23 (v0.1.0.36), which adds two fixes found on the EDIFIER MR5:
   delay report even when delay reporting was not negotiated. The MR5 reports about
   364..396 ms on its LDAC stream without offering the capability; its estimate went from
   209 ms (the 200 ms LDAC default) to about 401 ms.
+
+Driver 0.1.0.25 found the MR5's reports are not its real delay: a microphone measured
+267-340 ms against reports of 25 and 364 ms. It ignores a report below a per-codec
+plausibility floor and accepts a fixed delay measured with a microphone
+([speaker delay and lip-sync](21-speaker-delay-and-lip-sync.md)).
 
 The MR5 session on driver 0.1.0.23 (including the **Music** profile applied while playing)
 had 0 drops, write failures, latency trims and ring overflows. Not tested on hardware: SBC,

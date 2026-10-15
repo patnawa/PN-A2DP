@@ -7,7 +7,7 @@
 A Windows Bluetooth audio control panel with automatic codec selection,
 adaptive quality, and diagnostics you can understand.
 
-**Windows 10 / 11 · x64 · Control panel v0.1.0.36 · MIT project license**
+**Windows 10 / 11 · x64 · Control panel v0.1.0.38 · MIT project license**
 
 [Get started](#get-started) · [Choose a mode](#choose-a-mode) · [Codec support](#codec-support) · [Documentation](#documentation)
 
@@ -79,10 +79,10 @@ a self-signed certificate does not replace that requirement. See the
 
 ## Get started
 
-Download the [v0.1.0.36 experimental release](https://github.com/patnawa/PN-A2DP/releases/tag/v0.1.0.36)
-([release notes](docs/releases/v0.1.0.36.md)) and choose the **Windows-mode installer**
+Download the [v0.1.0.38 experimental release](https://github.com/patnawa/PN-A2DP/releases/tag/v0.1.0.38)
+([release notes](docs/releases/v0.1.0.38.md)) and choose the **Windows-mode installer**
 for use without Test Mode. The separate **Test Mode installer** contains custom driver
-0.1.0.23; stop playback and close the panel before installing it, and follow the
+0.1.0.25; stop playback and close the panel and browsers before installing it, and follow the
 [setup and recovery guide](docs/17-test-mode-release-guide.md), including certificate
 verification and the explicit developer option. SHA-256 checksums accompany the
 downloads. A private repository's release requires repository access.
@@ -162,6 +162,21 @@ already use keep their saved settings), and a **listening profile** (Music, Bala
 latency) on the **Transport** tab sets how much buffering rides out radio hiccups.
 Details: [maximum audio quality](docs/20-max-audio-quality.md).
 
+## Speaker delay (lip-sync)
+
+Video players keep picture and sound together with the delay Windows reports for the
+speaker, and that delay includes the speaker's own report, which can be wrong: the EDIFIER
+MR5 reports 25 ms or 364 ms, while a microphone measured 267-340 ms (median about 315 ms).
+Driver 0.1.0.25 ignores reports too low to be real and lets you set the delay yourself.
+**Headset > Speaker delay (lip-sync) > Measure with microphone** plays eight short chirps,
+finds the delay and enters it as a fixed value for the codec that is playing; **Apply
+changes** saves it. The recording is analysed in memory and not saved. Because a speaker's
+delay can change between stream starts, measure a few times and keep the middle value; the
+result includes the microphone's own timing, so a value 20 to 30 ms lower is a safe choice. The
+command line has `pna2dpctl measure-delay` and `pna2dpctl set sinkdelay=<ms>`. A speaker
+that connects by itself now also gets its saved quality (LDAC HQ on the MR5, where driver
+0.1.0.23 used SQ). Details: [speaker delay and lip-sync](docs/21-speaker-delay-and-lip-sync.md).
+
 ## Build and verify the full project
 
 Build the driver, codec host, encoder plugins, tools, and installer:
@@ -180,29 +195,36 @@ and FFmpeg on `PATH`.
 The verification suite covers codec negotiation, AVDTP parsing and
 reassembly, PCM conversion, RTP, configuration handling, diagnostics, service
 operations, Windows-mode behavior, and installer signing checks. It includes the
-core checks (58,106 for v0.1.0.36) also run under AddressSanitizer, 50,000 malformed
+core checks (58,271 for v0.1.0.38) also run under AddressSanitizer, 50,000 malformed
 packet inputs, a codec plugin parameter matrix, independent FFmpeg decoding of SBC, AAC
-and the aptX family, and an end-to-end audio-quality harness (for v0.1.0.36, 1,252 jobs
-and 24 FFmpeg baselines, 1,276 in all, with 0 defect flags and known issue #31 within its
-bounds, including the sample-rate converter's alias, distortion and bit-exactness checks) that
-flags clicks, gaps, clipping and accounting errors. Build it with
-`.\build\build.ps1 -Target quality-tests`; `verify.ps1 -Interop` runs it. The release
-run's results are in the [release notes](docs/releases/v0.1.0.36.md).
+and the aptX family, the speaker-delay measurement's analysis on synthetic recordings
+(151 checks for v0.1.0.38, also under AddressSanitizer), and an end-to-end audio-quality
+harness (for v0.1.0.38, 1,252 jobs and 24 FFmpeg baselines, 1,276 in all, with 0 defect
+flags and known issue #31 within its bounds, including the sample-rate converter's alias,
+distortion and bit-exactness checks) that flags clicks, gaps, clipping and accounting
+errors. Build it with `.\build\build.ps1 -Target quality-tests`; `verify.ps1 -Interop`
+runs it. The release run's results are in the [release notes](docs/releases/v0.1.0.38.md).
 
 **Hardware tested:** Windows 11 build 26300 and Qualcomm FastConnect 7800 with two
 receivers. Sony CMT-SBT40D (driver 0.1.0.19): SBC at 672 kbps, reconnects, volume, mute,
 and audible playback. EDIFIER MR5: LDAC SQ and HQ (990 kbps) without drops, reconnects,
-and an owner listening check without crackle (driver 0.1.0.20). On the released driver
-0.1.0.23 the MR5 played LDAC at 44.1 kHz natively as chosen in Windows' Default Format;
-switching Windows to 48 kHz during playback was bridged by the converter without a
-reconnect and with no crackle heard; its own delay report gave an end-to-end estimate of
-about 401 ms; the Music profile applied live; the session had no drops, write failures or
-latency trims. The Sony was not re-tested on 0.1.0.23. AAC and aptX receivers, codecs
-other than LDAC through the converter, the 48 to 44.1 kHz switch and pause/resume on a
-converted stream, interference sessions, Driver Verifier/HLK, sleep/wake and broader
-power/PnP stress coverage remain work in progress. See the
-[test record and remaining coverage](docs/06-testing-plan.md) and the
-[maximum audio quality record](docs/20-max-audio-quality.md).
+and an owner listening check without crackle (driver 0.1.0.20). On driver 0.1.0.23 the
+MR5 played LDAC at 44.1 kHz natively as chosen in Windows' Default Format; switching
+Windows to 48 kHz during playback was bridged by the converter without a reconnect and
+with no crackle heard; the Music profile applied live; the session had no drops, write
+failures or latency trims. On the intermediate driver 0.1.0.24, a stream the MR5 set up
+itself after a power cycle ran LDAC HQ at 990 kbps (0.1.0.23: SQ, 660 kbps). A microphone
+measured the MR5's real delay at 267-340 ms over 10 stream starts, against its reports of
+25 and 364 ms. With a fixed 315 ms on driver 0.1.0.25, two checks heard the sound 27.4 ms
+early and 16.8 ms late. The Sony was not
+re-tested after 0.1.0.19. AAC and aptX receivers, receiver-initiated AAC / aptX / SBC
+configurations, other speakers and microphones for the delay measurement, codecs other
+than LDAC through the converter, the 48 to 44.1 kHz switch and pause/resume on a converted
+stream, interference sessions, Driver Verifier/HLK, sleep/wake and broader power/PnP stress
+coverage remain work in progress. See the
+[test record and remaining coverage](docs/06-testing-plan.md), the
+[maximum audio quality record](docs/20-max-audio-quality.md) and the
+[speaker delay record](docs/21-speaker-delay-and-lip-sync.md).
 
 <details>
 <summary><strong>Repository layout</strong></summary>
@@ -237,6 +259,7 @@ docs/              Architecture, installation, and validation notes
 | [Testing](docs/06-testing-plan.md) | Reproducible checks, hardware results, and open coverage |
 | [Driver review fixes](docs/18-driver-review-fixes.md) | Review, audio-quality and Connect / Disconnect changes in driver 0.1.0.21 / app 0.1.0.34, with evidence and limits |
 | [Maximum audio quality](docs/20-max-audio-quality.md) | Best-quality defaults, latency profiles (Music / Balanced / Low latency), the alias-free sample-rate converter, the Default Format and delay-report fixes, and the hardware results of driver 0.1.0.23 / app 0.1.0.36 |
+| [Speaker delay and lip-sync](docs/21-speaker-delay-and-lip-sync.md) | Implausible delay reports ignored, the fixed speaker delay and its microphone measurement, receiver-chosen configurations at the saved quality, and the hardware results of driver 0.1.0.25 / app 0.1.0.38 |
 | [Test Mode release guide](docs/17-test-mode-release-guide.md) | Download verification, Test Mode setup, installation and rollback |
 
 ## Contributing

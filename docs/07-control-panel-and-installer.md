@@ -7,6 +7,7 @@ tools/common/           pnctl.*   wrapper around the IOCTL interface, names, pre
                         pndrv.*   device nodes, driver store, per-device driver switching, services, signing, elevation
                         pnboot.*  boot settings, development-driver readiness and operation guard
                         pnspatial.* CLI-only Windows spatial compatibility and renderer discovery
+                        pnlatency.* speaker-delay measurement: chirps, microphone recording, analysis (0.1.0.38)
 tools/pna2dp-panel/     pna2dp-panel.exe   control panel (Win32, common controls, no framework)
 tools/pna2dp-setup/     pna2dp-setup.exe   installer / uninstaller with the whole product embedded
 ```
@@ -34,7 +35,7 @@ a connected one, then any PN-A2DP device. An existing selection is kept across r
 
 | Tab | What it shows / changes |
 |---|---|
-| Status | Live connection state (an idle receiver with signalling up shows as **Connected**; the driver state is `PNA2DP_STATE_DISCOVERING`), codec, format, encoder owner, bitrate and ceiling, estimated latency, sink delay report, MTU, AVDTP version, flags, last NTSTATUS (the format line names the Windows rate when it is converted; the sink delay reads "reported by the headset" or "not reported; a per-codec default is assumed"); transport statistics (packets, bytes, drops, queue depth, write completion time, ABR level, codec host round trip); driver version, codec host service state, encoders available. Refreshes on every driver event (pended `WAIT_EVENT` IOCTL on a worker thread) and once a second. |
+| Status | Live connection state (an idle receiver with signalling up shows as **Connected**; the driver state is `PNA2DP_STATE_DISCOVERING`), codec, format, encoder owner, bitrate and ceiling, estimated latency, sink delay, MTU, AVDTP version, flags, last NTSTATUS (the format line names the Windows rate when it is converted; the sink delay names the delay applied and its source, for example "364 ms reported by the speaker", "315 ms fixed; the speaker reports 364 ms" or "200 ms default; the 25 ms report is ignored", and with drivers before 0.1.0.25 "reported by the headset" or "not reported; a per-codec default is assumed"); transport statistics (packets, bytes, drops, queue depth, write completion time, ABR level, codec host round trip); driver version, codec host service state, encoders available. Refreshes on every driver event (pended `WAIT_EVENT` IOCTL on a worker thread) and once a second. |
 | Quality | Background audio checks with suggested settings, a live bitrate chart and recent transport counters, and a local diagnostic export that omits device identifiers. Also available in Windows mode with explicit telemetry limits. See [audio diagnostics](14-audio-diagnostics.md). |
 | Codecs | Live codec/rate/bitrate, receiver support, live state, and saved or edited settings. Activate selected puts a supported codec first and applies it with SBC fallback. Auto quality + codecs restores automatic selection. The preset picker is a loader, not an indicator of saved settings. SBC cannot be disabled. |
 | SBC | Max bitpool (slider, or the headset's maximum), min bitpool, bitpool override, dual channel preference, **SBC XQ** checkbox (dual channel, 16 blocks, 8 subbands at the bitpool plain dual channel gets, packed to the radio's EDR packets; it overrides the mode, block and subband choices), rate / channel mode / block / subband / allocation masks, live bitrate estimate at 44.1 and 48 kHz. |
@@ -42,7 +43,7 @@ a connected one, then any PN-A2DP device. An existing selection is kept across r
 | aptX | Rate and channel masks for aptX, aptX HD (plus 16/24-bit input) and aptX LL (plus target buffer level). |
 | LDAC | Quality (HQ / SQ / MQ / adaptive), ABR step-down, encoder input format, rate and channel masks, bitrate preview. |
 | Transport | Listening profile (Music 150 / 450 ms, Balanced 60 / 250 ms, Low latency 30 / 120 ms, Custom; application 0.1.0.35, released in 0.1.0.36) above the target and maximum buffer sliders (maximum 40..500 ms), ABR on/off and floor, reconnect delay, persisted volume, behaviour flags (suspend on SCO, auto start, delay reports, expose all rates, software volume). |
-| Headset | AVDTP version, SDP features, every remote SEP decoded (rates, channels, blocks, bitpool, AAC object types and bitrate, services) with the raw IEs. |
+| Headset | AVDTP version, SDP features, every remote SEP decoded (rates, channels, blocks, bitpool, AAC object types and bitrate, services) with the raw IEs. **Speaker delay (lip-sync)** (application 0.1.0.38, driver 0.1.0.25 or later): the delay applied and its source, **Automatic** / **Fixed** (1..1000 ms for the codec playing), a microphone choice and **Measure with microphone** ([below](#control-panel-01038--driver-01025-speaker-delay-released-as-v01038)). |
 | Adapter | Actual radio name/address, Classic EDR capability, live health, effective bitrate range and observation counters. Auto quality + codecs detects receiver support and enables adapter-aware limits with live adaptation. |
 | Driver | Driver, provider, version, INF, status, **Use PN-A2DP driver** / **Use Windows mode** / **Rescan**. Labelled Test Mode, Secure Boot and Memory Integrity lights; **Requirements...** explains blocked activation. **Windows Security** opens Core isolation; **Windows / Test Mode...** manages next-start Test Mode with confirmation and manual restart. Staged package with stage/remove, codec host service controls and installed plugins. |
 | Audio (Windows mode) | Selected endpoint's volume, mute, format and output status, plus Windows Sound/Bluetooth settings links. |
@@ -76,7 +77,8 @@ paired, the status line points there.
 
 Bottom bar: **Apply** sends the edited `PNA2DP_CONFIG` with `IOCTL_PNA2DP_SET_CONFIG`
 (the driver validates, persists and applies live; bitpool changes go in band), **Revert**
-reloads, **Defaults** loads the driver defaults, **Import / Export** round-trip the
+reloads, **Defaults** loads the driver defaults (keeping the volume; the speaker delay
+returns to Automatic), **Import / Export** round-trip the
 configuration as text (`pna2dpctl` key=value lines plus an exact hex blob).
 
 ### Driver switching (selective driver)
@@ -234,6 +236,62 @@ the local gain path is used when receiver-volume integration is unavailable.
 * Build: stale catalogs were embedded around a rebuilt unsigned driver; `install.ps1`
   assigned to the read-only `$host` and skipped `freeaptx.dll`; non-ASCII checkout paths
   broke the installer resource script; a missing plugin submodule aborted the package.
+
+### Control panel 0.1.0.38 / driver 0.1.0.25: speaker delay, released as v0.1.0.38
+
+Application 0.1.0.37 and driver 0.1.0.24 were intermediate builds; everything they contain
+ships in [v0.1.0.38](releases/v0.1.0.38.md). Full record:
+[speaker delay and lip-sync](21-speaker-delay-and-lip-sync.md).
+
+- **Headset > Speaker delay (lip-sync).** A status line names the delay the driver applies
+  and its source ("Using 364 ms reported by the speaker", "Using 315 ms, the fixed speaker
+  delay; the speaker reports 364 ms", "Using 200 ms, the LDAC default; the speaker's report
+  of 25 ms is ignored as impossible", "No stream"). **Automatic** uses the speaker's
+  plausible reports, else the codec's default; **Fixed:** takes 1..1000 ms for the codec
+  playing when it is chosen or typed (the label reads "ms, for LDAC"; it reads "ms, for any
+  codec" only when Fixed was chosen while nothing played and no codec had been set before);
+  an empty box starts from the delay in use. The receiver list
+  and its detail are shorter to make room. With a driver before 0.1.0.25 the group is
+  disabled and says that driver 0.1.0.25 or later is needed.
+- **Microphone** lists the active recording devices, Windows' default marked "(default)"
+  and selected first, read again when the list opens and on **Refresh**.
+- **Measure with microphone** asks first (speaker, microphone, 8 short chirps over about
+  13 seconds, "The recording is analysed in memory and not saved", 10 to 30 cm, other
+  playback stopped, a quiet room; it adds a warning when Windows is already playing to the
+  speaker, since the test needs a fresh stream). While it runs the button reads **Cancel
+  measurement** and the text below shows the progress ("Starting the speaker...",
+  "Waiting for the speaker to start playing...", "Chirp 3 of 8...", "Listening for the last
+  chirp...", "Analysing the recording..."). A result such as "Measured 306 ms (8 of 8
+  chirps, spread 10 ms). Apply changes to use it." becomes a pending **Fixed** value for the
+  codec that played: **Apply changes** saves it ("Applied."), **Undo changes** drops it
+  ("Not applied."). A failed run shows its reason (for example no microphone, a microphone
+  recording below 16 kHz, only silence recorded, the speaker changing its delay during the
+  test) and changes nothing. The run uses a worker thread and its own read-only driver
+  handle; closing the panel or changing the device cancels it. Demo mode simulates the
+  progress and a result without sound or devices.
+- **Status > Sink delay** names the source in a short form: "364 ms reported by the
+  speaker", "315 ms fixed; the speaker reports 364 ms", "200 ms default; the 25 ms report
+  is ignored", "150 ms default; not reported", "no stream".
+- Presets and **Auto quality + codecs** keep the speaker delay, like the volume; the
+  footer's **Defaults** button resets it to Automatic.
+- **Command line.** `pna2dpctl set sinkdelay=auto|<ms>` and
+  `sinkdelay.codec=any|sbc|aac|aptx|aptxhd|aptxll|ldac`; `pna2dpctl config` prints
+  `sink delay : 315 ms (LDAC)` or `automatic`; `pna2dpctl status` prints the estimate and a
+  **sink delay** line with the source; `pna2dpctl measure-delay [-d N] [mic=<name part>]
+  [apply]` runs the same measurement and, with `apply`, saves the result for the codec that
+  played. Settings export and import carry `sinkdelay=` and `sinkdelay.codec=` (an edited
+  line wins over the blob).
+- **Receiver sample rates** (application 0.1.0.37). One decoder, `pn::SepRatesText`, serves
+  the Headset page and `pna2dpctl caps`, which now prints a `rates` line for every codec
+  (for the MR5 with its 96 kHz setting on: "rates 44.1k, 48k, 96k").
+- `build/check-panel-text-fit.ps1` covers the new Status texts and the Headset page's
+  speaker-delay texts (run it once on each page). On hardware, the Status page had 94
+  texts and none cut off at the normal or minimum window size when idle; with four flags
+  and a long Last error message, those two rows end in an ellipsis at the minimum size
+  (end-ellipsis controls, by design).
+- On hardware (EDIFIER MR5, a USB-C headset microphone) the panel's measurement ran to a
+  result twice (306 and 316 ms). The owner's first attempt showed no result; this is not
+  explained (the driver's last error then was 0xC00000B5, Device Timeout).
 
 ### Control panel 0.1.0.35: latency profiles and best-quality presets
 

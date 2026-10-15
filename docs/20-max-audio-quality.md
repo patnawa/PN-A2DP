@@ -17,6 +17,22 @@ receiver (EDIFIER MR5, LDAC). See [hardware results](#hardware-results-14-octobe
 [second review](#second-review-14-october-2026-pause-drain-and-kernel-cpu) and
 [hardware checks still to do](#hardware-checks-still-to-do).
 
+**Follow-up in v0.1.0.38** (driver 0.1.0.25 / application 0.1.0.38; record:
+[speaker delay and lip-sync](21-speaker-delay-and-lip-sync.md)):
+
+- **Receiver-chosen LDAC at HQ.** The best-quality defaults below applied only to streams
+  PN-A2DP configures. A stream the receiver configured itself kept the parser's LDAC SQ:
+  with driver 0.1.0.23 the EDIFIER MR5, reconnecting by itself, ran LDAC at 660 kbps
+  (ceiling 660) under an HQ preference. Since driver 0.1.0.24 such a configuration takes
+  the saved quality (and the AAC, SBC and aptX LL preferences); after a power cycle the
+  MR5's own stream ran at 990 kbps.
+- **Delay reports.** The [delay-report fix](#sink-delay-reports-were-ignored-without-negotiation)
+  below uses every report. A microphone showed the MR5's reports (25.0 ms right after it
+  sets up the stream, 364.0 ms later) are not its real delay (267-340 ms over 10 stream
+  starts). Driver 0.1.0.25 ignores a report below a per-codec plausibility floor and accepts
+  a fixed speaker delay, measured with a microphone in the panel or with
+  `pna2dpctl measure-delay`.
+
 ## Summary
 
 | Area | 0.1.0.21 / 0.1.0.34 | 0.1.0.23 / 0.1.0.36 |
@@ -715,7 +731,7 @@ defects that predate this round. Both are fixed in driver 0.1.0.23.
 ### Sink delay reports were ignored without negotiation
 
 - **Symptom.** The end-to-end latency estimate for the MR5's LDAC stream used the 200 ms
-  LDAC default (209 ms in total) although the receiver reports its real delay.
+  LDAC default (209 ms in total) although the receiver sends delay reports.
 - **Cause.** A DELAYREPORT was used only when delay reporting had been negotiated for the
   stream. The MR5's LDAC SEP does not offer the delay-reporting capability, yet it sends
   delay reports (about 364..396 ms).
@@ -728,7 +744,9 @@ defects that predate this round. Both are fixed in driver 0.1.0.23.
 - **Labels.** The panel's Status page shows "N ms reported by the headset" or "not
   reported; a per-codec default is assumed". `pna2dpctl status` adds "(reported without
   delay-reporting negotiation)" or "(not reported; a per-codec default is assumed)". On the
-  MR5 the estimate went from 209 ms (the default guess) to about 401 ms (the real delay).
+  MR5 the estimate went from 209 ms (the default guess) to about 401 ms (the MR5's own
+  report; a microphone later measured its real delay at 267-340 ms, see
+  [speaker delay and lip-sync](21-speaker-delay-and-lip-sync.md)).
 
 ## Hardware results (14 October 2026)
 

@@ -43,7 +43,9 @@ and `02-windows-bluetooth-audio-internals.md`.
   and a stream that fell back to SBC returns to the better codec at the next START or
   pause once the quarantine ends. Only the LocalSystem service may register as a host.
 * **pna2dpctl.exe** is the control tool (and the reference for a GUI): status, remote
-  capabilities, configuration, statistics, event watch, reconnect.
+  capabilities, configuration, statistics, event watch, reconnect, and (since 0.1.0.38)
+  the microphone measurement of the speaker delay (`tools/common/pnlatency`, shared with
+  the panel).
 
 ## 2. Data path and timing
 
@@ -86,13 +88,21 @@ and `02-windows-bluetooth-audio-internals.md`.
    every profile. See `10-adapter-quality.md` and `20-max-audio-quality.md`.
 5. Latency reaches Windows through the presentation position: PCM in the ring, at the
    codec host, in queued results and in L2CAP writes, plus one write's measured send
-   time, plus the sink delay (the AVDTP delay report, or a per-codec default when the
-   receiver does not report; since driver 0.1.0.23 a report is used even when delay
-   reporting was not negotiated, as the EDIFIER MR5 sends one on its LDAC stream without
-   offering the capability). The position changes smoothly (at most 1 % of real time),
-   never goes backwards within a run and resets at a stream start or stop. `GetHWLatency`
+   time, plus the sink delay. Since driver 0.1.0.25 the sink delay is decided by
+   `PnSinkDelayDecide` (`transport_policy.h`): a fixed speaker delay
+   (`PNA2DP_CONFIG.SinkDelayMs`, 1..1000 ms, for `SinkDelayCodec` or any codec, measured
+   with a microphone or typed in); else the AVDTP delay report, when it is at or above the
+   codec's plausibility floor (LDAC, AAC and aptX HD 80 ms; aptX, SBC and unknown codecs
+   40 ms; aptX LL none); else the per-codec default. A report is used even when delay
+   reporting was not negotiated (driver 0.1.0.23: the EDIFIER MR5 sends one on its LDAC
+   stream without offering the capability); its 25 ms report right after it sets up the
+   stream is below the floor and ignored. The setting is read lock-free as one packed word
+   and applies live, without renegotiation. The status reports the same value
+   (`SinkDelayUs`, flags `SINK_DELAY_SET` / `SINK_DELAY_IGNORED`). The position changes
+   smoothly (at most 1 % of real time), also when the sink delay changes, never goes
+   backwards within a run and resets at a stream start or stop. `GetHWLatency`
    reports zero: this software endpoint has no DMA FIFO, and a non-zero value made
-   Windows' format probes fail.
+   Windows' format probes fail. See `21-speaker-delay-and-lip-sync.md`.
 
 ## 3. Connection state machine (device.cpp)
 
@@ -134,6 +144,16 @@ remote SET_CONFIGURATION/OPEN/START/SUSPEND/CLOSE/ABORT/DELAYREPORT update the s
 `Reconcile` reacts. After a remote SET_CONFIGURATION the driver waits up to 1.5 s for the
 receiver's own OPEN before sending one. Commands that cross ours are resolved by the
 collision rules in `transport_policy.h`.
+
+A configuration the receiver chooses (its SET_CONFIGURATION or RECONFIGURE) fixes the rate,
+the channel mode and the SBC bitpool range; since driver 0.1.0.24 the source's own choices
+come from the saved preferences, as for a stream we configure (`A2dpApplySourcePreferences`,
+called from `OnRemoteSetConfiguration` / `OnRemoteReconfigure`): LDAC quality and input
+format, AAC bitrate and CBR / VBR (written into the IEs the AAC plugin reads), SBC start
+bitpool and floor within the receiver's range (`SbcMaxBitpool` stays the receiver's
+maximum), the aptX LL target level, and the basic-rate budget on a Basic Rate-only radio.
+Before, such a stream kept the parser's defaults (the MR5 reconnecting by itself ran LDAC
+SQ under an HQ preference).
 
 HCI events from the radio (`GUID_BLUETOOTH_HCI_EVENT`) detect SCO links to the same
 address: by default the stream is suspended while a call is active and resumed after.
@@ -181,7 +201,12 @@ on the Bluetooth device node, so one instance exists per headset. IOCTLs are buf
 versioned (`PNA2DP_ABI_VERSION`) and documented in `driver/pna2dp/inc/pna2dp_public.h`:
 version, status, capabilities, get/set config (applied live; SBC bitpool changes in
 band), wait-event (pended IRP completed on state/caps/config/SCO/delay events), stats,
-reconnect, and the codec-host protocol. Each handle gets a role from the caller's token
+reconnect, and the codec-host protocol. ABI 1 grows only additively, through free flag bits
+and former reserved words: for example driver 0.1.0.21's four `PNA2DP_STATS` counters,
+driver 0.1.0.22's `PNA2DP_STATUS.EngineSampleRate`, and driver 0.1.0.25's
+`PNA2DP_CONFIG.SinkDelayMs` / `SinkDelayCodec`, `PNA2DP_STATUS.SinkDelayUs` and the
+`SINK_DELAY_SET` / `SINK_DELAY_IGNORED` flags (sizes and offsets unchanged; older drivers
+report 0). Each handle gets a role from the caller's token
 when it is opened (`control_access.h`): any user may use the status, configuration,
 event, statistics and reconnect requests that the unelevated panel needs; the trace and
 SBC sample need an elevated administrator; the codec-host requests and unknown codes
@@ -194,7 +219,7 @@ need LocalSystem.
 | Codec execution | all in kernel | SBC in kernel, everything else in a user-mode plugin host (crash isolated, LGPL/Apache isolated, upgradable) |
 | Fallback | none (no sound without license) | automatic SBC fallback when a host codec is unavailable; a failing host is quarantined and the codec returns automatically |
 | Applying changes | reconnect required | live: in-band for bitpool/EQMID, AVDTP RECONFIGURE for rate, renegotiation otherwise |
-| Latency to apps | not reported | measured path latency + AVDTP delay reports exposed through WaveRT |
+| Latency to apps | not reported | measured path latency + plausible AVDTP delay reports, or a speaker delay measured with a microphone, exposed through WaveRT |
 | Remote initiated streams | supported | supported, including remote SET_CONFIGURATION with codec validation |
 | Status to apps | registry polling | event IOCTL (pended), plus stats |
 | ABR | on/off | time-window controller with hysteresis and bounded codec ladders |

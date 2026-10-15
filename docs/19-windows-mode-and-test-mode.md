@@ -1,6 +1,6 @@
 # Windows mode and Test Mode: which one do I need?
 
-A plain-language guide for application 0.1.0.36 and custom driver 0.1.0.23.
+A plain-language guide for application 0.1.0.38 and custom driver 0.1.0.25.
 PN-A2DP can be used in two ways. You choose the way **per speaker or headphone**,
 and you can change your mind later.
 

@@ -205,7 +205,37 @@ the converter, so it no longer interrupts the stream with a renegotiation.
 The end-to-end latency estimate now uses the receiver's AVDTP delay report even when
 delay reporting was not negotiated (the EDIFIER MR5 reports about 364..396 ms on LDAC
 without offering the capability; its estimate went from 209 to about 401 ms). The
-estimate does not feed the ABR rules, which watch only the transport.
+estimate does not feed the ABR rules, which watch only the transport. Driver 0.1.0.25
+ignores a report below a per-codec plausibility floor and accepts a speaker delay
+measured with a microphone; neither affects the ABR either
+([speaker delay and lip-sync](21-speaker-delay-and-lip-sync.md)).
+
+## Driver 0.1.0.24: receiver-chosen configurations follow the saved ceilings
+
+A receiver that starts the stream itself (its own AVDTP SET_CONFIGURATION or RECONFIGURE,
+for example when it reconnects after a power cycle) chooses the rate, the channel mode and,
+for SBC, the bitpool range. Until driver 0.1.0.23 everything else stayed at the parser's
+defaults, so the saved quality ceiling did not apply: the EDIFIER MR5, reconnecting by
+itself, ran LDAC at **660 kbps (ceiling 660, SQ)** under an HQ preference. Since driver
+0.1.0.24 (`A2dpApplySourcePreferences`) the same rules apply as for a stream PN-A2DP
+configures:
+
+- LDAC: the saved quality (HQ / SQ / MQ; adaptive starts at SQ) and input format.
+- AAC: the smaller of the receiver's bitrate and the saved one (at most 320 kbps), CBR
+  unless both allow VBR; the encoder mode and bitrate go into the IEs the AAC plugin reads.
+- SBC: the saved maximum bitpool sets the start (the ABR's top rung) and the saved minimum
+  the floor, both within the receiver's range; the receiver's maximum stays reachable by a
+  live bitpool change.
+- aptX family: the saved aptX LL target buffer level.
+- A confirmed Basic Rate-only radio gets the 350 kbps starting budget (LDAC MQ, a lower SBC
+  bitpool), as described above.
+
+The ABR then works from that ceiling as for any stream. On hardware (driver 0.1.0.24), the
+MR5's own stream after a power cycle ran at **990 kbps, ceiling 990**, and a PN-started
+stream at 990 kbps (ABR range 330-990), with no drops in steady streaming.
+Receiver-initiated AAC and SBC configurations have software tests only
+(`TestRemoteConfiguredQuality`). The aptX-family target level for a receiver-chosen
+configuration has no test and no hardware check.
 
 ## Limits and interpretation
 
@@ -227,9 +257,9 @@ bounded queue, latency guard and encoder-failure fallback remain active.
 
 Automatic quality does not add codecs to the receiver, create lossless bandwidth,
 or guarantee uninterrupted playback under all conditions. On physical receivers here,
-only the Sony's SBC path and the EDIFIER MR5's LDAC path (SQ and HQ, 44.1 and 48 kHz) have
-been exercised, without congestion. Other codecs have software negotiation, policy, encoder
-and decoder regression coverage.
+only the Sony's SBC path and the EDIFIER MR5's LDAC path (SQ and HQ, 44.1 and 48 kHz,
+PN-started and receiver-started) have been exercised, without congestion. Other codecs have
+software negotiation, policy, encoder and decoder regression coverage.
 
 ## Implementation and verification
 
