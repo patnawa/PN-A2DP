@@ -245,6 +245,15 @@
 #define IDC_SINK_LIST           1802
 #define IDC_SINK_DETAIL         1803
 #define IDC_SINK_REFRESH        1804
+/* sink page: speaker delay (lip-sync), 0.1.0.38 */
+#define IDC_SINK_DELAY_STATUS   1805
+#define IDC_SINK_DELAY_AUTO     1806   /* AUTO and FIXED: one radio group, consecutive ids */
+#define IDC_SINK_DELAY_FIXED    1807
+#define IDC_SINK_DELAY_MS       1808
+#define IDC_SINK_DELAY_SCOPE    1809
+#define IDC_SINK_MIC            1810
+#define IDC_SINK_MEASURE        1811
+#define IDC_SINK_MEASURE_RESULT 1812
 
 /* driver page */
 #define IDC_DRV_CURRENT         1901

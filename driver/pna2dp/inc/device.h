@@ -59,6 +59,9 @@ typedef struct PNA2DP_DEVICE {
     KSPIN_LOCK          StatusLock;
     PNA2DP_CONFIG       Config;
     PNA2DP_CONFIG       WorkConfig;       /* the worker's copy of Config for one pass (StateMutex) */
+    LONG                SinkDelaySetting; /* interlocked: Config.SinkDelayMs / SinkDelayCodec as one word
+                                           * (PnSinkDelaySettingPack) for the lock-free DeviceSinkDelayUs;
+                                           * written with Config under StatusLock */
     PNA2DP_CAPABILITIES Caps;
     PNA2DP_STATUS       Status;
     A2DP_CODEC_CONFIG   Active;           /* negotiated codec configuration */
@@ -199,7 +202,7 @@ NTSTATUS DeviceQueueWaitEvent(_Inout_ PPNA2DP_DEVICE D, _In_ PIRP Irp);
 VOID     DeviceFlushWaitersForFile(_Inout_ PPNA2DP_DEVICE D, _In_ PFILE_OBJECT File);
 VOID     DeviceHostChanged(_Inout_ PPNA2DP_DEVICE D);                                 /* codec host (un)registered */
 VOID     DevicePowerChanged(_Inout_ PPNA2DP_DEVICE D, _In_ DEVICE_POWER_STATE State, _In_ SYSTEM_POWER_STATE SystemState);
-ULONG    DeviceSinkDelayUs(_In_ PPNA2DP_DEVICE D);   /* <= DISPATCH, lock-free: receiver latency of the stream */
+ULONG    DeviceSinkDelayUs(_In_ PPNA2DP_DEVICE D);   /* <= DISPATCH, lock-free: receiver latency of the stream (as applied) */
 VOID     DeviceMediaStalled(_Inout_ PPNA2DP_DEVICE D);  /* <= DISPATCH: media writes stopped completing (C4) */
 
 /* Scheduling */

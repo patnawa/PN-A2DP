@@ -3,7 +3,8 @@
    wraps, and a second line below a one-line control is not drawn, so the end of the text
    disappears; an end-ellipsis label shows "...". Read-only, except that -MinSize briefly
    shrinks the panel to its minimum size and then restores it.
-   Run it with the panel open on the Status page of a PN-A2DP receiver. Exit 1 on any FAIL. #>
+   Run it with the panel open on the Status page of a PN-A2DP receiver, and again on its Headset
+   page for the speaker-delay texts (a hidden page's controls are skipped). Exit 1 on any FAIL. #>
 param([int]$ProcessId = 0, [switch]$MinSize, [switch]$ShowAll)
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -50,8 +51,10 @@ public static class PnFit {
 }
 '@
 
-# The longest text each Status value can show (panel.cpp LoadStatus, tools/common/pnctl.cpp).
-# Keep this table in step with those strings.
+# The longest text each Status value and each Headset page speaker-delay text can show (panel.cpp
+# LoadStatus and the speaker delay functions, tools/common/pnctl.cpp, tools/common/pnlatency.cpp).
+# Keep this table in step with those strings. Reports are at most 6553.5 ms; an ignored one is
+# below 80 ms; a fixed delay is at most 1000 ms.
 $longest = @{
     1103 = @('served by the Microsoft inbox driver', 'PN-A2DP driver not responding')                 # State
     1104 = @('aptX Low Latency (ABR reduced)')                                                         # Codec
@@ -60,7 +63,9 @@ $longest = @{
     1106 = @('codec host plugin')                                                                      # Encoder
     1107 = @('1000 kbps (ceiling 1000 kbps)')                                                          # Bitrate
     1108 = @('1500 ms estimated end to end')                                                           # Latency
-    1109 = @('not reported; a per-codec default is assumed', '1500.0 ms reported by the headset')      # Sink delay
+    1109 = @('not reported; a per-codec default is assumed', '6553.5 ms reported by the headset',      # Sink delay (drivers before 0.1.0.25)
+             '6553.5 ms reported by the speaker', '1000 ms fixed; the speaker reports 6553.5 ms',        # Sink delay (pnctl SinkDelayShortText)
+             '1000 ms fixed; the 79.9 ms report is ignored', '180 ms default; the 79.9 ms report is ignored')
     1113 = @('audio running, in range, rate converted (2:1)')                                         # Flags
     1127 = @('64 now, 64 peak')                                                                        # TX queue
     1128 = @('65535 us avg, 999999 us max')                                                            # TX completion
@@ -68,6 +73,23 @@ $longest = @{
     1140 = @('not installed (only SBC is available; run the installer or Driver > Install)')           # Codec host service
     1141 = @('kernel: SBC   codec host: SBC AAC aptX aptX HD aptX Low Latency LDAC')                  # Encoders
     1142 = @('PN-A2DP 0.1.0.65535 (ABI 1)')                                                            # Driver
+    # Headset page, speaker delay (lip-sync): status line (pnctl SinkDelayText), the fixed delay's codec
+    1805 = @('Using 1000 ms, the fixed speaker delay; the speaker''s report of 79.9 ms is ignored as impossible',
+             'Using 180 ms, the aptX HD default; the speaker''s report of 79.9 ms is ignored as impossible',
+             'Using 60 ms, the aptX Low Latency default; the speaker does not report its delay',
+             'Speaker delay settings and the measurement need driver 0.1.0.25 or later.')
+    1809 = @('ms, for aptX Low Latency')
+    # Headset page: the measurement's hint, progress and results (two lines; panel.cpp, pnlatency.cpp)
+    1812 = @('Measure with microphone: the speaker plays 8 short chirps, the microphone hears when they come out, and the speaker delay it finds is entered as the fixed delay for the current codec. Apply changes saves it.',
+             'No microphone is available. Connect one (a USB microphone works well), allow desktop apps to use it (Windows Settings > Privacy & security > Microphone), then press Refresh.',
+             'The microphone recorded only silence. Check that it is not muted and that desktop apps may use it (Windows Settings > Privacy & security > Microphone), then try again.',
+             'The chirps arrived with delays that differ by 1999 ms. Background noise, or the speaker changed its delay during the test. Try again in a quiet room with no other sound playing.',
+             'This microphone records at 11025 Hz, too low for the test sound (Bluetooth headset microphones often record this way). Choose a microphone that records at 16 kHz or more.',
+             'The speaker changed its delay during the test (the driver applied 6553.5 ms, then 1000 ms). Play nothing else to it, wait 10 seconds, then try again.',
+             'The driver did not report the speaker delay it applies, so the result cannot be turned into a setting. Driver 0.1.0.25 or later is needed.',
+             'The speaker''s audio clock did not start. Check that the speaker is connected and not used exclusively by another app, then try again.',
+             'The output''s audio clock stopped during the test (7 of 8 chirps timed). Check that the speaker stays connected, then try again.',
+             'Measured 1000 ms (8 of 8 chirps, spread 20 ms). Apply changes to use it.')
 }
 
 if (-not $ProcessId) {

@@ -12,6 +12,11 @@
  *   pna2dpctl connect    [-d N]         connect the receiver, as Windows Settings' Connect does
  *   pna2dpctl disconnect [-d N]         disconnect the receiver, as Windows Settings' Disconnect does
  *   pna2dpctl windows connect|disconnect [-d N]   the same for any paired A2DP device (any driver)
+ *   pna2dpctl measure-delay [-d N] [mic=<name part>] [apply]
+ *                                       play 8 chirps on the speaker, record them with a microphone
+ *                                       (the default one, or the one whose name contains the part)
+ *                                       and print the speaker delay; apply saves it for the codec
+ *                                       that played (driver 0.1.0.25 or later)
  *
  * Keys for `set`: codecs=ldac,aptxhd,aac,aptx,aptxll,sbc (priority order)
  *                 enable=<codec>,...   disable=<codec>,...
@@ -24,6 +29,8 @@
  *                 latency.profile=music|balanced|low  (150/450, 60/250, 30/120 ms; custom = keep)
  *                 preset=best|defaults|lowlatency|compat|sbcxq  (the panel's presets; volume kept)
  *                 suspendonsco=0|1  hostonly=0|1
+ *                 sinkdelay=auto|N(ms, 1..1000)  sinkdelay.codec=any|sbc|aac|aptx|aptxhd|aptxll|ldac
+ *                   (the speaker delay assumed instead of the receiver's reports, for one codec or any)
  *                 Keys apply left to right: "preset=best latency.profile=balanced" ends Balanced.
  *
  * SPDX-License-Identifier: MIT
@@ -34,10 +41,14 @@
 #include <cfgmgr32.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
+#include <atomic>
 #include <string>
 #include <vector>
 #include "pna2dp_public.h"
+#include "config_policy.h"
 #include "../common/pnctl.h"
+#include "../common/pnlatency.h"
 #include "../common/pnspatial.h"
 #include "../common/pnaudio.h"
 #include "../common/pndrv.h"
@@ -116,8 +127,10 @@ static void PrintStatus(HANDLE h)
     printf("codec       : %s%s  %ls  (encoder: %s)\n", CodecName(s.Codec), (s.Flags & PNA2DP_STATUS_FLAG_ABR_ACTIVE) ? " (ABR reduced)" : "",
            pn::StreamFormatText(s).c_str(), s.EncoderOwner == 1 ? "kernel" : s.EncoderOwner == 2 ? "codec host" : "-");
     printf("bitrate     : %u kbps (max %u)\n", s.BitrateBps / 1000, s.MaxBitrateBps / 1000);
-    printf("latency     : %u ms estimated, sink reports %u.%u ms%s\n", s.EstimatedLatencyUs / 1000, s.SinkReportedDelayUs / 1000, (s.SinkReportedDelayUs / 100) % 10,
-           (s.Flags & PNA2DP_STATUS_FLAG_DELAY_REPORTING) ? "" : s.SinkReportedDelayUs ? " (reported without delay-reporting negotiation)" : " (not reported; a per-codec default is assumed)");
+    printf("latency     : %u ms estimated end to end\n", s.EstimatedLatencyUs / 1000);
+    /* the speaker delay the driver applies and its source (0.1.0.25): reported, fixed or the default */
+    printf("sink delay  : %ls%s\n", pn::SinkDelayText(s).c_str(),
+           s.SinkReportedDelayUs && !(s.Flags & PNA2DP_STATUS_FLAG_DELAY_REPORTING) ? " (reported without delay-reporting negotiation)" : "");
     printf("media mtu   : %u   AVDTP %x.%x   remote SEID %u\n", s.MediaMtu, s.AvdtpVersion >> 8, s.AvdtpVersion & 0xFF, s.RemoteSeid);
     if (s.LastError) printf("last error  : 0x%08x\n", s.LastError);
 }
@@ -140,6 +153,8 @@ static void PrintCaps(HANDLE h)
             printf("\n           rates %s%s%s%s  modes %s%s%s%s  bitpool %u..%u", (s.CodecInfo[0] & 0x80) ? "16k " : "", (s.CodecInfo[0] & 0x40) ? "32k " : "",
                    (s.CodecInfo[0] & 0x20) ? "44.1k " : "", (s.CodecInfo[0] & 0x10) ? "48k" : "", (s.CodecInfo[0] & 0x08) ? "mono " : "", (s.CodecInfo[0] & 0x04) ? "dual " : "",
                    (s.CodecInfo[0] & 0x02) ? "stereo " : "", (s.CodecInfo[0] & 0x01) ? "joint" : "", s.CodecInfo[2], s.CodecInfo[3]);
+        } else if (pn::SepRatesText(s) != L"-") {
+            printf("\n           rates %ls", pn::SepRatesText(s).c_str());   /* e.g. LDAC 44.1k, 48k, 96k */
         }
         printf("\n");
     }
@@ -165,6 +180,7 @@ static void PrintConfig(const PNA2DP_CONFIG &c)
     printf("LDAC           : quality %s, abr %u, rates %s, formats 0x%02x\n", c.Ldac.Eqmid == 0 ? "HQ (990k)" : c.Ldac.Eqmid == 1 ? "SQ (660k)" : c.Ldac.Eqmid == 2 ? "MQ (330k)" : "ABR",
            c.Ldac.AbrEnable, RateMaskStr(c.Ldac.RateMask).c_str(), c.Ldac.FormatMask);
     printf("volume         : %d dB (persisted)\n", c.VolumeDb16 / 65536);
+    printf("sink delay     : %ls\n", pn::SinkDelaySettingText(c).c_str());
 }
 
 static void PrintStats(HANDLE h)
@@ -273,6 +289,14 @@ static int DoSet(HANDLE h, int argc, char **argv, int start)
         else if (!_stricmp(k, "autoquality")) flag(PNA2DP_CFG_AUTO_QUALITY);
         else if (!_stricmp(k, "abrfloor")) c.AbrFloorBps = (ULONG)strtoul(v, NULL, 10);
         else if (!_stricmp(k, "applylive")) flag(PNA2DP_CFG_APPLY_LIVE);
+        else if (!_stricmp(k, "sinkdelay") || !_stricmp(k, "sinkdelay.codec")) {
+            std::wstring wk(k, k + strlen(k)), wv(v, v + strlen(v));
+            if (pn::SinkDelayKey(c, wk.c_str(), wv.c_str()) != 1) {
+                fprintf(stderr, !_stricmp(k, "sinkdelay") ? "sinkdelay must be auto or 1..1000 (ms), not %s\n"
+                                                          : "unknown codec %s for sinkdelay.codec (any, sbc, aac, aptx, aptxhd, aptxll, ldac)\n", v);
+                return 1;
+            }
+        }
         else { fprintf(stderr, "unknown key %s\n", k); return 1; }
     }
     if (!Ioctl(h, IOCTL_PNA2DP_SET_CONFIG, &c, sizeof(c), NULL, 0)) return 1;
@@ -317,6 +341,113 @@ static int OneShotCommand(const std::wstring &instanceId, bool connect, const st
     }
     wprintf(L"%s: %s\n", name.c_str(), pn::BluetoothAudioOneShotText(hr, stage, connect, pnDriver).c_str());
     return SUCCEEDED(hr) ? 0 : 1;
+}
+
+/* measure-delay: the panel's "Measure with microphone". Plays sound on the speaker and records
+ * the microphone for about 13 s (pnlatency.h); runs only when asked for on the command line. */
+static std::atomic<bool> g_cancelMeasure{ false };
+static BOOL WINAPI MeasureCtrlHandler(DWORD type)
+{
+    if (type != CTRL_C_EVENT && type != CTRL_BREAK_EVENT) return FALSE;
+    g_cancelMeasure = true;
+    return TRUE;
+}
+
+static int MeasureDelayCommand(int dev, int argc, char **argv, int first)
+{
+    std::wstring micPart;
+    bool apply = false;
+    for (int i = first; i < argc; i++) {
+        if (!_strnicmp(argv[i], "mic=", 4)) {
+            int n = MultiByteToWideChar(CP_ACP, 0, argv[i] + 4, -1, NULL, 0);
+            std::vector<wchar_t> w(n > 0 ? n : 1);
+            if (n > 0) MultiByteToWideChar(CP_ACP, 0, argv[i] + 4, -1, w.data(), n);
+            micPart = w.data();
+        } else if (!_stricmp(argv[i], "apply")) apply = true;
+        else { fprintf(stderr, "Usage: pna2dpctl measure-delay [-d N] [mic=<name part>] [apply]\n"); return 1; }
+    }
+    const auto paths = EnumerateDevices();
+    if (paths.empty()) { fprintf(stderr, "no PN-A2DP devices found (is the driver installed and the headset paired?)\n"); return 1; }
+    if (dev < 0 || dev >= (int)paths.size()) { fprintf(stderr, "device index out of range (0..%zu)\n", paths.size() - 1); return 1; }
+    std::wstring instanceId;
+    for (const auto &iface : pn::EnumerateControlInterfaces()) if (!_wcsicmp(iface.path.c_str(), paths[dev].c_str())) instanceId = iface.instanceId;
+    if (instanceId.empty()) { fprintf(stderr, "Could not resolve the selected device instance\n"); return 1; }
+    HANDLE h = OpenDevice(dev);
+    if (h == INVALID_HANDLE_VALUE) return 1;
+    struct Close { HANDLE h; ~Close() { CloseHandle(h); } } closeHandle{ h };
+    PNA2DP_VERSION v = {};
+    if (!Ioctl(h, IOCTL_PNA2DP_GET_VERSION, NULL, 0, &v, sizeof(v))) return 1;
+    if (!pn::DriverAppliesSinkDelay(v)) {
+        fprintf(stderr, "measure-delay needs driver 0.1.0.25 or later (this one is %u.%u.0.%u)\n", v.DriverVersion >> 24, (v.DriverVersion >> 16) & 0xFF, v.DriverVersion & 0xFFFF);
+        return 1;
+    }
+    pn::WindowsAudioInfo audio = pn::QueryWindowsAudio(instanceId);
+    if (!audio.active || audio.endpointId.empty()) { fprintf(stderr, "the speaker has no active Windows audio output; connect it, then try again\n"); return 1; }
+    std::vector<pn::CaptureEndpoint> mics;
+    HRESULT hr = pn::ListCaptureEndpoints(mics);
+    if (FAILED(hr)) { fprintf(stderr, "the microphones could not be listed: 0x%08lx\n", (unsigned long)hr); return 1; }
+    int mic = pn::MatchCaptureEndpoint(mics, micPart);
+    if (mic < 0) {
+        if (mics.empty()) fprintf(stderr, "no microphone found; connect one (a USB microphone works well), then try again\n");
+        else {
+            fprintf(stderr, mic == -2 ? "several microphones match \"%ls\"; give more of the name:\n" : "no microphone matches \"%ls\"; available:\n", micPart.c_str());
+            for (const auto &m : mics) fprintf(stderr, "  %ls%s\n", m.name.c_str(), m.isDefault ? " (default)" : "");
+        }
+        return 1;
+    }
+    /* the lag range follows the delay the driver is expected to apply: a fixed delay far longer
+     * than the speaker's makes the sound come before the clock says it plays */
+    PNA2DP_CONFIG config = {};
+    if (!Ioctl(h, IOCTL_PNA2DP_GET_CONFIG, NULL, 0, &config, sizeof(config))) return 1;
+    PNA2DP_STATUS before = {};
+    DWORD got = 0;
+    if (!DeviceIoControl(h, IOCTL_PNA2DP_GET_STATUS, NULL, 0, &before, sizeof(before), &got, NULL) || before.Size != sizeof(before)) before = {};
+    pn::LatencyOptions options;
+    pn::FitLatencyLagRange(options, pn::ExpectedSinkDelayMs(before, config));
+    printf("speaker    : %ls\nmicrophone : %ls\n", audio.endpointName.c_str(), mics[mic].name.c_str());
+    printf("Playing %zu short chirps over about %llu s. Keep the microphone 10 to 30 cm from the speaker, play nothing else\n"
+           "and keep the room quiet. Ctrl+C cancels.\n", options.spacingMs.size() + 1, (pn::LatencyTotalFrames(options, 1000) + 999) / 1000);
+    pn::AppliedDelayReadings applied;
+    auto progress = [&](const pn::LatencyProgress &p) {
+        if (!p.step) return;
+        if (pn::AppliedDelayReadings::ReadOn(p)) {
+            /* the delay the driver applies while the chirps play (silent on failure: a missing reading fails the result) */
+            PNA2DP_STATUS s = {};
+            DWORD bytes = 0;
+            if (DeviceIoControl(h, IOCTL_PNA2DP_GET_STATUS, NULL, 0, &s, sizeof(s), &bytes, NULL) && s.Size == sizeof(s))
+                applied.Add(s.SinkDelayUs, s.Codec, pn::AppliedDelayReadings::Finishing(p));
+        }
+        printf("  %ls\n", pn::LatencyProgressText(p).c_str());
+    };
+    g_cancelMeasure = false;
+    SetConsoleCtrlHandler(MeasureCtrlHandler, TRUE);
+    pn::LatencyMeasurement run = pn::MeasureOutputLatency(audio.endpointId, mics[mic].id, options, &g_cancelMeasure, progress);
+    SetConsoleCtrlHandler(MeasureCtrlHandler, FALSE);
+    if (run.result.chirps.empty()) printf("%ls\n", run.result.message.c_str());   /* failed before the analysis */
+    else printf("\n%ls", pn::LatencyReport(run.result).c_str());
+    if (FAILED(run.hr) || !run.result.ok()) return 1;
+    printf("microphone input: %u Hz, %u ch, %u-bit%s%s", run.captureRate, run.captureChannels, run.captureBits, run.captureFloat ? " float" : "",
+           run.captureRaw ? ", raw (no effects)" : "");
+    if (run.captureChannels > 1) printf(", channel %u analysed", run.captureChannel + 1u);   /* the one that heard the chirps */
+    printf("\n");
+    pn::SpeakerDelayMeasurement measured = pn::SpeakerDelayFromRun(run.result, applied, PN_CONFIG_MAX_SINK_DELAY_MS);
+    if (!measured.ok) { fprintf(stderr, "%ls\n", measured.message.c_str()); return 1; }
+    printf("speaker delay: %u ms for %ls (the driver applied %ls; the sound came %.1f ms %s)\n", measured.delayMs,
+           applied.codec ? pn::CodecName(applied.codec) : L"any codec", pn::DelayMsText(applied.firstUs).c_str(), fabs(run.result.lateMs),
+           run.result.lateMs < 0 ? "earlier" : "later");
+    if (!apply) {
+        printf("not saved; run measure-delay with apply, or: pna2dpctl set -d %d sinkdelay=%u sinkdelay.codec=%ls\n", dev, measured.delayMs,
+               applied.codec ? pn::CodecKey(applied.codec) : L"any");   /* -d: the device measured, not device 0 */
+        return 0;
+    }
+    PNA2DP_CONFIG c = {};
+    if (!Ioctl(h, IOCTL_PNA2DP_GET_CONFIG, NULL, 0, &c, sizeof(c))) return 1;
+    c.SinkDelayMs = measured.delayMs;
+    c.SinkDelayCodec = applied.codec;   /* the codec that played: a fixed delay applies to it */
+    if (!Ioctl(h, IOCTL_PNA2DP_SET_CONFIG, &c, sizeof(c), NULL, 0)) return 1;
+    if (!Ioctl(h, IOCTL_PNA2DP_GET_CONFIG, NULL, 0, &c, sizeof(c))) return 1;
+    printf("saved: sink delay %ls\n", pn::SinkDelaySettingText(c).c_str());
+    return 0;
 }
 
 static int WindowsCommand(int argc, char **argv)
@@ -364,7 +495,10 @@ int main(int argc, char **argv)
                "       pna2dpctl list|status|spatial|quality|caps|config|auto|set|watch|stats|trace|reconnect|connect|disconnect [-d index] [key=value ...]\n"
                "         connect / disconnect: connect or disconnect the receiver, as Windows Settings does\n"
                "         reconnect: reset the link (disconnect first, then connect)\n"
-               "         set keys include latency.profile=music|balanced|low and preset=best|defaults|lowlatency|compat|sbcxq\n");
+               "         set keys include latency.profile=music|balanced|low and preset=best|defaults|lowlatency|compat|sbcxq,\n"
+               "         sinkdelay=auto|<ms> and sinkdelay.codec=any|sbc|aac|aptx|aptxhd|aptxll|ldac\n"
+               "       pna2dpctl measure-delay [-d index] [mic=<name part>] [apply]\n"
+               "         play 8 chirps, record them with a microphone and print the speaker delay; apply saves it\n");
         return 1;
     }
     const char *cmd = argv[1];
@@ -394,6 +528,7 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "Could not resolve the selected device instance\n"); return 1;
     }
+    if (!strcmp(cmd, "measure-delay")) return MeasureDelayCommand(dev, argc, argv, first);
     if (!strcmp(cmd, "connect") || !strcmp(cmd, "disconnect")) {
         const auto paths = EnumerateDevices();
         if (paths.empty()) { fprintf(stderr, "no PN-A2DP devices found (is the driver installed and the headset paired?)\n"); return 1; }

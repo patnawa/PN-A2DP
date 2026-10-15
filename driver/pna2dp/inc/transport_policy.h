@@ -1088,16 +1088,87 @@ static inline ULONG PnDefaultSinkDelayUs(ULONG Codec)
     }
 }
 
-/* Sink delay for the current stream (C2). ReportedTenthsMs: last AVDTP DELAYREPORT of
- * this stream. The acceptor stores a report only for the stream's own SEID and the value is
- * reset with every configuration (T6), so a received report is this stream's real delay and
- * is used even when delay reporting was not negotiated: some sinks (the EDIFIER MR5 on its
- * LDAC SEP) report without offering the capability. DelayNegotiated only documents the case. */
+/* Plausibility floor of a receiver's delay report (0.1.0.25). No receiver presents audio
+ * sooner than it decodes a frame and fills its jitter buffer: a report below the floor is
+ * not its delay. The EDIFIER MR5 (LDAC 48 kHz) reports 25.0 ms right after it sets up the
+ * stream itself and 364.0 ms after a stream restart; a microphone measured 265-295 ms both
+ * times. A report below the floor is not used (the per-codec default applies) and the status
+ * says so (SINK_DELAY_IGNORED). LDAC, AAC and aptX HD sinks buffer long; aptX, SBC and
+ * unknown codecs less; aptX LL sinks run short buffers, so any report is believed. */
+#define PN_SINK_DELAY_FLOOR_LONG_US    80000u   /* LDAC, AAC, aptX HD */
+#define PN_SINK_DELAY_FLOOR_US         40000u   /* aptX, SBC and unknown codecs */
+
+static inline ULONG PnMinPlausibleSinkDelayUs(ULONG Codec)
+{
+    switch (Codec) {
+    case PNA2DP_CODEC_LDAC: case PNA2DP_CODEC_AAC: case PNA2DP_CODEC_APTX_HD: return PN_SINK_DELAY_FLOOR_LONG_US;
+    case PNA2DP_CODEC_APTX_LL: return 0;
+    default: return PN_SINK_DELAY_FLOOR_US;
+    }
+}
+
+/* Where the applied sink delay comes from (PnSinkDelayDecide). */
+typedef enum _PN_SINK_DELAY_SOURCE {
+    PnSinkDelayNoStream = 0,
+    PnSinkDelaySet,          /* the configured speaker delay (PNA2DP_CONFIG.SinkDelayMs) */
+    PnSinkDelayReported,     /* the receiver's report */
+    PnSinkDelayDefault       /* the per-codec default: no report, or one below the floor */
+} PN_SINK_DELAY_SOURCE;
+
+typedef struct _PN_SINK_DELAY_INPUT {
+    BOOLEAN StreamActive;      /* an AVDTP stream exists (not Idle) */
+    BOOLEAN ReportReceived;    /* a DELAYREPORT of this stream (T6) */
+    ULONG   ReportedTenthsMs;  /* its value (16 bits on the wire) */
+    ULONG   Codec;             /* PNA2DP_CODEC of the stream, NONE before it is known */
+    ULONG   SetMs;             /* PNA2DP_CONFIG.SinkDelayMs: 0 = automatic */
+    ULONG   SetCodec;          /* PNA2DP_CONFIG.SinkDelayCodec: 0 = any codec */
+} PN_SINK_DELAY_INPUT;
+
+typedef struct _PN_SINK_DELAY {
+    ULONG                Us;             /* applied delay; 0 without a stream */
+    ULONG                ReportedUs;     /* the receiver's report, 0 if none (PNA2DP_STATUS.SinkReportedDelayUs) */
+    PN_SINK_DELAY_SOURCE Source;
+    BOOLEAN              ReportIgnored;  /* the report is below the floor: not used (also when a set value applies) */
+} PN_SINK_DELAY;
+
+/* Sink delay for the current stream (C2; 0.1.0.25). ReportedTenthsMs: last AVDTP DELAYREPORT
+ * of this stream. The acceptor stores a report only for the stream's own SEID and the value
+ * is reset with every configuration (T6), so a received report belongs to this stream and is
+ * used even when delay reporting was not negotiated: some sinks (the EDIFIER MR5 on its LDAC
+ * SEP) report without offering the capability. Order: no stream -> 0; the configured speaker
+ * delay when it is set for any codec or for this one; a report at or above the codec's floor;
+ * else the per-codec default. */
+static inline PN_SINK_DELAY PnSinkDelayDecide(const PN_SINK_DELAY_INPUT *In)
+{
+    PN_SINK_DELAY r = { 0, 0, PnSinkDelayNoStream, FALSE };
+    if (!In->StreamActive) return r;
+    if (In->ReportReceived) {
+        r.ReportedUs = In->ReportedTenthsMs * 100;   /* <= 6553.5 ms */
+        r.ReportIgnored = r.ReportedUs < PnMinPlausibleSinkDelayUs(In->Codec);
+    }
+    if (In->SetMs && (!In->SetCodec || In->SetCodec == In->Codec)) { r.Us = In->SetMs * 1000; r.Source = PnSinkDelaySet; }
+    else if (In->ReportReceived && !r.ReportIgnored) { r.Us = r.ReportedUs; r.Source = PnSinkDelayReported; }
+    else { r.Us = PnDefaultSinkDelayUs(In->Codec); r.Source = PnSinkDelayDefault; }
+    return r;
+}
+
+/* The automatic decision (no speaker delay set). DelayNegotiated only documents the case. */
 static inline ULONG PnSinkDelayUs(BOOLEAN StreamActive, BOOLEAN DelayNegotiated, BOOLEAN ReportReceived,
                                   ULONG ReportedTenthsMs, ULONG Codec)
 {
     (void)DelayNegotiated;
-    if (!StreamActive) return 0;
-    if (ReportReceived) return ReportedTenthsMs * 100;
-    return PnDefaultSinkDelayUs(Codec);
+    PN_SINK_DELAY_INPUT in = { StreamActive, ReportReceived, ReportedTenthsMs, Codec, 0, 0 };
+    return PnSinkDelayDecide(&in).Us;
 }
+
+/* DeviceSinkDelayUs reads the speaker-delay setting lock-free at <= DISPATCH (the WaveRT
+ * presentation position), so both words travel as one LONG: milliseconds in the low 16 bits
+ * (validated <= 1000), the codec above them. */
+static inline LONG PnSinkDelaySettingPack(ULONG SetMs, ULONG SetCodec)
+{
+    if (SetMs > 0xFFFFu) SetMs = 0xFFFFu;
+    return (LONG)(SetMs | ((SetCodec & 0x7FFFu) << 16));
+}
+
+static inline ULONG PnSinkDelaySettingMs(LONG Setting) { return (ULONG)Setting & 0xFFFFu; }
+static inline ULONG PnSinkDelaySettingCodec(LONG Setting) { return ((ULONG)Setting >> 16) & 0x7FFFu; }

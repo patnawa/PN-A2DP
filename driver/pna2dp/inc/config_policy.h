@@ -38,6 +38,9 @@
 #define PN_CONFIG_MIN_TARGET_MS          20u
 #define PN_CONFIG_MAX_TARGET_MS         400u
 #define PN_CONFIG_MAX_LATENCY_MS        500u
+/* Speaker delay (SinkDelayMs, 0.1.0.25): 0 = automatic (the receiver's plausible reports, else
+ * the per-codec default; transport_policy.h PnSinkDelayDecide), else up to this many ms. */
+#define PN_CONFIG_MAX_SINK_DELAY_MS    1000u
 
 /* RegCfgLoadDevice results meaning "no configuration stored" (STATUS_OBJECT_NAME_NOT_FOUND,
  * STATUS_OBJECT_PATH_NOT_FOUND; regcfg.cpp asserts the values). */
@@ -118,6 +121,8 @@ static inline BOOLEAN PnConfigValidate(PNA2DP_CONFIG *Cfg)
     if (Cfg->Ldac.Eqmid > PNA2DP_LDAC_EQMID_MQ && Cfg->Ldac.Eqmid != PNA2DP_LDAC_EQMID_ABR) Cfg->Ldac.Eqmid = PNA2DP_LDAC_EQMID_SQ;
     if (Cfg->VolumeDb16 > 0) Cfg->VolumeDb16 = 0;
     if (Cfg->VolumeDb16 < -96 * 0x10000) Cfg->VolumeDb16 = -96 * 0x10000;
+    if (Cfg->SinkDelayCodec >= PNA2DP_CODEC_MAX) Cfg->SinkDelayMs = Cfg->SinkDelayCodec = 0;   /* automatic */
+    if (Cfg->SinkDelayMs > PN_CONFIG_MAX_SINK_DELAY_MS) Cfg->SinkDelayMs = PN_CONFIG_MAX_SINK_DELAY_MS;
     BOOLEAN any = FALSE;
     for (ULONG i = 0; i < sizeof(Cfg->CodecPriority) / sizeof(Cfg->CodecPriority[0]); i++) {
         if (Cfg->CodecPriority[i] >= PNA2DP_CODEC_MAX) Cfg->CodecPriority[i] = 0;

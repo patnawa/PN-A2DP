@@ -397,8 +397,190 @@ static void TestRateConversionStatus()
     CHECK(pn::StatusFlagsText(PNA2DP_STATUS_FLAG_RATE_CONVERTED) == L"rate converted", "flag text");
     CHECK(pn::StatusFlagsText(PNA2DP_STATUS_FLAG_RATE_CONVERTED | PNA2DP_STATUS_FLAG_HALF_RATE) == L"rate converted (2:1)", "2:1 text");
     CHECK(pn::StatusFlagsText(PNA2DP_STATUS_FLAG_HALF_RATE) == L"2:1 rate conversion", "a 0.1.0.21 driver's half-band flag");
-    /* ABI 1: EngineSampleRate is a former reserved word, the structure keeps its size */
-    static_assert(sizeof(PNA2DP_STATUS) == 224 && offsetof(PNA2DP_STATUS, EngineSampleRate) == 208 && sizeof(s.Reserved) == 12, "PNA2DP_STATUS layout");
+    /* ABI 1: EngineSampleRate and SinkDelayUs (0.1.0.25) are former reserved words, the structure keeps its size */
+    static_assert(sizeof(PNA2DP_STATUS) == 224 && offsetof(PNA2DP_STATUS, EngineSampleRate) == 208 && offsetof(PNA2DP_STATUS, SinkDelayUs) == 212 &&
+                  sizeof(s.Reserved) == 8, "PNA2DP_STATUS layout");
+}
+
+/* 0.1.0.37: one decoder of a receiver's sample rates for every codec, for the panel's Headset
+ * page and `pna2dpctl caps` (which printed only SBC's): the EDIFIER MR5 with its 96 kHz option */
+static void TestSepRates()
+{
+    PNA2DP_REMOTE_SEP s = {};
+    const UCHAR ldac96[] = { 0x2d, 0x01, 0x00, 0x00, 0xaa, 0x00, 0x34, 0x07 };
+    s.Codec = PNA2DP_CODEC_LDAC; s.VendorId = 0x12D; s.VendorCodecId = 0xAA;
+    memcpy(s.CodecInfo, ldac96, sizeof(ldac96)); s.CodecInfoLength = sizeof(ldac96);
+    CHECK(pn::SepRatesText(s) == L"44.1k, 48k, 96k", "LDAC with 96 kHz: %ls", pn::SepRatesText(s).c_str());
+    CHECK(pn::DescribeSep(s).find(L"Sample rates: 44.1k, 48k, 96k") != std::wstring::npos, "the Headset page shows the same");
+    s.CodecInfo[6] = 0x30;
+    CHECK(pn::SepRatesText(s) == L"44.1k, 48k", "LDAC without it: %ls", pn::SepRatesText(s).c_str());
+    s.CodecInfoLength = 7;
+    CHECK(pn::SepRatesText(s) == L"-", "a short LDAC element: %ls", pn::SepRatesText(s).c_str());
+    const UCHAR sbc[] = { 0xff, 0xff, 0x02, 0x35 };
+    s = {}; s.Codec = PNA2DP_CODEC_SBC; memcpy(s.CodecInfo, sbc, sizeof(sbc)); s.CodecInfoLength = sizeof(sbc);
+    CHECK(pn::SepRatesText(s) == L"16k, 32k, 44.1k, 48k", "SBC: %ls", pn::SepRatesText(s).c_str());
+    const UCHAR aac[] = { 0x80, 0x01, 0x8C, 0x84, 0xE2, 0x00 };   /* 44.1 / 48 kHz */
+    s = {}; s.Codec = PNA2DP_CODEC_AAC; memcpy(s.CodecInfo, aac, sizeof(aac)); s.CodecInfoLength = sizeof(aac);
+    CHECK(pn::SepRatesText(s) == L"44.1k, 48k", "AAC: %ls", pn::SepRatesText(s).c_str());
+    const UCHAR aptxhd[] = { 0xd7, 0x00, 0x00, 0x00, 0x24, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00 };
+    s = {}; s.Codec = PNA2DP_CODEC_APTX_HD; memcpy(s.CodecInfo, aptxhd, sizeof(aptxhd)); s.CodecInfoLength = sizeof(aptxhd);
+    CHECK(pn::SepRatesText(s) == L"44.1k, 48k", "aptX HD: %ls", pn::SepRatesText(s).c_str());
+    const UCHAR faststream[] = { 0x0a, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x03 };   /* music sink, 44.1 / 48 kHz */
+    s = {}; s.Codec = PNA2DP_CODEC_FASTSTREAM; memcpy(s.CodecInfo, faststream, sizeof(faststream)); s.CodecInfoLength = sizeof(faststream);
+    CHECK(pn::SepRatesText(s) == L"44.1k, 48k", "FastStream: %ls", pn::SepRatesText(s).c_str());
+    s = {}; s.Codec = PNA2DP_CODEC_OPUS; s.CodecInfoLength = 9;
+    CHECK(pn::SepRatesText(s) == L"48k", "Opus: %ls", pn::SepRatesText(s).c_str());
+    s = {}; s.Codec = PNA2DP_CODEC_NONE;
+    CHECK(pn::SepRatesText(s) == L"-", "an unknown codec");
+}
+
+/* 0.1.0.38: the speaker delay the driver applies (0.1.0.25 SinkDelayUs, SINK_DELAY_SET /
+ * SINK_DELAY_IGNORED) in words, for the Headset page, the Status page and pna2dpctl status.
+ * The EDIFIER MR5 (LDAC) reports 25 ms after it sets up the stream and 364 ms later; a
+ * microphone measured about 280 ms. */
+static void TestSinkDelayText()
+{
+    PNA2DP_STATUS s = {};
+    CHECK(pn::SinkDelaySourceOf(s) == pn::SinkDelaySource::NoStream && pn::SinkDelayText(s) == L"No stream" && pn::SinkDelayShortText(s) == L"no stream",
+          "no stream: %ls / %ls", pn::SinkDelayText(s).c_str(), pn::SinkDelayShortText(s).c_str());
+    s.State = PNA2DP_STATE_STREAMING; s.Codec = PNA2DP_CODEC_LDAC;
+    s.SinkReportedDelayUs = 364000; s.SinkDelayUs = 364000; s.Flags = PNA2DP_STATUS_FLAG_AUDIO_ACTIVE;
+    CHECK(pn::SinkDelaySourceOf(s) == pn::SinkDelaySource::Reported, "a plausible report is the source");
+    CHECK(pn::SinkDelayText(s) == L"Using 364 ms reported by the speaker", "reported: %ls", pn::SinkDelayText(s).c_str());
+    CHECK(pn::SinkDelayShortText(s) == L"364 ms reported by the speaker", "reported, short: %ls", pn::SinkDelayShortText(s).c_str());
+    s.SinkDelayUs = 280000; s.Flags |= PNA2DP_STATUS_FLAG_SINK_DELAY_SET;
+    CHECK(pn::SinkDelaySourceOf(s) == pn::SinkDelaySource::Set, "the fixed delay is the source");
+    CHECK(pn::SinkDelayText(s) == L"Using 280 ms, the fixed speaker delay; the speaker reports 364 ms", "set: %ls", pn::SinkDelayText(s).c_str());
+    CHECK(pn::SinkDelayShortText(s) == L"280 ms fixed; the speaker reports 364 ms", "set, short: %ls", pn::SinkDelayShortText(s).c_str());
+    s.SinkReportedDelayUs = 25000; s.Flags |= PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED;
+    CHECK(pn::SinkDelayText(s) == L"Using 280 ms, the fixed speaker delay; the speaker's report of 25 ms is ignored as impossible", "set, report ignored: %ls", pn::SinkDelayText(s).c_str());
+    CHECK(pn::SinkDelayShortText(s) == L"280 ms fixed; the 25 ms report is ignored", "set, report ignored, short: %ls", pn::SinkDelayShortText(s).c_str());
+    s.SinkReportedDelayUs = 0; s.Flags &= ~PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED;
+    CHECK(pn::SinkDelayText(s) == L"Using 280 ms, the fixed speaker delay" && pn::SinkDelayShortText(s) == L"280 ms fixed", "set, no report: %ls / %ls",
+          pn::SinkDelayText(s).c_str(), pn::SinkDelayShortText(s).c_str());
+    /* the design's example: the 25 ms report is impossible for LDAC, the default applies */
+    s.Flags = PNA2DP_STATUS_FLAG_AUDIO_ACTIVE | PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED; s.SinkDelayUs = 200000; s.SinkReportedDelayUs = 25000;
+    CHECK(pn::SinkDelaySourceOf(s) == pn::SinkDelaySource::Default, "an ignored report leaves the default");
+    CHECK(pn::SinkDelayText(s) == L"Using 200 ms, the LDAC default; the speaker's report of 25 ms is ignored as impossible", "default, ignored: %ls", pn::SinkDelayText(s).c_str());
+    CHECK(pn::SinkDelayShortText(s) == L"200 ms default; the 25 ms report is ignored", "default, ignored, short: %ls", pn::SinkDelayShortText(s).c_str());
+    s.Flags = 0; s.SinkReportedDelayUs = 0; s.SinkDelayUs = 150000; s.Codec = PNA2DP_CODEC_SBC;
+    CHECK(pn::SinkDelayText(s) == L"Using 150 ms, the SBC default; the speaker does not report its delay", "default, no report: %ls", pn::SinkDelayText(s).c_str());
+    CHECK(pn::SinkDelayShortText(s) == L"150 ms default; not reported", "default, no report, short: %ls", pn::SinkDelayShortText(s).c_str());
+    s.Codec = PNA2DP_CODEC_NONE; s.State = PNA2DP_STATE_CONFIGURED;
+    CHECK(pn::SinkDelayText(s) == L"Using 150 ms, the default; the speaker does not report its delay", "codec not known yet: %ls", pn::SinkDelayText(s).c_str());
+    /* tenths of a millisecond as reported */
+    s.Codec = PNA2DP_CODEC_AAC; s.SinkReportedDelayUs = s.SinkDelayUs = 182400;
+    CHECK(pn::SinkDelayText(s) == L"Using 182.4 ms reported by the speaker", "tenths: %ls", pn::SinkDelayText(s).c_str());
+    CHECK(pn::DelayMsText(25000) == L"25 ms" && pn::DelayMsText(25400) == L"25.4 ms" && pn::DelayMsText(6553500) == L"6553.5 ms" && pn::DelayMsText(0) == L"0 ms", "delay text");
+    /* drivers before 0.1.0.25 report no applied delay (SinkDelayUs 0 with a stream): the former texts */
+    s = {}; s.State = PNA2DP_STATE_STREAMING; s.Codec = PNA2DP_CODEC_LDAC; s.SinkReportedDelayUs = 364000;
+    CHECK(pn::SinkDelaySourceOf(s) == pn::SinkDelaySource::Legacy, "an older driver's report");
+    CHECK(pn::SinkDelayText(s) == L"364.0 ms reported by the headset" && pn::SinkDelayShortText(s) == L"364.0 ms reported by the headset", "older driver: %ls",
+          pn::SinkDelayText(s).c_str());
+    s.SinkReportedDelayUs = 0;
+    CHECK(pn::SinkDelaySourceOf(s) == pn::SinkDelaySource::Legacy && pn::SinkDelayShortText(s) == L"not reported; a per-codec default is assumed",
+          "older driver without a report: %ls", pn::SinkDelayShortText(s).c_str());
+    PNA2DP_VERSION v = {};
+    v.DriverVersion = 0x00010018;
+    CHECK(!pn::DriverAppliesSinkDelay(v), "0.1.0.24 has no speaker delay setting");
+    v.DriverVersion = 0x00010019;
+    CHECK(pn::DriverAppliesSinkDelay(v), "0.1.0.25 has it");
+    v.DriverVersion = 0x00020000;
+    CHECK(pn::DriverAppliesSinkDelay(v), "later versions have it");
+}
+
+/* 0.1.0.38: the speaker delay setting (PNA2DP_CONFIG.SinkDelayMs / SinkDelayCodec, driver
+ * 0.1.0.25): pna2dpctl config text, the set keys and the settings export / import */
+static void TestSinkDelaySetting()
+{
+    PNA2DP_CONFIG c;
+    pn::ConfigDefaults(c);
+    CHECK(c.SinkDelayMs == 0 && c.SinkDelayCodec == 0 && pn::SinkDelaySettingText(c) == L"automatic", "default: automatic (%ls)", pn::SinkDelaySettingText(c).c_str());
+    CHECK(pn::SinkDelayKey(c, L"sinkdelay", L"280") == 1 && c.SinkDelayMs == 280 && c.SinkDelayCodec == 0, "sinkdelay=280");
+    CHECK(pn::SinkDelaySettingText(c) == L"280 ms (any codec)", "any codec: %ls", pn::SinkDelaySettingText(c).c_str());
+    CHECK(pn::SinkDelayKey(c, L"SinkDelay.Codec", L"LDAC") == 1 && c.SinkDelayCodec == PNA2DP_CODEC_LDAC, "sinkdelay.codec=ldac, case-insensitive");
+    CHECK(pn::SinkDelaySettingText(c) == L"280 ms (LDAC)", "for LDAC: %ls", pn::SinkDelaySettingText(c).c_str());
+    CHECK(DriverKeepsUnchanged(c), "the driver keeps 280 ms for LDAC unchanged");
+    CHECK(pn::SinkDelayKey(c, L"sinkdelay", L"300") == 1 && c.SinkDelayMs == 300 && c.SinkDelayCodec == PNA2DP_CODEC_LDAC, "a new value keeps the codec");
+    for (const wchar_t *bad : { L"1001", L"-5", L"abc", L"", L"28o", L"99999999999" }) {
+        PNA2DP_CONFIG before = c;
+        CHECK(pn::SinkDelayKey(c, L"sinkdelay", bad) == 0 && !memcmp(&before, &c, sizeof(c)), "sinkdelay=%ls is refused and changes nothing", bad);
+    }
+    CHECK(pn::SinkDelayKey(c, L"sinkdelay", L"1000") == 1 && c.SinkDelayMs == 1000, "1000 ms is the largest value");
+    CHECK(pn::SinkDelayKey(c, L"sinkdelay.codec", L"aptx-hd") == 1 && c.SinkDelayCodec == PNA2DP_CODEC_APTX_HD, "aptx-hd alias");
+    CHECK(pn::SinkDelayKey(c, L"sinkdelay.codec", L"any") == 1 && c.SinkDelayCodec == 0, "any codec");
+    for (const wchar_t *bad : { L"none", L"mp3", L"" }) {
+        PNA2DP_CONFIG before = c;
+        CHECK(pn::SinkDelayKey(c, L"sinkdelay.codec", bad) == 0 && !memcmp(&before, &c, sizeof(c)), "sinkdelay.codec=%ls is refused", bad);
+    }
+    CHECK(pn::SinkDelayKey(c, L"sinkdelay.codec", L"sbc") == 1 && pn::SinkDelayKey(c, L"sinkdelay", L"AUTO") == 1 && c.SinkDelayMs == 0 && c.SinkDelayCodec == 0,
+          "sinkdelay=auto resets both words");
+    CHECK(pn::SinkDelayKey(c, L"sinkdelay", L"0") == 1 && c.SinkDelayMs == 0, "0 means automatic");
+    CHECK(pn::SinkDelayKey(c, L"latency", L"100") == -1, "other keys are not speaker delay keys");
+    c.SinkDelayCodec = PNA2DP_CODEC_LDAC;   /* a codec word without a delay is still automatic */
+    CHECK(pn::SinkDelaySettingText(c) == L"automatic", "0 ms for LDAC: %ls", pn::SinkDelaySettingText(c).c_str());
+
+    /* export / import */
+    PNA2DP_CONFIG d;
+    pn::ConfigDefaults(d);
+    std::wstring t = pn::ConfigToText(d);
+    CHECK(t.find(L"\r\nsinkdelay=auto\r\nsinkdelay.codec=any\r\n") != std::wstring::npos, "defaults export automatic");
+    PNA2DP_CONFIG m = d;
+    m.SinkDelayMs = 280; m.SinkDelayCodec = PNA2DP_CODEC_LDAC; m.ReconnectDelayMs = 4321;
+    t = pn::ConfigToText(m);
+    CHECK(t.find(L"\r\nsinkdelay=280\r\nsinkdelay.codec=ldac\r\n") != std::wstring::npos, "a measured delay is exported");
+    PNA2DP_CONFIG r = {};
+    CHECK(pn::ConfigFromText(t, r) && !memcmp(&r, &m, sizeof(r)), "speaker delay round trip");
+    size_t at = t.find(L"sinkdelay=280");
+    if (at != std::wstring::npos) t.replace(at, 13, L"sinkdelay=295");
+    CHECK(pn::ConfigFromText(t, r) && r.SinkDelayMs == 295 && r.SinkDelayCodec == PNA2DP_CODEC_LDAC && r.ReconnectDelayMs == 4321, "an edited delay wins over the blob");
+    at = t.find(L"sinkdelay=295");
+    if (at != std::wstring::npos) t.replace(at, 13, L"sinkdelay=auto");
+    CHECK(pn::ConfigFromText(t, r) && r.SinkDelayMs == 0, "an edited auto wins over the blob");
+    CHECK(pn::ConfigFromText(L"sinkdelay=280\nsinkdelay.codec=aac\n", r) && r.SinkDelayMs == 280 && r.SinkDelayCodec == PNA2DP_CODEC_AAC && r.TargetLatencyMs == 60,
+          "key-only file over the defaults");
+    CHECK(!pn::ConfigFromText(L"sinkdelay=2000\n", r), "an invalid delay alone is not a configuration");
+    CHECK(pn::ConfigFromText(L"sinkdelay=2000\nlatency=100\n", r) && r.SinkDelayMs == 0 && r.TargetLatencyMs == 100, "an invalid delay is ignored");
+    CHECK(pn::ConfigFromText(L"sinkdelay=280\nsinkdelay.codec=mp3\n", r) && r.SinkDelayMs == 280 && r.SinkDelayCodec == 0, "an unknown codec is ignored");
+
+    /* presets and automatic codecs choose codecs and buffering: the measured speaker delay stays */
+    for (int i = 0; i <= (int)pn::Preset::SbcXq; i++) {
+        PNA2DP_CONFIG p = m;
+        pn::ApplyPreset(p, (pn::Preset)i);
+        CHECK(p.SinkDelayMs == 280 && p.SinkDelayCodec == PNA2DP_CODEC_LDAC, "preset %d keeps the speaker delay", i);
+        CHECK(DriverKeepsUnchanged(p), "preset %d with a speaker delay is accepted unchanged by the driver", i);
+    }
+    PNA2DP_CONFIG a = m;
+    pn::UseAutomaticCodecs(a);
+    CHECK(a.SinkDelayMs == 280 && a.SinkDelayCodec == PNA2DP_CODEC_LDAC, "automatic codecs keep the speaker delay");
+}
+
+/* The speaker delay a measurement expects the driver to apply while the chirps play: the
+ * measurement's lag range follows it (pnlatency.h FitLatencyLagRange), so a fixed delay that
+ * is far too long is still measured. */
+static void TestExpectedSinkDelay()
+{
+    PNA2DP_STATUS s = {};
+    PNA2DP_CONFIG c;
+    pn::ConfigDefaults(c);
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 0, "no stream, automatic: nothing known (%u)", pn::ExpectedSinkDelayMs(s, c));
+    s.State = PNA2DP_STATE_STREAMING; s.Codec = PNA2DP_CODEC_LDAC; s.SinkDelayUs = s.SinkReportedDelayUs = 364000;
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 364, "the applied report (%u)", pn::ExpectedSinkDelayMs(s, c));
+    s.SinkDelayUs = 364100;
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 365, "rounded up (%u)", pn::ExpectedSinkDelayMs(s, c));
+    s.SinkDelayUs = 364000;
+    c.SinkDelayMs = 1000; c.SinkDelayCodec = PNA2DP_CODEC_LDAC;   /* set; the status has not caught up yet */
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 1000, "a fixed delay for the stream's codec (%u)", pn::ExpectedSinkDelayMs(s, c));
+    c.SinkDelayCodec = 0;
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 1000, "a fixed delay for any codec (%u)", pn::ExpectedSinkDelayMs(s, c));
+    c.SinkDelayCodec = PNA2DP_CODEC_AAC;
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 364, "another codec's fixed delay does not apply (%u)", pn::ExpectedSinkDelayMs(s, c));
+    s.SinkDelayUs = 1000000; s.Flags = PNA2DP_STATUS_FLAG_SINK_DELAY_SET; c.SinkDelayCodec = PNA2DP_CODEC_LDAC;
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 1000, "applied and set agree (%u)", pn::ExpectedSinkDelayMs(s, c));
+    s = {};   /* no stream yet (the measurement starts a fresh one): its codec is not known */
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 1000, "no stream: a fixed delay may apply to the next one (%u)", pn::ExpectedSinkDelayMs(s, c));
+    c.SinkDelayMs = 0; c.SinkDelayCodec = 0;
+    CHECK(pn::ExpectedSinkDelayMs(s, c) == 0, "no stream, automatic again (%u)", pn::ExpectedSinkDelayMs(s, c));
 }
 
 static void TestErrorText()
@@ -476,6 +658,10 @@ int main()
     TestCodecActivation();
     TestCodecPageDetails();
     TestRateConversionStatus();
+    TestSepRates();
+    TestSinkDelayText();
+    TestSinkDelaySetting();
+    TestExpectedSinkDelay();
     TestErrorText();
     TestAddressParsing();
     TestDriverPackageSelection();

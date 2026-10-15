@@ -13,7 +13,7 @@
  */
 #pragma once
 
-#define PNA2DP_DRIVER_VERSION   0x00010017u   /* 0.1.0.23 */
+#define PNA2DP_DRIVER_VERSION   0x00010019u   /* 0.1.0.25 */
 
 #ifdef PN_DEFINE_GUIDS
 #include <initguid.h>      /* driver.cpp defines every GUID exactly once */

@@ -9,6 +9,7 @@
   .\build\build.ps1 -Target service-tests # focused Windows service failure tests
   .\build\build.ps1 -Target process-tests # helper-process responsiveness tests
   .\build\build.ps1 -Target health-tests # audio diagnostics and quality-history tests
+  .\build\build.ps1 -Target latency-tests # speaker-delay measurement analysis (synthetic recordings)
   .\build\build.ps1 -Target quality-tests # end-to-end audio quality harness (quality_test.exe; run it with
                                           # build\test-audio-quality.py, needs FFmpeg and the codec plugins)
   .\build\build.ps1 -Target windows  # application-only Windows mode installer + portable
@@ -24,7 +25,7 @@
   WDK NuGet layout (see get-wdk.ps1 and toolchain.ps1).
 #>
 param(
-    [ValidateSet('all','driver','host','cli','tests','security-tests','core-tests','plugin-tests','quality-tests','plugins','service-tests','process-tests','health-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
+    [ValidateSet('all','driver','host','cli','tests','security-tests','core-tests','plugin-tests','quality-tests','plugins','service-tests','process-tests','health-tests','latency-tests','gui','setup','package','dist','windows')][string]$Target = 'all',
     [ValidateSet('Release','Debug')][string]$Config = 'Release',
     [switch]$Sign,
     [switch]$Sanitize,
@@ -184,9 +185,16 @@ function Build-HealthTests {
     Build-UserExe 'health_test' @((Join-Path $Root 'tools\common\test\health_test.cpp'), (Join-Path $Root 'tools\common\pnhealth.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) @("/I$(Join-Path $Root 'tools\common')", "/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib','uuid.lib') @()
 }
 
+# The speaker-delay measurement (pnlatency.cpp): its analysis runs on synthetic recordings;
+# the test plays and records nothing.
+function Build-LatencyTests {
+    Build-UserExe 'latency_test' @((Join-Path $Root 'tools\common\test\latency_test.cpp'), (Join-Path $Root 'tools\common\pnlatency.cpp')) @("/I$(Join-Path $Root 'tools\common')") @('ole32.lib') @()
+}
+
 function Build-Tests {
     Build-SecurityTests
     Build-HealthTests
+    Build-LatencyTests
     Build-ServiceTests
     Build-ProcessTests
     Build-UserExe 'boot_mode_test' @((Join-Path $Root 'tools\common\test\boot_mode_test.cpp'), (Join-Path $Root 'tools\common\pnboot.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','newdev.lib','cfgmgr32.lib','advapi32.lib','shell32.lib','crypt32.lib','ole32.lib','user32.lib','uuid.lib') @()
@@ -221,7 +229,7 @@ function Build-QualityTests {
 }
 
 function Build-Cli {
-    Build-UserExe 'pna2dpctl' @((Join-Path $Root 'tools\pna2dpctl\pna2dpctl.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp'), (Join-Path $Root 'tools\common\pnspatial.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','cfgmgr32.lib','advapi32.lib','ole32.lib','windowsapp.lib','newdev.lib','shell32.lib','crypt32.lib','user32.lib') @()
+    Build-UserExe 'pna2dpctl' @((Join-Path $Root 'tools\pna2dpctl\pna2dpctl.cpp'), (Join-Path $Root 'tools\common\pnctl.cpp'), (Join-Path $Root 'tools\common\pnspatial.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp'), (Join-Path $Root 'tools\common\pnlatency.cpp'), (Join-Path $Root 'tools\common\pndrv.cpp')) @("/I$(Join-Path $Root 'codec-host\include')") @('setupapi.lib','cfgmgr32.lib','advapi32.lib','ole32.lib','windowsapp.lib','newdev.lib','shell32.lib','crypt32.lib','user32.lib') @()
 }
 
 function Build-Host {
@@ -262,7 +270,7 @@ function Build-WinExe([string]$name, [string[]]$sources, [string]$rcFile, [strin
 }
 
 function Build-Gui {
-    $srcs = @((Join-Path $Root 'tools\pna2dp-panel\panel.cpp'), (Join-Path $Root 'tools\pna2dp-panel\bootdlg.cpp'), (Join-Path $Root 'tools\common\pnhealth.cpp'), (Join-Path $Root 'tools\common\pnboot.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp')) + $CommonSrcs
+    $srcs = @((Join-Path $Root 'tools\pna2dp-panel\panel.cpp'), (Join-Path $Root 'tools\pna2dp-panel\bootdlg.cpp'), (Join-Path $Root 'tools\common\pnhealth.cpp'), (Join-Path $Root 'tools\common\pnboot.cpp'), (Join-Path $Root 'tools\common\pnsigning.cpp'), (Join-Path $Root 'tools\common\pnaudio.cpp'), (Join-Path $Root 'tools\common\pnlatency.cpp')) + $CommonSrcs
     Build-WinExe 'pna2dp-panel' $srcs (Join-Path $Root 'tools\pna2dp-panel\panel.rc') @() @() @()
 }
 
@@ -409,6 +417,7 @@ switch ($Target) {
     'service-tests' { Build-ServiceTests }
     'process-tests' { Build-ProcessTests }
     'health-tests' { Build-HealthTests }
+    'latency-tests' { Build-LatencyTests }
     'cli'     { Build-Cli }
     'host'    { Build-Host }
     'gui'     { Build-Gui }

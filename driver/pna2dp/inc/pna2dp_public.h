@@ -186,8 +186,9 @@ typedef struct _PNA2DP_STATUS {
     ULONG      BitrateBps;        /* current encoded bitrate */
     ULONG      MaxBitrateBps;     /* configured ceiling (ABR) */
     ULONG      MediaMtu;          /* L2CAP out MTU of the media channel */
-    ULONG      SinkReportedDelayUs; /* AVDTP delay report, 0 if none */
-    ULONG      EstimatedLatencyUs;  /* buffer + encode + air + sink */
+    ULONG      SinkReportedDelayUs; /* the receiver's last AVDTP delay report, 0 if none; whether or not
+                                       it is used (SINK_DELAY_SET, SINK_DELAY_IGNORED) */
+    ULONG      EstimatedLatencyUs;  /* buffer + encode + air + SinkDelayUs */
     ULONG      Flags;             /* PNA2DP_STATUS_FLAG_* */
     ULONG      LastError;         /* NTSTATUS of last failure */
     ULONG      AvdtpVersion;      /* 0x0103 for 1.3 */
@@ -197,7 +198,10 @@ typedef struct _PNA2DP_STATUS {
     /* Former Reserved[4] (0.1.0.22): size and offsets unchanged; older drivers report 0. */
     ULONG      EngineSampleRate;  /* Windows audio engine (WaveRT) rate while a stream is open, else 0;
                                      differs from SampleRate when the driver converts (RATE_CONVERTED) */
-    ULONG      Reserved[3];
+    /* Former Reserved[0] (0.1.0.25): size and offsets unchanged; older drivers report 0. */
+    ULONG      SinkDelayUs;       /* the speaker delay the driver applies (estimate and presentation
+                                     position); 0 without a stream */
+    ULONG      Reserved[2];
 } PNA2DP_STATUS, *PPNA2DP_STATUS;
 
 #define PNA2DP_STATUS_FLAG_SCO_ACTIVE        0x00000001
@@ -213,6 +217,9 @@ typedef struct _PNA2DP_STATUS {
 #define PNA2DP_STATUS_FLAG_UNREACHABLE       0x00000400  /* link lost or media stalled; retrying */
 #define PNA2DP_STATUS_FLAG_HALF_RATE         0x00000800  /* engine at twice SampleRate: the 2:1 decimator alone */
 #define PNA2DP_STATUS_FLAG_RATE_CONVERTED    0x00001000  /* streaming through the sample-rate converter: EngineSampleRate != SampleRate */
+#define PNA2DP_STATUS_FLAG_SINK_DELAY_SET    0x00002000  /* SinkDelayUs is the configured speaker delay (PNA2DP_CONFIG.SinkDelayMs) */
+#define PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED 0x00004000 /* the receiver's report (SinkReportedDelayUs) is below the plausibility
+                                                            floor of the codec and is not used */
 
 /* One remote stream endpoint (SEP) as reported by AVDTP GET_(ALL_)CAPABILITIES. */
 typedef struct _PNA2DP_REMOTE_SEP {
@@ -305,7 +312,11 @@ typedef struct _PNA2DP_CONFIG {
     PNA2DP_APTX_PARAMS AptxHd;
     PNA2DP_APTX_PARAMS AptxLl;
     PNA2DP_LDAC_PARAMS Ldac;
-    ULONG   Reserved[8];
+    /* Former Reserved[0..1] (0.1.0.25): size and offsets unchanged; older tools send 0 (automatic). */
+    ULONG   SinkDelayMs;         /* the speaker delay to assume instead of the receiver's reports: 0 = automatic,
+                                    else 1..1000 ms (measured with a microphone or set) */
+    ULONG   SinkDelayCodec;      /* PNA2DP_CODEC_* it applies to, 0 = any codec */
+    ULONG   Reserved[6];
 } PNA2DP_CONFIG, *PPNA2DP_CONFIG;
 
 #define PNA2DP_CFG_ABR_ENABLE            0x00000001

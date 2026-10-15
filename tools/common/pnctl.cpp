@@ -268,6 +268,31 @@ std::wstring HexBytes(const UCHAR *p, ULONG n)
     return r;
 }
 
+std::wstring SepRatesText(const PNA2DP_REMOTE_SEP &s)
+{
+    struct Rate { ULONG byte; UCHAR bit; const wchar_t *name; };
+    static const Rate sbc[] = { {0,0x80,L"16k"}, {0,0x40,L"32k"}, {0,0x20,L"44.1k"}, {0,0x10,L"48k"} };
+    static const Rate aac[] = { {1,0x80,L"8k"}, {1,0x40,L"11.025k"}, {1,0x20,L"12k"}, {1,0x10,L"16k"}, {1,0x08,L"22.05k"}, {1,0x04,L"24k"},
+                                {1,0x02,L"32k"}, {1,0x01,L"44.1k"}, {2,0x80,L"48k"}, {2,0x40,L"64k"}, {2,0x20,L"88.2k"}, {2,0x10,L"96k"} };
+    static const Rate aptx[] = { {6,0x80,L"16k"}, {6,0x40,L"32k"}, {6,0x20,L"44.1k"}, {6,0x10,L"48k"} };
+    static const Rate ldac[] = { {6,0x20,L"44.1k"}, {6,0x10,L"48k"}, {6,0x08,L"88.2k"}, {6,0x04,L"96k"} };
+    static const Rate fs[] = { {7,0x02,L"44.1k"}, {7,0x01,L"48k"} };   /* FastStream: the music (sink) direction */
+    const Rate *t = NULL; size_t count = 0; ULONG need = 0;
+    switch (s.Codec) {
+    case PNA2DP_CODEC_SBC: t = sbc; count = _countof(sbc); need = 4; break;
+    case PNA2DP_CODEC_AAC: t = aac; count = _countof(aac); need = 6; break;
+    case PNA2DP_CODEC_APTX: case PNA2DP_CODEC_APTX_HD: case PNA2DP_CODEC_APTX_LL: t = aptx; count = _countof(aptx); need = 7; break;
+    case PNA2DP_CODEC_LDAC: t = ldac; count = _countof(ldac); need = 8; break;
+    case PNA2DP_CODEC_FASTSTREAM: t = fs; count = _countof(fs); need = 8; break;
+    case PNA2DP_CODEC_OPUS: return s.CodecInfoLength >= 7 ? L"48k" : L"-";   /* PipeWire Opus runs at 48 kHz only */
+    default: break;
+    }
+    std::wstring r;
+    if (t && s.CodecInfoLength >= need)
+        for (size_t i = 0; i < count; i++) if (s.CodecInfo[t[i].byte] & t[i].bit) { if (!r.empty()) r += L", "; r += t[i].name; }
+    return r.empty() ? L"-" : r;
+}
+
 std::wstring DescribeSep(const PNA2DP_REMOTE_SEP &s)
 {
     std::wstring r;
@@ -289,12 +314,11 @@ std::wstring DescribeSep(const PNA2DP_REMOTE_SEP &s)
     switch (s.Codec) {
     case PNA2DP_CODEC_SBC: {
         if (n < 4) break;
-        static const UCHAR rb[] = { 0x80, 0x40, 0x20, 0x10 }; static const wchar_t *rn[] = { L"16k", L"32k", L"44.1k", L"48k" };
         static const UCHAR cb[] = { 0x08, 0x04, 0x02, 0x01 }; static const wchar_t *cn[] = { L"mono", L"dual", L"stereo", L"joint" };
         static const UCHAR bb[] = { 0x80, 0x40, 0x20, 0x10 }; static const wchar_t *bn[] = { L"4", L"8", L"12", L"16" };
         static const UCHAR sb[] = { 0x08, 0x04 }; static const wchar_t *sn[] = { L"4", L"8" };
         static const UCHAR ab[] = { 0x02, 0x01 }; static const wchar_t *an[] = { L"SNR", L"loudness" };
-        list(L"Sample rates", masktext(ie[0], rb, rn, 4));
+        list(L"Sample rates", SepRatesText(s));
         list(L"Channel modes", masktext(ie[0], cb, cn, 4));
         list(L"Blocks", masktext(ie[1], bb, bn, 4));
         list(L"Subbands", masktext(ie[1], sb, sn, 2));
@@ -308,11 +332,7 @@ std::wstring DescribeSep(const PNA2DP_REMOTE_SEP &s)
         static const UCHAR ob[] = { 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02 };
         static const wchar_t *on[] = { L"MPEG-2 AAC LC", L"MPEG-4 AAC LC", L"MPEG-4 AAC LTP", L"MPEG-4 AAC Scalable", L"HE-AAC v1", L"HE-AAC v2", L"AAC ELD v2" };
         list(L"Object types", masktext(ie[0], ob, on, 7));
-        std::wstring rates;
-        static const struct { int byte; UCHAR bit; const wchar_t *s; } rt[] = { {1,0x80,L"8k"},{1,0x40,L"11.025k"},{1,0x20,L"12k"},{1,0x10,L"16k"},{1,0x08,L"22.05k"},{1,0x04,L"24k"},{1,0x02,L"32k"},{1,0x01,L"44.1k"},
-                                                                               {2,0x80,L"48k"},{2,0x40,L"64k"},{2,0x20,L"88.2k"},{2,0x10,L"96k"} };
-        for (auto &e : rt) if (ie[e.byte] & e.bit) { if (!rates.empty()) rates += L", "; rates += e.s; }
-        list(L"Sample rates", rates.empty() ? L"-" : rates);
+        list(L"Sample rates", SepRatesText(s));
         static const UCHAR cb[] = { 0x08, 0x04 }; static const wchar_t *cn[] = { L"mono", L"stereo" };
         list(L"Channels", masktext(ie[2], cb, cn, 2));
         ULONG br = ((ie[3] & 0x7F) << 16) | (ie[4] << 8) | ie[5];
@@ -324,9 +344,8 @@ std::wstring DescribeSep(const PNA2DP_REMOTE_SEP &s)
     case PNA2DP_CODEC_APTX_HD:
     case PNA2DP_CODEC_APTX_LL: {
         if (n < 7) break;
-        static const UCHAR rb[] = { 0x80, 0x40, 0x20, 0x10 }; static const wchar_t *rn[] = { L"16k", L"32k", L"44.1k", L"48k" };
         static const UCHAR cb[] = { 0x02, 0x01 }; static const wchar_t *cn[] = { L"stereo", L"mono" };
-        list(L"Sample rates", masktext(ie[6], rb, rn, 4));
+        list(L"Sample rates", SepRatesText(s));
         list(L"Channels", masktext(ie[6], cb, cn, 2));
         if (s.Codec == PNA2DP_CODEC_APTX_LL && n >= 8) list(L"Bidirectional link", (ie[7] & 0x01) ? L"yes" : L"no");
         if (s.Codec == PNA2DP_CODEC_APTX_HD) list(L"Input", L"24-bit");
@@ -334,9 +353,8 @@ std::wstring DescribeSep(const PNA2DP_REMOTE_SEP &s)
     }
     case PNA2DP_CODEC_LDAC: {
         if (n < 8) break;
-        static const UCHAR rb[] = { 0x20, 0x10, 0x08, 0x04 }; static const wchar_t *rn[] = { L"44.1k", L"48k", L"88.2k", L"96k" };
         static const UCHAR cb[] = { 0x04, 0x02, 0x01 }; static const wchar_t *cn[] = { L"mono", L"dual", L"stereo" };
-        list(L"Sample rates", masktext(ie[6], rb, rn, 4));
+        list(L"Sample rates", SepRatesText(s));
         list(L"Channel modes", masktext(ie[7], cb, cn, 3));
         list(L"Bitrates", L"990/909, 660/606, 330/303 kbps (HQ, SQ, MQ) + adaptive");
         break;
@@ -565,7 +583,8 @@ const wchar_t *PresetDescription(Preset p)
 
 /* Presets touch only the codec order, the enable mask, the knobs they are about, the buffer
  * sizes and the ABR / dual-channel flags. Everything else (per-codec masks, behaviour flags,
- * volume, reconnect delay) stays as it is; "Balanced" is the full driver default. */
+ * volume, reconnect delay) stays as it is; "Balanced" is the full driver default. The speaker
+ * delay (measured with a microphone) belongs to the speaker, like the volume: every preset keeps it. */
 void ApplyPreset(PNA2DP_CONFIG &c, Preset p)
 {
     PNA2DP_CONFIG d;
@@ -587,8 +606,10 @@ void ApplyPreset(PNA2DP_CONFIG &c, Preset p)
         break;
     case Preset::Balanced: {
         LONG volume = c.VolumeDb16;
+        ULONG sinkDelayMs = c.SinkDelayMs, sinkDelayCodec = c.SinkDelayCodec;
         c = d;
         c.VolumeDb16 = volume;
+        c.SinkDelayMs = sinkDelayMs; c.SinkDelayCodec = sinkDelayCodec;
         break;
     }
     case Preset::LowLatency:
@@ -700,6 +721,118 @@ std::wstring QualityReport(const PNA2DP_QUALITY &q)
     return out;
 }
 
+/* ---- speaker delay -------------------------------------------------------- */
+
+SinkDelaySource SinkDelaySourceOf(const PNA2DP_STATUS &s)
+{
+    /* 0.1.0.25 applies a delay whenever a stream exists (every default and report used is above
+     * 0): 0 with a configured stream or a report is a driver that does not fill SinkDelayUs */
+    if (!s.SinkDelayUs) {
+        bool stream = s.State >= PNA2DP_STATE_CONFIGURED && s.State <= PNA2DP_STATE_SUSPENDED;
+        return stream || s.SinkReportedDelayUs ? SinkDelaySource::Legacy : SinkDelaySource::NoStream;
+    }
+    if (s.Flags & PNA2DP_STATUS_FLAG_SINK_DELAY_SET) return SinkDelaySource::Set;
+    if (s.SinkReportedDelayUs && !(s.Flags & PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED)) return SinkDelaySource::Reported;
+    return SinkDelaySource::Default;
+}
+
+bool DriverAppliesSinkDelay(const PNA2DP_VERSION &v)
+{
+    return v.DriverVersion >= 0x00010019u;   /* 0.1.0.25 (0xMMmmbbbb) */
+}
+
+std::wstring DelayMsText(ULONG us)
+{
+    wchar_t b[32];
+    if (us % 1000) swprintf_s(b, L"%u.%u ms", us / 1000, us / 100 % 10);
+    else swprintf_s(b, L"%u ms", us / 1000);
+    return b;
+}
+
+static std::wstring LegacySinkDelayText(const PNA2DP_STATUS &s)
+{
+    if (!s.SinkReportedDelayUs) return L"not reported; a per-codec default is assumed";
+    wchar_t b[64];
+    swprintf_s(b, L"%u.%u ms reported by the headset", s.SinkReportedDelayUs / 1000, (s.SinkReportedDelayUs / 100) % 10);
+    return b;
+}
+
+std::wstring SinkDelayText(const PNA2DP_STATUS &s)
+{
+    const bool ignored = s.SinkReportedDelayUs && (s.Flags & PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED);
+    const std::wstring report = DelayMsText(s.SinkReportedDelayUs), used = DelayMsText(s.SinkDelayUs);
+    switch (SinkDelaySourceOf(s)) {
+    case SinkDelaySource::NoStream: return L"No stream";
+    case SinkDelaySource::Legacy: return LegacySinkDelayText(s);
+    case SinkDelaySource::Reported: return L"Using " + used + L" reported by the speaker";
+    case SinkDelaySource::Set:
+        return L"Using " + used + L", the fixed speaker delay" + (ignored ? L"; the speaker's report of " + report + L" is ignored as impossible" :
+                                                                   s.SinkReportedDelayUs ? L"; the speaker reports " + report : L"");
+    case SinkDelaySource::Default: {
+        std::wstring codec = s.Codec ? std::wstring(CodecName(s.Codec)) + L" " : L"";
+        return L"Using " + used + L", the " + codec + L"default" + (ignored ? L"; the speaker's report of " + report + L" is ignored as impossible" :
+                                                                    L"; the speaker does not report its delay");
+    }
+    }
+    return L"";
+}
+
+std::wstring SinkDelayShortText(const PNA2DP_STATUS &s)
+{
+    const bool ignored = s.SinkReportedDelayUs && (s.Flags & PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED);
+    const std::wstring report = DelayMsText(s.SinkReportedDelayUs), used = DelayMsText(s.SinkDelayUs);
+    switch (SinkDelaySourceOf(s)) {
+    case SinkDelaySource::NoStream: return L"no stream";
+    case SinkDelaySource::Legacy: return LegacySinkDelayText(s);
+    case SinkDelaySource::Reported: return used + L" reported by the speaker";
+    case SinkDelaySource::Set:
+        return used + L" fixed" + (ignored ? L"; the " + report + L" report is ignored" : s.SinkReportedDelayUs ? L"; the speaker reports " + report : L"");
+    case SinkDelaySource::Default:
+        return used + L" default" + (ignored ? L"; the " + report + L" report is ignored" : L"; not reported");
+    }
+    return L"";
+}
+
+std::wstring SinkDelaySettingText(const PNA2DP_CONFIG &c)
+{
+    if (!c.SinkDelayMs) return L"automatic";
+    return std::to_wstring(c.SinkDelayMs) + L" ms (" + (c.SinkDelayCodec ? std::wstring(CodecName(c.SinkDelayCodec)) : std::wstring(L"any codec")) + L")";
+}
+
+int SinkDelayKey(PNA2DP_CONFIG &c, const wchar_t *key, const wchar_t *value)
+{
+    if (!key || !value) return -1;
+    if (!_wcsicmp(key, L"sinkdelay")) {
+        ULONG ms = 0;
+        bool digits = *value && wcslen(value) <= 4;
+        for (const wchar_t *p = value; digits && *p; ++p) digits = *p >= L'0' && *p <= L'9';
+        if (!_wcsicmp(value, L"auto") || !_wcsicmp(value, L"automatic")) ms = 0;
+        else if (digits) ms = (ULONG)_wtol(value);
+        else return 0;
+        if (ms > PN_CONFIG_MAX_SINK_DELAY_MS) return 0;
+        c.SinkDelayMs = ms;
+        if (!ms) c.SinkDelayCodec = 0;   /* automatic: no codec either */
+        return 1;
+    }
+    if (!_wcsicmp(key, L"sinkdelay.codec")) {
+        const bool any = !_wcsicmp(value, L"any");
+        ULONG codec = any ? 0 : CodecFromKey(value);
+        if (!any && !codec) return 0;
+        c.SinkDelayCodec = codec;
+        return 1;
+    }
+    return -1;
+}
+
+ULONG ExpectedSinkDelayMs(const PNA2DP_STATUS &s, const PNA2DP_CONFIG &c)
+{
+    /* the driver's own choice (PnSinkDelayDecide) where the status already shows it; a fixed delay
+     * the status has not caught up with, or that the next stream's codec may take */
+    const ULONG applied = (s.SinkDelayUs + 999) / 1000;
+    const bool fixedApplies = c.SinkDelayMs && (!c.SinkDelayCodec || s.Codec == PNA2DP_CODEC_NONE || c.SinkDelayCodec == s.Codec);
+    return std::max<ULONG>(applied, fixedApplies ? c.SinkDelayMs : 0);
+}
+
 static void AppendLine(std::wstring &out, const wchar_t *fmt, ...)
 {
     wchar_t b[512];
@@ -747,6 +880,9 @@ std::wstring ConfigToText(const PNA2DP_CONFIG &c)
     AppendLine(out, L"autoquality=%u", (c.Flags & PNA2DP_CFG_AUTO_QUALITY) ? 1 : 0);
     AppendLine(out, L"hostonly=%u", (c.Flags & PNA2DP_CFG_HOST_CODECS_ONLY) ? 1 : 0);
     AppendLine(out, L"applylive=%u", (c.Flags & PNA2DP_CFG_APPLY_LIVE) ? 1 : 0);
+    /* the speaker delay (0.1.0.25); "auto" also resets the codec, so the codec line comes after it */
+    if (c.SinkDelayMs) AppendLine(out, L"sinkdelay=%u", c.SinkDelayMs); else AppendLine(out, L"sinkdelay=auto");
+    AppendLine(out, L"sinkdelay.codec=%s", c.SinkDelayCodec ? CodecKey(c.SinkDelayCodec) : L"any");
     std::wstring blob;
     const UCHAR *p = (const UCHAR *)&c;
     wchar_t h[4];
@@ -873,7 +1009,7 @@ bool ConfigFromText(const std::wstring &text, PNA2DP_CONFIG &c)
         else if (k == L"autoquality") flag(PNA2DP_CFG_AUTO_QUALITY);
         else if (k == L"hostonly") flag(PNA2DP_CFG_HOST_CODECS_ONLY);
         else if (k == L"applylive") flag(PNA2DP_CFG_APPLY_LIVE);
-        else recognised--;   /* unknown keys are ignored */
+        else if (SinkDelayKey(n, k.c_str(), v.c_str()) <= 0) recognised--;   /* unknown keys and refused values are ignored */
     }
     if (!haveBlob && recognised == 0) return false;
     n.EnabledCodecMask |= PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);

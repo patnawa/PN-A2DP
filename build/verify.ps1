@@ -62,6 +62,8 @@ try {
     Invoke-Check 'plugins' { & (Join-Path $outputDir 'plugin_test.exe') $outputDir $pluginVectors }
     Invoke-Check 'plugin-discovery' { & (Join-Path $PSScriptRoot 'test-plugin-discovery.ps1') -OutputDirectory $outputDir }
     Invoke-Check 'controls-and-machine' { & (Join-Path $outputDir 'pnctl_test.exe') }
+    # speaker-delay measurement analysis on synthetic recordings; plays and records nothing
+    Invoke-Check 'speaker-delay-analysis' { & (Join-Path $outputDir 'latency_test.exe') }
     Invoke-Check 'service-failure-handling' { & (Join-Path $outputDir 'service_failure_test.exe') }
     Invoke-Check 'process-wait' { & (Join-Path $outputDir 'process_wait_test.exe') }
     Invoke-Check 'audio-health' { & (Join-Path $outputDir 'health_test.exe') }
@@ -88,6 +90,7 @@ try {
             Invoke-Check 'asan-protected-service-paths' { & (Join-Path $asanDir 'secure_path_test.exe') }
             Invoke-Check 'asan-sbc' { & (Join-Path $asanDir 'sbc_test.exe') }
             Invoke-Check 'asan-controls' { & (Join-Path $asanDir 'pnctl_test.exe') }
+            Invoke-Check 'asan-speaker-delay-analysis' { & (Join-Path $asanDir 'latency_test.exe') }
             Invoke-Check 'asan-services' { & (Join-Path $asanDir 'service_failure_test.exe') }
             Invoke-Check 'asan-process-wait' { & (Join-Path $asanDir 'process_wait_test.exe') }
             Invoke-Check 'asan-audio-health' { & (Join-Path $asanDir 'health_test.exe') }

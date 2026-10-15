@@ -28,6 +28,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include "resource.h"
 #include "version.h"
 #include "pnctl.h"
@@ -36,6 +37,7 @@
 #include "pnaudio.h"
 #include "pnretry.h"
 #include "pnhealth.h"
+#include "pnlatency.h"
 #include "config_policy.h"
 #include <memory>
 #include "bootdlg.h"
@@ -97,14 +99,15 @@ struct Session {
     void DemoFill()
     {
         demo = true; open = true; telemetryValid = true;
-        ver.AbiVersion = PNA2DP_ABI_VERSION; ver.DriverVersion = 0x00010000; ver.Role = 1;
+        ver.AbiVersion = PNA2DP_ABI_VERSION; ver.DriverVersion = 0x00010019; ver.Role = 1;   /* 0.1.0.25: applies a speaker delay */
         ver.KernelCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC);
         ver.HostCodecMask = PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_LDAC) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_AAC) |
                             PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_HD) | PNA2DP_CODEC_BIT(PNA2DP_CODEC_APTX_LL);
         status.Size = sizeof(status); status.RemoteAddress = 0xE8EC4A123456ull; wcscpy_s(status.RemoteName, L"WH-1000XM5 (demo)");
         status.State = PNA2DP_STATE_STREAMING; status.Codec = PNA2DP_CODEC_LDAC; status.SampleRate = 48000; status.Channels = 2; status.BitsPerSample = 24;
         status.EngineSampleRate = 48000;
-        status.BitrateBps = 660000; status.MaxBitrateBps = 990000; status.MediaMtu = 1005; status.SinkReportedDelayUs = 150000; status.EstimatedLatencyUs = 212000;
+        status.BitrateBps = 660000; status.MaxBitrateBps = 990000; status.MediaMtu = 1005; status.SinkReportedDelayUs = 150000; status.SinkDelayUs = 150000;
+        status.EstimatedLatencyUs = 212000;
         status.Flags = PNA2DP_STATUS_FLAG_AUDIO_ACTIVE | PNA2DP_STATUS_FLAG_DELAY_REPORTING | PNA2DP_STATUS_FLAG_RADIO_IN_RANGE; status.AvdtpVersion = 0x0103; status.RemoteSeid = 4; status.EncoderOwner = 2;
         caps.Size = sizeof(caps); caps.SdpProfileVersion = 0x0103; caps.SdpSupportedFeatures = 0x000F; caps.SepCount = 4;
         auto sep = [&](int i, UCHAR seid, ULONG codec, ULONG vid, USHORT cid, std::initializer_list<UCHAR> ie, ULONG svc) {
@@ -126,7 +129,11 @@ struct Session {
         stats.PcmFramesConsumed += 48000; stats.PacketsSent += 125; stats.BytesSent += 82500; stats.EncodedFrames += 375;
         stats.TxCompletionAvgUs = 1500 + (ULONG)((demoTicks * 97) % 900);
         stats.QueueDepthPackets = 1 + (ULONG)(demoTicks % 4);
-        status.EstimatedLatencyUs = 200000 + (ULONG)((demoTicks * 37) % 15000);
+        /* the speaker delay follows the applied setting as the driver's does (0.1.0.25) */
+        bool set = applied.SinkDelayMs && (!applied.SinkDelayCodec || applied.SinkDelayCodec == status.Codec);
+        status.SinkDelayUs = set ? applied.SinkDelayMs * 1000 : status.SinkReportedDelayUs;
+        status.Flags = set ? status.Flags | PNA2DP_STATUS_FLAG_SINK_DELAY_SET : status.Flags & ~PNA2DP_STATUS_FLAG_SINK_DELAY_SET;
+        status.EstimatedLatencyUs = 50000 + status.SinkDelayUs + (ULONG)((demoTicks * 37) % 15000);
     }
     bool Refresh(bool withCaps)
     {
@@ -184,6 +191,11 @@ static const wchar_t *ProfileItemText(ULONG profile)
     default: return L"Custom";
     }
 }
+/* Headset page: what Measure with microphone does, until a measurement says more */
+static const wchar_t kMeasureHint[] =
+    L"Measure with microphone: the speaker plays 8 short chirps, the microphone hears when they come out, and the "
+    L"speaker delay it finds is entered as the fixed delay for the current codec. Apply changes saves it.";
+
 static bool Checked(HWND dlg, int id) { return IsDlgButtonChecked(dlg, id) == BST_CHECKED; }
 static void Check(HWND dlg, int id, bool v) { CheckDlgButton(dlg, id, v ? BST_CHECKED : BST_UNCHECKED); }
 static void EnableItem(HWND dlg, int id, bool v)
@@ -417,6 +429,26 @@ private:
         std::atomic<bool> done{false};
     };
     std::shared_ptr<ConnectJob> m_connectJob;
+    /* Speaker delay measurement (Headset page): MeasureOutputLatency plays and records on a
+     * worker for about 13 s; the UI polls the job on TIMER_HEALTH for progress and the result.
+     * The worker reads the driver's applied delay through its own handle while the chirps play. */
+    struct MeasureJob {
+        unsigned generation = 0;
+        std::wstring renderId, captureId, ifacePath;
+        bool demo = false;
+        ULONG demoSinkDelayUs = 0, demoCodec = 0;
+        pn::LatencyOptions options;             /* the lag range fitted to the delay the driver is expected to apply */
+        std::atomic<bool> cancel{false}, done{false};
+        std::mutex lock;                        /* guards progress */
+        pn::LatencyProgress progress;
+        bool progressValid = false;
+        pn::AppliedDelayReadings applied;       /* the worker's until done */
+        pn::LatencyMeasurement measurement;     /* the worker's until done */
+    };
+    std::shared_ptr<MeasureJob> m_measureJob;
+    std::vector<pn::CaptureEndpoint> m_mics;    /* the microphone list's items */
+    UINT32 m_measuredMs = 0;                    /* a measured delay waiting for Apply, and its result text */
+    std::wstring m_measuredText;
     pn::WindowsAudioInfo m_audio;
     std::vector<int> m_tabs;
     bool m_adjustingVolume = false;
@@ -524,6 +556,14 @@ private:
     void SyncLatencyProfile();          /* selects the profile the two edit boxes match (else Custom) */
     void ApplyLatencyProfileChoice();   /* the chosen profile's values into the edit boxes and sliders */
     void LoadSink();
+    void LoadSinkDelay();  void SaveSinkDelay(PNA2DP_CONFIG &c);
+    void UpdateSinkDelayStatus();
+    void UpdateSinkDelayControls();
+    bool SinkDelaySupported() const { return m_s.open && pn::DriverAppliesSinkDelay(m_s.ver); }
+    void LoadMicrophones();
+    void StartMeasurement();
+    void FinishMeasurement();
+    void SettleMeasuredDelay(bool applied);
     void LoadDriver();
     void LoadReadiness();
     void LoadAdapter();
@@ -963,7 +1003,7 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     case WM_TIMER:
         if (p->m_inPrompt) return TRUE;
-        if (wp == TIMER_HEALTH) { p->FinishAudioCheck(); p->FinishConnectionRequest(); return TRUE; }
+        if (wp == TIMER_HEALTH) { p->FinishAudioCheck(); p->FinishConnectionRequest(); p->FinishMeasurement(); return TRUE; }
         if (wp == TIMER_CONNECT_EARLY || wp == TIMER_CONNECT_LATE) { KillTimer(hwnd, wp); p->FollowConnectionRequest(); return TRUE; }
         if (wp == TIMER_STATS && !p->m_inPrompt && p->m_sel >= 0 && p->m_sel < (int)p->m_devices.size()) {
             if (p->m_adjustingVolume && GetCapture() != GetDlgItem(p->m_page[PG_WINDOWS], IDC_WIN_VOLUME)) p->m_adjustingVolume = false;
@@ -980,7 +1020,7 @@ INT_PTR CALLBACK Panel::MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (wp == TIMER_STATS && p->m_cur == PG_ADAPTER && !p->m_inPrompt) p->LoadAdapter();
         if (wp == TIMER_STATS && p->m_cur == PG_DRIVER && !p->m_inPrompt) p->LoadReadiness();
-        if (wp == TIMER_STATS) { if (p->m_s.open) { if (p->m_s.demo) p->m_s.DemoTick(); p->m_s.Refresh(false); p->UpdateOutputSummary(); if (p->m_cur == PG_STATUS) p->LoadStatus(); if (p->m_cur == PG_CODECS) p->UpdateCodecLive(); if (p->m_cur >= PG_SBC && p->m_cur <= PG_LDAC) p->UpdateCodecDetails(); } p->LoadQuality(true); p->UpdateConnectButtons(); return TRUE; }
+        if (wp == TIMER_STATS) { if (p->m_s.open) { if (p->m_s.demo) p->m_s.DemoTick(); p->m_s.Refresh(false); p->UpdateOutputSummary(); if (p->m_cur == PG_STATUS) p->LoadStatus(); if (p->m_cur == PG_CODECS) p->UpdateCodecLive(); if (p->m_cur >= PG_SBC && p->m_cur <= PG_LDAC) p->UpdateCodecDetails(); if (p->m_cur == PG_SINK) p->UpdateSinkDelayStatus(); } p->LoadQuality(true); p->UpdateConnectButtons(); return TRUE; }
         break;
     case WM_SIZE: if (wp != SIZE_MINIMIZED) p->LayoutShell(); return TRUE;
     case WM_GETMINMAXINFO: {
@@ -1100,6 +1140,7 @@ void Panel::OnInit()
     SetText(m_page[PG_APTX], IDC_APTX_NOTE,
         L"Leave a group empty to accept whatever the headset supports. aptX, aptX HD and aptX LL need the codec host service with the aptX plugin (libfreeaptx). "
         L"\"aptX\" is a trademark of Qualcomm; this driver implements the codec format and is not certified by Qualcomm.");
+    SetText(m_page[PG_SINK], IDC_SINK_MEASURE_RESULT, kMeasureHint);
     SetText(m_page[PG_LDAC], IDC_LDAC_NOTE,
         L"The first figure applies at 48 and 96 kHz, the second at 44.1 and 88.2 kHz. High quality needs a clean 2.4 GHz environment; with ABR on, the driver drops to standard and mobile "
         L"quality in band (no reconnect) when packets start to queue and climbs back after a quiet period. 88.2 / 96 kHz are only used when the Windows audio engine runs at that rate "
@@ -1143,7 +1184,10 @@ void Panel::OnClose()
     KillTimer(m_hwnd, TIMER_HEALTH);
     KillTimer(m_hwnd, TIMER_CONNECT_EARLY);
     KillTimer(m_hwnd, TIMER_CONNECT_LATE);
+    std::shared_ptr<MeasureJob> measuring = m_measureJob;   /* CloseSession cancels it */
     CloseSession();
+    /* a cancelled measurement stops its streams within about 20 ms: let it before the process ends */
+    for (int i = 0; measuring && i < 50 && !measuring->done.load(std::memory_order_acquire); ++i) Sleep(10);
     DestroyWindow(m_hwnd);
 }
 
@@ -1258,6 +1302,7 @@ void Panel::SelectPage(int p)
     if (p == PG_DRIVER) LoadDriver();
     if (p == PG_ADAPTER) LoadAdapter();
     if (p == PG_QUALITY) LoadQuality();
+    if (p == PG_SINK) { if (!m_measureJob) LoadMicrophones(); UpdateSinkDelayStatus(); }
     InvalidateRect(m_tab, NULL, FALSE);
 }
 
@@ -1518,6 +1563,9 @@ void Panel::CloseSession()
     m_pendingEvents = 0;
     m_pendingGone = ERROR_SUCCESS;
     m_refreshPending = false;
+    if (m_measureJob) { m_measureJob->cancel = true; m_measureJob.reset(); }
+    m_measuredMs = 0; m_measuredText.clear();
+    if (m_page[PG_SINK]) SetText(m_page[PG_SINK], IDC_SINK_MEASURE_RESULT, kMeasureHint);
     m_s.dev.Close();
     m_s.open = false;
     m_s.demo = false;
@@ -1638,6 +1686,7 @@ void Panel::OnDriverEvent(ULONG mask)
     if (mask & (PNA2DP_EVENT_STATE_CHANGED | PNA2DP_EVENT_SCO_CHANGED | PNA2DP_EVENT_DELAY_REPORT | PNA2DP_EVENT_ERROR | PNA2DP_EVENT_HOST_CHANGED)) {
         LoadStatus();
         UpdateCodecLive();
+        UpdateSinkDelayStatus();
         if (m_sel >= 0) {
             std::wstring state = pn::StateName(m_s.status.State);
             if (m_s.status.Codec) { state += L" "; state += pn::CodecName(m_s.status.Codec); }
@@ -1655,7 +1704,7 @@ void Panel::OnDriverEvent(ULONG mask)
 bool Panel::CollectConfig(PNA2DP_CONFIG &c)
 {
     c = m_s.config;
-    SaveCodecs(c); SaveSbc(c); SaveAac(c); SaveAptx(c); SaveLdac(c); SaveTransport(c);
+    SaveCodecs(c); SaveSbc(c); SaveAac(c); SaveAptx(c); SaveLdac(c); SaveTransport(c); SaveSinkDelay(c);
     if (Checked(m_page[PG_ADAPTER], IDC_AD_AUTO)) {
         c.Flags |= PNA2DP_CFG_AUTO_QUALITY | PNA2DP_CFG_ABR_ENABLE;
         c.Ldac.AbrEnable = 1;
@@ -1689,6 +1738,7 @@ bool Panel::Apply()
     }
     LoadAll();
     SetDirty(false);
+    SettleMeasuredDelay(true);
     SetStatusText(L"Configuration applied and saved for this headset.");
     return true;
 }
@@ -1699,6 +1749,7 @@ void Panel::Revert()
     m_s.LoadConfig();
     LoadAll();
     SetDirty(false);
+    SettleMeasuredDelay(false);
     SetStatusText(L"Reverted to the driver's current configuration.");
 }
 
@@ -1760,7 +1811,7 @@ void Panel::ImportConfig()
 void Panel::LoadAll()
 {
     m_loading = true;
-    LoadStatus(); LoadCodecs(); LoadSbc(); LoadAac(); LoadAptx(); LoadLdac(); LoadTransport(); LoadSink(); LoadDriver();
+    LoadStatus(); LoadCodecs(); LoadSbc(); LoadAac(); LoadAptx(); LoadLdac(); LoadTransport(); LoadSink(); LoadSinkDelay(); LoadDriver();
     if (WindowsMode()) LoadWindowsAudio();
     Check(m_page[PG_ADAPTER], IDC_AD_AUTO, (m_s.config.Flags & PNA2DP_CFG_AUTO_QUALITY) != 0);
     EnableItem(m_page[PG_ADAPTER], IDC_AD_AUTO, m_s.open);
@@ -1956,8 +2007,8 @@ void Panel::LoadStatus()
         SetText(d, IDC_ST_ENCODER, s.EncoderOwner == 1 ? L"kernel (SBC)" : s.EncoderOwner == 2 ? L"codec host plugin" : L"-");
         if (s.BitrateBps) SetTextF(d, IDC_ST_BITRATE, L"%u kbps (ceiling %u kbps)", s.BitrateBps / 1000, s.MaxBitrateBps / 1000); else SetText(d, IDC_ST_BITRATE, L"-");
         SetTextF(d, IDC_ST_LATENCY, L"%u ms estimated end to end", s.EstimatedLatencyUs / 1000);
-        if (s.SinkReportedDelayUs) SetTextF(d, IDC_ST_SINKDELAY, L"%u.%u ms reported by the headset", s.SinkReportedDelayUs / 1000, (s.SinkReportedDelayUs / 100) % 10);
-        else SetText(d, IDC_ST_SINKDELAY, L"not reported; a per-codec default is assumed");
+        // Which delay is used: reported, fixed (measured or set) or the default, with an ignored report.
+        SetText(d, IDC_ST_SINKDELAY, pn::SinkDelayShortText(s));
         SetTextF(d, IDC_ST_MTU, L"%u bytes", s.MediaMtu);
         SetTextF(d, IDC_ST_AVDTP, L"%x.%x", s.AvdtpVersion >> 8, s.AvdtpVersion & 0xFF);
         SetTextF(d, IDC_ST_SEID, L"%u", s.RemoteSeid);
@@ -2415,6 +2466,248 @@ void Panel::LoadSink()
     m_loading = guard;
 }
 
+/* ---- speaker delay (Headset page) ------------------------------------------ */
+
+/* Automatic (0 / 0) or Fixed: the delay to assume instead of the speaker's reports. A fixed
+ * delay applies to the codec that played when it was entered or measured
+ * (m_s.config.SinkDelayCodec, 0 = any codec). */
+void Panel::LoadSinkDelay()
+{
+    HWND d = m_page[PG_SINK];
+    bool guard = m_loading; m_loading = true;
+    const PNA2DP_CONFIG &c = m_s.config;
+    CheckRadioButton(d, IDC_SINK_DELAY_AUTO, IDC_SINK_DELAY_FIXED, c.SinkDelayMs ? IDC_SINK_DELAY_FIXED : IDC_SINK_DELAY_AUTO);
+    if (c.SinkDelayMs) SetUInt(d, IDC_SINK_DELAY_MS, c.SinkDelayMs); else SetText(d, IDC_SINK_DELAY_MS, L"");
+    m_loading = guard;
+    UpdateSinkDelayStatus();
+    UpdateSinkDelayControls();
+}
+
+void Panel::SaveSinkDelay(PNA2DP_CONFIG &c)
+{
+    HWND d = m_page[PG_SINK];
+    if (!Checked(d, IDC_SINK_DELAY_FIXED)) { c.SinkDelayMs = 0; c.SinkDelayCodec = 0; return; }
+    /* the driver's limits (config_policy.h); the codec was bound when the value was entered */
+    c.SinkDelayMs = min(PN_CONFIG_MAX_SINK_DELAY_MS, max(1u, GetUInt(d, IDC_SINK_DELAY_MS)));
+    c.SinkDelayCodec = m_s.config.SinkDelayCodec;
+}
+
+/* The applied delay and where it comes from (the driver's status), and the scope of a fixed one. */
+void Panel::UpdateSinkDelayStatus()
+{
+    HWND d = m_page[PG_SINK];
+    if (!d) return;
+    std::wstring text = !m_s.open ? L"No PN-A2DP driver instance selected." :
+        !SinkDelaySupported() ? L"Speaker delay settings and the measurement need driver 0.1.0.25 or later." : pn::SinkDelayText(m_s.status);
+    if (GetText(d, IDC_SINK_DELAY_STATUS) != text) SetText(d, IDC_SINK_DELAY_STATUS, text);
+    const ULONG codec = m_s.config.SinkDelayCodec;
+    std::wstring scope = !Checked(d, IDC_SINK_DELAY_FIXED) ? L"ms" : codec ? L"ms, for " + std::wstring(pn::CodecName(codec)) : L"ms, for any codec";
+    if (GetText(d, IDC_SINK_DELAY_SCOPE) != scope) SetText(d, IDC_SINK_DELAY_SCOPE, scope);
+}
+
+void Panel::UpdateSinkDelayControls()
+{
+    HWND d = m_page[PG_SINK];
+    if (!d) return;
+    const bool usable = SinkDelaySupported(), idle = !m_measureJob;
+    EnableItem(d, IDC_SINK_DELAY_AUTO, usable && idle);
+    EnableItem(d, IDC_SINK_DELAY_FIXED, usable && idle);
+    EnableItem(d, IDC_SINK_DELAY_MS, usable && idle && Checked(d, IDC_SINK_DELAY_FIXED));
+    EnableItem(d, IDC_SINK_MIC, usable && idle);
+    EnableItem(d, IDC_SINK_MEASURE, usable);   /* Cancel while a measurement runs */
+    const wchar_t *button = idle ? L"Measure with microphone" : L"Cancel measurement";
+    if (GetText(d, IDC_SINK_MEASURE) != button) SetText(d, IDC_SINK_MEASURE, button);
+}
+
+/* Active capture endpoints, keeping the chosen one; else Windows' default recording device. */
+void Panel::LoadMicrophones()
+{
+    HWND combo = GetDlgItem(m_page[PG_SINK], IDC_SINK_MIC);
+    std::wstring keep;
+    int selected = ComboBox_GetCurSel(combo);
+    if (selected >= 0 && selected < (int)m_mics.size()) keep = m_mics[selected].id;
+    std::vector<pn::CaptureEndpoint> mics;
+    if (m_demo) mics.push_back({ L"demo-microphone", L"Microphone (demo)", true });
+    else pn::ListCaptureEndpoints(mics);   /* read-only; on failure the list stays empty */
+    m_mics = mics;
+    bool guard = m_loading; m_loading = true;
+    ComboBox_ResetContent(combo);
+    int pick = -1;
+    for (size_t i = 0; i < m_mics.size(); ++i) {
+        ComboBox_AddString(combo, (m_mics[i].name + (m_mics[i].isDefault ? L" (default)" : L"")).c_str());
+        if (!keep.empty() && !_wcsicmp(m_mics[i].id.c_str(), keep.c_str())) pick = (int)i;
+    }
+    if (pick < 0) pick = pn::MatchCaptureEndpoint(m_mics, L"");
+    ComboBox_SetCurSel(combo, pick);
+    m_loading = guard;
+}
+
+/* Demo mode: the measurement's progress and an Ok result, without sound or devices. */
+static pn::LatencyMeasurement DemoMeasurement(const std::atomic<bool> &cancel, const pn::LatencyProgressFn &progress)
+{
+    pn::LatencyMeasurement m;
+    pn::LatencyProgress p;
+    p.chirps = 8;
+    auto step = [&](pn::LatencyPhase phase, unsigned chirp) {
+        p.phase = phase; p.chirp = chirp; p.percent = chirp * 11; p.step = true;
+        progress(p);
+        for (int i = 0; i < 6 && !cancel.load(); ++i) Sleep(50);
+        return !cancel.load();
+    };
+    bool run = step(pn::LatencyPhase::Starting, 0) && step(pn::LatencyPhase::LeadIn, 0);
+    for (unsigned k = 1; run && k <= 8; ++k) run = step(pn::LatencyPhase::Chirps, k);
+    if (!run || !step(pn::LatencyPhase::Finishing, 8)) {
+        m.hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        m.result.verdict = pn::LatencyVerdict::Cancelled; m.result.message = L"The measurement was cancelled.";
+        return m;
+    }
+    step(pn::LatencyPhase::Analysing, 8);
+    m.hr = S_OK;
+    m.result.verdict = pn::LatencyVerdict::Ok;
+    m.result.total = m.result.clear = m.result.heard = 8;
+    m.result.lateMs = m.result.lagMs = 131.4; m.result.spreadMs = 2.6;
+    m.result.chirps.resize(8);
+    for (auto &c : m.result.chirps) { c.timed = c.clear = c.heard = true; c.lateMs = c.heardLateMs = 131.4; c.match = c.heardMatch = 0.9; }
+    m.result.message = L"Demo: 8 of 8 chirps heard clearly, spread 2.6 ms.";
+    return m;
+}
+
+void Panel::StartMeasurement()
+{
+    if (m_measureJob || !SinkDelaySupported() || m_sel < 0 || m_sel >= (int)m_devices.size()) return;
+    HWND d = m_page[PG_SINK];
+    const unsigned generation = m_sessionGen;
+    const DeviceEntry device = m_devices[m_sel];
+    int mic = ComboBox_GetCurSel(GetDlgItem(d, IDC_SINK_MIC));
+    if (mic < 0 || mic >= (int)m_mics.size()) {
+        LoadMicrophones();
+        mic = ComboBox_GetCurSel(GetDlgItem(d, IDC_SINK_MIC));
+        if (generation != m_sessionGen) return;
+        if (mic < 0 || mic >= (int)m_mics.size()) {
+            SetText(d, IDC_SINK_MEASURE_RESULT, L"No microphone is available. Connect one (a USB microphone works well), allow desktop apps to use it "
+                                                L"(Windows Settings > Privacy & security > Microphone), then press Refresh.");
+            return;
+        }
+    }
+    const pn::CaptureEndpoint microphone = m_mics[mic];
+    /* the speaker: the Windows output that belongs to this PN device, never the default output */
+    std::wstring render, speaker = device.node.name;
+    if (!m_s.demo) {
+        pn::WindowsAudioInfo audio = pn::QueryWindowsAudio(device.node.instanceId);
+        if (generation != m_sessionGen) return;   /* COM may dispatch a device change */
+        if (!audio.active || audio.endpointId.empty()) {
+            SetText(d, IDC_SINK_MEASURE_RESULT, L"The speaker has no active Windows audio output. Connect it, then try again.");
+            return;
+        }
+        render = audio.endpointId;
+        if (!audio.endpointName.empty()) speaker = audio.endpointName;
+    }
+    /* the lag range follows the delay the driver is expected to apply: a fixed delay far longer
+     * than the speaker's makes the sound come before the clock says it plays */
+    pn::LatencyOptions options;
+    pn::FitLatencyLagRange(options, pn::ExpectedSinkDelayMs(m_s.status, m_s.applied));
+    std::wstring text = L"Measure the speaker delay of " + speaker + L"?\n\nThe speaker plays " + std::to_wstring(options.spacingMs.size() + 1) +
+        L" short chirps over about " + std::to_wstring((pn::LatencyTotalFrames(options, 1000) + 999) / 1000) + L" seconds while " + microphone.name +
+        L" records them. The recording is analysed in memory and not saved.\n\nPut the microphone 10 to 30 cm from the speaker, stop other "
+        L"playback and keep the room quiet. A normal listening volume is enough.";
+    if (m_s.status.Flags & PNA2DP_STATUS_FLAG_AUDIO_ACTIVE)
+        text += L"\n\nWindows is playing to this speaker now. Stop that playback and wait a few seconds first: the test needs a fresh stream.";
+    if (Prompt(text, MB_ICONQUESTION | MB_OKCANCEL) != IDOK || generation != m_sessionGen || m_measureJob || !m_s.open) return;
+
+    auto job = std::make_shared<MeasureJob>();
+    job->generation = generation; job->renderId = render; job->captureId = microphone.id; job->ifacePath = device.ifacePath;
+    job->demo = m_s.demo; job->demoSinkDelayUs = m_s.status.SinkDelayUs; job->demoCodec = m_s.status.Codec; job->options = options;
+    m_measureJob = job;
+    UpdateSinkDelayControls();
+    SetText(d, IDC_SINK_MEASURE_RESULT, L"Starting the speaker...");
+    SetStatusText(L"Measuring the speaker delay: the speaker plays chirps for about " + std::to_wstring((pn::LatencyTotalFrames(options, 1000) + 999) / 1000) + L" seconds.");
+    try {
+        // The worker owns its job and its own read-only handle; it never touches the UI.
+        std::thread([job] {
+            try {
+                pn::Device dev;
+                const bool driver = !job->demo && dev.Open(job->ifacePath, false);
+                auto progress = [&](const pn::LatencyProgress &p) {
+                    if (pn::AppliedDelayReadings::ReadOn(p)) {
+                        PNA2DP_STATUS s = {};
+                        const bool last = pn::AppliedDelayReadings::Finishing(p);
+                        if (job->demo) job->applied.Add(job->demoSinkDelayUs, job->demoCodec, last);
+                        else if (driver && dev.GetStatus(s) && s.Size == sizeof(s)) job->applied.Add(s.SinkDelayUs, s.Codec, last);
+                    }
+                    std::lock_guard<std::mutex> hold(job->lock);
+                    job->progress = p; job->progressValid = true;
+                };
+                job->measurement = job->demo ? DemoMeasurement(job->cancel, progress)
+                                             : pn::MeasureOutputLatency(job->renderId, job->captureId, job->options, &job->cancel, progress);
+            } catch (...) {
+                job->measurement.hr = E_OUTOFMEMORY;
+                job->measurement.result.verdict = pn::LatencyVerdict::Failed;
+                job->measurement.result.message = L"The measurement could not run. Try again.";
+            }
+            job->done.store(true, std::memory_order_release);
+        }).detach();
+    } catch (...) {
+        job->measurement.hr = E_OUTOFMEMORY;
+        job->measurement.result.verdict = pn::LatencyVerdict::Failed;
+        job->measurement.result.message = L"The measurement could not start. Try again.";
+        job->done = true;
+    }
+}
+
+/* After Apply or Undo: whether the measured delay is now the driver's setting. */
+void Panel::SettleMeasuredDelay(bool applied)
+{
+    if (!m_measuredMs) return;
+    const bool used = applied && m_s.applied.SinkDelayMs == m_measuredMs;
+    SetText(m_page[PG_SINK], IDC_SINK_MEASURE_RESULT, m_measuredText + (used ? L" Applied." : L" Not applied."));
+    m_measuredMs = 0; m_measuredText.clear();
+}
+
+/* TIMER_HEALTH: the running measurement's progress, then its result as a pending Fixed value. */
+void Panel::FinishMeasurement()
+{
+    if (!m_measureJob) return;
+    auto job = m_measureJob;
+    HWND d = m_page[PG_SINK];
+    if (!job->done.load(std::memory_order_acquire)) {
+        pn::LatencyProgress p;
+        bool valid;
+        { std::lock_guard<std::mutex> hold(job->lock); p = job->progress; valid = job->progressValid; }
+        std::wstring text = job->cancel ? L"Cancelling..." : valid ? pn::LatencyProgressText(p) : L"Starting the speaker...";
+        if (GetText(d, IDC_SINK_MEASURE_RESULT) != text) SetText(d, IDC_SINK_MEASURE_RESULT, text);
+        return;
+    }
+    m_measureJob.reset();
+    UpdateSinkDelayControls();
+    if (job->generation != m_sessionGen || !m_s.open) {   /* measured for a session that is gone */
+        /* CloseSession drops a running job, so an open session here had its event thread
+         * stopped (WM_APP_DEVICE_GONE, the driver kept failing): say so, not the last progress */
+        if (m_s.open && d)
+            SetText(d, IDC_SINK_MEASURE_RESULT, L"The measurement was interrupted: the driver stopped answering. Press Refresh, then measure again.");
+        return;
+    }
+    const pn::LatencyResult &r = job->measurement.result;
+    /* the driver's applied delay (the same through the run) plus how late the sound came */
+    pn::SpeakerDelayMeasurement measured = pn::SpeakerDelayFromRun(r, job->applied, PN_CONFIG_MAX_SINK_DELAY_MS);
+    if (!measured.ok) {
+        SetText(d, IDC_SINK_MEASURE_RESULT, measured.message.empty() ? std::wstring(L"The measurement failed. Try again.") : measured.message);
+        SetStatusText(r.verdict == pn::LatencyVerdict::Cancelled ? L"Speaker delay measurement cancelled; nothing changed." : L"Speaker delay measurement failed; nothing changed.");
+        return;
+    }
+    bool guard = m_loading; m_loading = true;
+    CheckRadioButton(d, IDC_SINK_DELAY_AUTO, IDC_SINK_DELAY_FIXED, IDC_SINK_DELAY_FIXED);
+    SetUInt(d, IDC_SINK_DELAY_MS, measured.delayMs);
+    m_loading = guard;
+    m_s.config.SinkDelayCodec = job->applied.codec;   /* the codec that played: the fixed delay applies to it */
+    UpdateSinkDelayStatus();
+    UpdateSinkDelayControls();
+    m_measuredMs = measured.delayMs; m_measuredText = measured.message;
+    SetText(d, IDC_SINK_MEASURE_RESULT, measured.message + L" Apply changes to use it.");
+    SetDirty(true);
+    SetStatusText(L"Speaker delay measured: " + std::to_wstring(measured.delayMs) + L" ms for " +
+                  (job->applied.codec ? std::wstring(pn::CodecName(job->applied.codec)) : std::wstring(L"any codec")) + L". Apply changes to use it.");
+}
+
 void Panel::LoadDriver()
 {
     HWND d = m_page[PG_DRIVER];
@@ -2605,8 +2898,30 @@ INT_PTR Panel::OnPageCommand(HWND page, int id, int code, HWND)
         }
     }
     if (page == m_page[PG_SINK]) {
-        if (id == IDC_SINK_REFRESH) { m_s.Refresh(true); LoadSink(); LoadCodecs(); return TRUE; }
-        return FALSE;
+        if (id == IDC_SINK_REFRESH) { m_s.Refresh(true); LoadSink(); LoadCodecs(); if (!m_measureJob) LoadMicrophones(); UpdateSinkDelayStatus(); return TRUE; }
+        if (id == IDC_SINK_MEASURE) {
+            if (!m_measureJob) StartMeasurement();
+            else { m_measureJob->cancel = true; SetText(page, IDC_SINK_MEASURE_RESULT, L"Cancelling..."); }
+            return TRUE;
+        }
+        if (id == IDC_SINK_MIC) { if (code == CBN_DROPDOWN && !m_measureJob) LoadMicrophones(); return TRUE; }   /* not a setting */
+        if (m_loading) return FALSE;
+        const bool mode = (id == IDC_SINK_DELAY_AUTO || id == IDC_SINK_DELAY_FIXED) && code == BN_CLICKED;
+        if (!mode && !(id == IDC_SINK_DELAY_MS && code == EN_CHANGE)) return FALSE;
+        if (Checked(page, IDC_SINK_DELAY_FIXED)) {
+            /* a fixed delay applies to the codec that plays now (kept while nothing plays) */
+            const PNA2DP_STATUS &s = m_s.status;
+            if (s.Codec && s.State >= PNA2DP_STATE_CONFIGURED && s.State <= PNA2DP_STATE_SUSPENDED) m_s.config.SinkDelayCodec = s.Codec;
+            if (id == IDC_SINK_DELAY_FIXED && GetText(page, IDC_SINK_DELAY_MS).empty()) {
+                bool guard = m_loading; m_loading = true;   /* start from the delay in use */
+                SetUInt(page, IDC_SINK_DELAY_MS, s.SinkDelayUs >= 1000 ? min(PN_CONFIG_MAX_SINK_DELAY_MS, (s.SinkDelayUs + 500) / 1000) : 150);
+                m_loading = guard;
+            }
+        }
+        UpdateSinkDelayControls();
+        UpdateSinkDelayStatus();
+        SetDirty(true);
+        return TRUE;
     }
     if (page == m_page[PG_DRIVER]) {
         const bool selected = m_sel >= 0 && m_sel < (int)m_devices.size();

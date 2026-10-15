@@ -531,6 +531,65 @@ BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *RemoteCaps, _In_ const PNA2
     return TRUE;
 }
 
+/* A receiver-chosen configuration (its SET_CONFIGURATION / RECONFIGURE) fixes the rate, channel
+ * mode and, for SBC, the bitpool range; the rest is the source's own choice and follows the same
+ * preference rules as A2dpSelectConfig. Without this a receiver that connects by itself got the
+ * parser's defaults: LDAC SQ (660 kbps) under an HQ preference. */
+VOID A2dpApplySourcePreferences(_Inout_ PA2DP_CODEC_CONFIG Cfg, _In_ const PNA2DP_CONFIG *Pref, _In_ BOOLEAN Conservative)
+{
+    switch (Cfg->Codec) {
+    case PNA2DP_CODEC_SBC: {
+        /* the receiver's range (lo..hi) is binding. A preference narrows where the encoder starts
+         * (SbcBitpool, the ABR's top rung) and its floor; SbcMaxBitpool stays the negotiated maximum,
+         * which a live bitpool change may still reach in band (A2dpSbcPlanStream, DeviceSetConfig) */
+        const UCHAR lo = Cfg->SbcMinBitpool, hi = Cfg->SbcMaxBitpool;
+        const UCHAR top = (Pref->Sbc.MaxBitpool && Pref->Sbc.MaxBitpool < hi) ? (UCHAR)PN_MAX(Pref->Sbc.MaxBitpool, lo) : hi;
+        Cfg->SbcMinBitpool = (UCHAR)PN_MIN(PN_MAX(Pref->Sbc.MinBitpool, lo), top);
+        Cfg->SbcBitpool = top;
+        break;
+    }
+    case PNA2DP_CODEC_AAC:
+        Cfg->AacVbr = Cfg->AacVbr && Pref->Aac.Vbr;
+        if (!Cfg->BitrateBps) Cfg->BitrateBps = Pref->Aac.BitrateBps ? Pref->Aac.BitrateBps : 256000;
+        if (Pref->Aac.BitrateBps && Pref->Aac.BitrateBps < Cfg->BitrateBps) Cfg->BitrateBps = Pref->Aac.BitrateBps;
+        if (Cfg->BitrateBps > 320000) Cfg->BitrateBps = 320000;
+        break;
+    case PNA2DP_CODEC_APTX:
+    case PNA2DP_CODEC_APTX_HD:
+    case PNA2DP_CODEC_APTX_LL:
+        Cfg->AptxLlTargetLevel = (Cfg->Codec == PNA2DP_CODEC_APTX ? &Pref->Aptx : Cfg->Codec == PNA2DP_CODEC_APTX_HD ? &Pref->AptxHd : &Pref->AptxLl)->LlTargetLevel;
+        break;
+    case PNA2DP_CODEC_LDAC:
+        Cfg->LdacEqmid = (Pref->Ldac.Eqmid <= PNA2DP_LDAC_EQMID_MQ) ? Pref->Ldac.Eqmid : PNA2DP_LDAC_EQMID_SQ;
+        if (Pref->Ldac.FormatMask & PNA2DP_FMT_S32) Cfg->PcmFormat = PNA2DP_FMT_S32;
+        else if (Pref->Ldac.FormatMask & PNA2DP_FMT_S24) Cfg->PcmFormat = PNA2DP_FMT_S24;
+        else if (Pref->Ldac.FormatMask & PNA2DP_FMT_F32) Cfg->PcmFormat = PNA2DP_FMT_F32;
+        break;
+    default:
+        break;
+    }
+    Cfg->BitrateBps = Cfg->MaxBitrateBps = A2dpNominalBitrate(Cfg);
+    /* the basic-rate budget, as the chooser applies it (a fixed-rate codec above it stays as the
+     * receiver configured it). The receiver's IEs and SBC maximum stay what it configured. */
+    if (Conservative) {
+        UCHAR ies[sizeof(Cfg->Ies)];
+        const UCHAR len = Cfg->IesLength, sbcMax = Cfg->SbcMaxBitpool;
+        RtlCopyMemory(ies, Cfg->Ies, sizeof(ies));
+        (void)A2dpConstrainBasicRadio(Cfg);
+        RtlCopyMemory(Cfg->Ies, ies, sizeof(ies));
+        Cfg->IesLength = len;
+        Cfg->SbcMaxBitpool = sbcMax;
+    }
+    /* Except AAC's VBR bit and bitrate: the codec host takes the encoder mode and peak from the
+     * IEs (aac_plugin), so they carry the source's choice. CBR is allowed where the receiver
+     * permits VBR, and the bitrate only goes down. */
+    if (Cfg->Codec == PNA2DP_CODEC_AAC && Cfg->IesLength >= 6) {
+        Cfg->Ies[3] = (UCHAR)((Cfg->AacVbr ? 0x80 : 0) | ((Cfg->BitrateBps >> 16) & 0x7F));
+        Cfg->Ies[4] = (UCHAR)(Cfg->BitrateBps >> 8);
+        Cfg->Ies[5] = (UCHAR)Cfg->BitrateBps;
+    }
+}
+
 /* Conservative initial envelope for a confirmed Basic Rate-only adapter.
  * EDR/unknown radios retain the user's ceiling and are measured during playback.
  * This is a policy budget, not a measured link speed. Never violate sink minima. */

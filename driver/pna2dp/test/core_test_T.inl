@@ -2325,6 +2325,125 @@ static void TestTRateConvert()
     }
 }
 
+/* 0.1.0.25: the speaker delay. The EDIFIER MR5 (LDAC 48 kHz) reports 25.0 ms right after it
+ * sets up the stream itself and 364.0 ms after a stream restart; chirps recorded with a
+ * microphone against the render clock put its real delay at 265-295 ms. A report below the
+ * codec's plausibility floor is ignored (the per-codec default applies); a configured delay
+ * (measured with a microphone or set) replaces the reports for its codec or for any codec. */
+static PN_SINK_DELAY TSinkDelay(BOOLEAN Active, ULONG ReportTenths, ULONG Codec, ULONG SetMs = 0, ULONG SetCodec = 0)
+{
+    PN_SINK_DELAY_INPUT in = { Active, ReportTenths != 0, ReportTenths, Codec, SetMs, SetCodec };
+    return PnSinkDelayDecide(&in);
+}
+
+static BOOLEAN TSinkDelayIs(const PN_SINK_DELAY &r, ULONG Us, PN_SINK_DELAY_SOURCE Source, ULONG ReportedUs, BOOLEAN Ignored)
+{
+    return r.Us == Us && r.Source == Source && r.ReportedUs == ReportedUs && r.ReportIgnored == Ignored;
+}
+
+/* Presentation position while the applied delay changes from BeforeUs to AfterUs at 5 s of a
+ * running stream (a set value applied live: no new pump epoch). FALSE if it ever moved
+ * backwards or off the 1 %/s slew, or is not within 1 ms of the new delay at 20 s. */
+static BOOLEAN TSinkDelayPresentation(ULONG BeforeUs, ULONG AfterUs)
+{
+    const ULONG rate = 48000, pipelineUs = 40000;
+    const ULONGLONG freq = 10000000;
+    PN_WAVE_PRESENTATION st = {};
+    PnWavePresentationSetEpoch(&st, 1);
+    ULONGLONG prev = 0, pos = 0;
+    BOOLEAN ok = TRUE;
+    for (ULONGLONG q = 100000; q <= 20 * freq; q += 100000) {     /* every 10 ms */
+        ULONG lat = pipelineUs + (q < 5 * freq ? BeforeUs : AfterUs);
+        pos = PnWavePresentationFrames(&st, q * rate / freq, q, TRUE, q, freq, rate, lat);
+        if (prev) {
+            long long step = (long long)pos - (long long)prev, ideal = 480;   /* 10 ms of frames */
+            if (step < 0 || step > ideal + ideal * 11 / 1000 + 3 || step < ideal - ideal * 11 / 1000 - 3) ok = FALSE;
+        }
+        prev = pos;
+    }
+    long long err = (long long)pos - (long long)(20 * freq * rate / freq - (ULONGLONG)(pipelineUs + AfterUs) * rate / 1000000);
+    return ok && err >= -48 && err <= 48;
+}
+
+static void TestTSinkDelay()
+{
+    /* ABI 1: the new words are former reserved words; sizes and every existing offset stay */
+    static_assert(sizeof(PNA2DP_CONFIG) == 156 && offsetof(PNA2DP_CONFIG, Ldac) == 116 && offsetof(PNA2DP_CONFIG, SinkDelayMs) == 124 &&
+                  offsetof(PNA2DP_CONFIG, SinkDelayCodec) == 128 && offsetof(PNA2DP_CONFIG, Reserved) == 132 &&
+                  sizeof(((PNA2DP_CONFIG *)0)->Reserved) == 24, "PNA2DP_CONFIG layout (ABI 1)");
+    static_assert(sizeof(PNA2DP_STATUS) == 224 && offsetof(PNA2DP_STATUS, SinkReportedDelayUs) == 176 &&
+                  offsetof(PNA2DP_STATUS, EstimatedLatencyUs) == 180 && offsetof(PNA2DP_STATUS, EngineSampleRate) == 208 &&
+                  offsetof(PNA2DP_STATUS, SinkDelayUs) == 212 && offsetof(PNA2DP_STATUS, Reserved) == 216 &&
+                  sizeof(((PNA2DP_STATUS *)0)->Reserved) == 8, "PNA2DP_STATUS layout (ABI 1)");
+    static_assert(PNA2DP_STATUS_FLAG_SINK_DELAY_SET == 0x2000 && PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED == 0x4000 &&
+                  ((PNA2DP_STATUS_FLAG_SINK_DELAY_SET | PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED) & 0x1FFF) == 0, "free status bits");
+    static_assert(PN_CONFIG_MAX_SINK_DELAY_MS <= 0xFFFF, "a validated set value fits the packed setting");
+
+    /* the plausibility floor per codec; every default is itself plausible */
+    CHECK(PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_LDAC) == 80000 && PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_AAC) == 80000 &&
+          PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_APTX_HD) == 80000);
+    CHECK(PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_APTX) == 40000 && PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_SBC) == 40000);
+    CHECK(PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_NONE) == 40000 && PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_OPUS) == 40000 &&
+          PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_MAX + 3) == 40000);
+    CHECK(PnMinPlausibleSinkDelayUs(PNA2DP_CODEC_APTX_LL) == 0);
+    for (ULONG c = PNA2DP_CODEC_NONE; c < PNA2DP_CODEC_MAX; c++) CHECK(PnMinPlausibleSinkDelayUs(c) < PnDefaultSinkDelayUs(c));
+    /* at the floor a report is used; below it the default applies and the report is named ignored */
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 800, PNA2DP_CODEC_LDAC), 80000, PnSinkDelayReported, 80000, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 799, PNA2DP_CODEC_LDAC), PN_SINK_DELAY_LDAC_US, PnSinkDelayDefault, 79900, TRUE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 799, PNA2DP_CODEC_AAC), PN_SINK_DELAY_AAC_US, PnSinkDelayDefault, 79900, TRUE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 799, PNA2DP_CODEC_APTX_HD), PN_SINK_DELAY_APTX_HD_US, PnSinkDelayDefault, 79900, TRUE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 400, PNA2DP_CODEC_SBC), 40000, PnSinkDelayReported, 40000, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 399, PNA2DP_CODEC_SBC), PN_SINK_DELAY_DEFAULT_US, PnSinkDelayDefault, 39900, TRUE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 399, PNA2DP_CODEC_APTX), PN_SINK_DELAY_APTX_US, PnSinkDelayDefault, 39900, TRUE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 1, PNA2DP_CODEC_APTX_LL), 100, PnSinkDelayReported, 100, FALSE));   /* any report believed */
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 0, PNA2DP_CODEC_LDAC), PN_SINK_DELAY_LDAC_US, PnSinkDelayDefault, 0, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 65535, PNA2DP_CODEC_SBC), 6553500, PnSinkDelayReported, 6553500, FALSE));   /* 16-bit maximum */
+
+    /* the MR5: 25 ms is impossible (the LDAC default instead), 364 ms is used, a measured 280 ms wins */
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 250, PNA2DP_CODEC_LDAC), 200000, PnSinkDelayDefault, 25000, TRUE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 3640, PNA2DP_CODEC_LDAC), 364000, PnSinkDelayReported, 364000, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 3640, PNA2DP_CODEC_LDAC, 280, PNA2DP_CODEC_LDAC), 280000, PnSinkDelaySet, 364000, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 250, PNA2DP_CODEC_LDAC, 280, PNA2DP_CODEC_LDAC), 280000, PnSinkDelaySet, 25000, TRUE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 0, PNA2DP_CODEC_LDAC, 280, PNA2DP_CODEC_LDAC), 280000, PnSinkDelaySet, 0, FALSE));
+    /* a value set for one codec leaves the speaker's other codecs automatic */
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 1500, PNA2DP_CODEC_AAC, 280, PNA2DP_CODEC_LDAC), 150000, PnSinkDelayReported, 150000, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 0, PNA2DP_CODEC_AAC, 280, PNA2DP_CODEC_LDAC), PN_SINK_DELAY_AAC_US, PnSinkDelayDefault, 0, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 0, PNA2DP_CODEC_NONE, 280, PNA2DP_CODEC_LDAC), PN_SINK_DELAY_DEFAULT_US, PnSinkDelayDefault, 0, FALSE));
+    /* a value set for any codec applies to all of them, also before the codec is known */
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 3640, PNA2DP_CODEC_AAC, 280, 0), 280000, PnSinkDelaySet, 364000, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 0, PNA2DP_CODEC_NONE, 280, 0), 280000, PnSinkDelaySet, 0, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 1, PNA2DP_CODEC_SBC, 1000, 0), 1000000, PnSinkDelaySet, 100, TRUE));
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 0, PNA2DP_CODEC_SBC, 1, 0), 1000, PnSinkDelaySet, 0, FALSE));
+    /* 0 ms is automatic whatever the codec word says */
+    CHECK(TSinkDelayIs(TSinkDelay(TRUE, 3640, PNA2DP_CODEC_LDAC, 0, PNA2DP_CODEC_LDAC), 364000, PnSinkDelayReported, 364000, FALSE));
+    /* no stream: nothing applies and nothing is reported */
+    CHECK(TSinkDelayIs(TSinkDelay(FALSE, 3640, PNA2DP_CODEC_LDAC, 280, 0), 0, PnSinkDelayNoStream, 0, FALSE));
+    CHECK(TSinkDelayIs(TSinkDelay(FALSE, 250, PNA2DP_CODEC_LDAC), 0, PnSinkDelayNoStream, 0, FALSE));
+    /* the automatic wrapper of the earlier callers applies the floor too */
+    CHECK(PnSinkDelayUs(TRUE, FALSE, TRUE, 250, PNA2DP_CODEC_LDAC) == PN_SINK_DELAY_LDAC_US);
+    CHECK(PnSinkDelayUs(TRUE, FALSE, TRUE, 3640, PNA2DP_CODEC_LDAC) == 364000);
+
+    /* the setting travels as one word (DeviceSinkDelayUs reads it lock-free) */
+    for (ULONG ms : { 0u, 1u, 280u, 999u, 1000u }) for (ULONG c = 0; c < PNA2DP_CODEC_MAX; c++) {
+        LONG p = PnSinkDelaySettingPack(ms, c);
+        CHECK(p >= 0 && PnSinkDelaySettingMs(p) == ms && PnSinkDelaySettingCodec(p) == c);
+    }
+    CHECK(PnSinkDelaySettingPack(0, 0) == 0);
+    CHECK(PnSinkDelaySettingMs(PnSinkDelaySettingPack(70000, PNA2DP_CODEC_LDAC)) == 0xFFFF &&
+          PnSinkDelaySettingCodec(PnSinkDelaySettingPack(70000, PNA2DP_CODEC_LDAC)) == PNA2DP_CODEC_LDAC);   /* never wraps into the codec */
+    CHECK(PnSinkDelaySettingPack(1000, 0xFFFFFFFFu) >= 0);
+
+    /* applied while playing (a set value takes effect live, without a new pump epoch): the
+     * presentation position follows at the 1 %/s slew, never backwards and without a jump,
+     * and settles on the new delay: 364 ms reported -> 280 ms set (lower), the ignored 25 ms
+     * (LDAC default 200 ms) -> 280 ms set (higher), and back to automatic */
+    ULONG reported = TSinkDelay(TRUE, 3640, PNA2DP_CODEC_LDAC).Us, fallback = TSinkDelay(TRUE, 250, PNA2DP_CODEC_LDAC).Us;
+    ULONG set = TSinkDelay(TRUE, 3640, PNA2DP_CODEC_LDAC, 280, PNA2DP_CODEC_LDAC).Us;
+    CHECK(TSinkDelayPresentation(reported, set));
+    CHECK(TSinkDelayPresentation(fallback, set));
+    CHECK(TSinkDelayPresentation(set, reported));
+}
+
 static void TestLaneT()
 {
     unsigned before = failures;
@@ -2344,6 +2463,7 @@ static void TestLaneT()
     TestTReview4();
     TestTReview5();
     TestTRateConvert();
+    TestTSinkDelay();
     tNonRedFailures = failures - before - tRedFailures;
     printf("lane T: %u non-RED failures; RED group (corrected transport): %u of %u checks failing\n",
            tNonRedFailures, tRedFailures, tRedChecks);

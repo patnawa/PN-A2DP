@@ -1777,6 +1777,25 @@ static void TestConfigPolicy()
     v = d; v.Ldac.Eqmid = 9; v.Flags = PNA2DP_CFG_AUTO_QUALITY; v.Ldac.AbrEnable = 0; v.EnabledCodecMask = 0;
     CHECK(PnConfigValidate(&v) && v.Ldac.Eqmid == PNA2DP_LDAC_EQMID_SQ && (v.Flags & PNA2DP_CFG_ABR_ENABLE) && v.Ldac.AbrEnable &&
           (v.Flags & PNA2DP_CFG_SOFTWARE_VOLUME) && v.EnabledCodecMask == PNA2DP_CODEC_BIT(PNA2DP_CODEC_SBC));
+    /* 0.1.0.25: the speaker delay starts automatic; a set value is stored as sent up to 1000 ms
+     * and clamped above; a codec word that is no PNA2DP_CODEC_* makes both automatic again */
+    CHECK(d.SinkDelayMs == 0 && d.SinkDelayCodec == 0 && PN_CONFIG_MAX_SINK_DELAY_MS == 1000);
+    PNA2DP_CONFIG sent = d;
+    for (ULONG ms : { 1u, 280u, 1000u }) for (ULONG c = PNA2DP_CODEC_NONE; c < PNA2DP_CODEC_MAX; c++) {
+        sent.SinkDelayMs = ms; sent.SinkDelayCodec = c; v = sent;
+        CHECK(PnConfigValidate(&v) && !memcmp(&v, &sent, sizeof(v)));
+    }
+    v = d; v.SinkDelayMs = 0; v.SinkDelayCodec = PNA2DP_CODEC_LDAC; sent = v;
+    CHECK(PnConfigValidate(&v) && !memcmp(&v, &sent, sizeof(v)));                     /* automatic; the codec word is harmless */
+    v = d; v.SinkDelayMs = 1001; v.SinkDelayCodec = PNA2DP_CODEC_LDAC;
+    CHECK(PnConfigValidate(&v) && v.SinkDelayMs == 1000 && v.SinkDelayCodec == PNA2DP_CODEC_LDAC);
+    v = d; v.SinkDelayMs = 0xFFFFFFFFu; v.SinkDelayCodec = 0;
+    CHECK(PnConfigValidate(&v) && v.SinkDelayMs == 1000 && v.SinkDelayCodec == 0);
+    v = d; v.SinkDelayMs = 280; v.SinkDelayCodec = PNA2DP_CODEC_MAX;
+    CHECK(PnConfigValidate(&v) && v.SinkDelayMs == 0 && v.SinkDelayCodec == 0);
+    v = d; v.SinkDelayMs = 5000; v.SinkDelayCodec = 0x80000006u;
+    CHECK(PnConfigValidate(&v) && v.SinkDelayMs == 0 && v.SinkDelayCodec == 0);
+    CHECK(!memcmp(v.Reserved, d.Reserved, sizeof(v.Reserved)));
 
     /* DeviceStart saves the defaults only where nothing is stored: never over a saved
      * configuration it cannot read (another ABI, a rejected value, an I/O error) */
@@ -1949,6 +1968,89 @@ static void TestLatencyProfileLink()
            balSlow.firstDowngradeMs, musicSlow.firstDowngradeMs, musicSlow.trims);
 }
 
+/* 0.1.0.24: a configuration the receiver chooses (its SET_CONFIGURATION or RECONFIGURE) carries
+ * no LDAC quality, AAC encoder bitrate or aptX LL level: those are the source's choice and
+ * follow the saved preferences as for a stream PN-A2DP configures. Before, the EDIFIER MR5,
+ * reconnecting by itself after a settings change, ran LDAC at SQ 660 kbps under HQ. */
+static void TestRemoteConfiguredQuality()
+{
+    PNA2DP_CONFIG pref;
+    PnConfigDefaults(&pref);                                                         /* LDAC HQ, AAC 320 kbps CBR */
+    const UCHAR ldac48[] = { 0x2d, 0x01, 0x00, 0x00, 0xaa, 0x00, 0x10, 0x01 };       /* the MR5's choice: 48 kHz stereo */
+    A2DP_CODEC_CONFIG cfg, chosen;
+    CHECK(A2dpParseConfig(A2DP_CODEC_VENDOR, ldac48, sizeof(ldac48), &cfg) && cfg.Codec == PNA2DP_CODEC_LDAC && cfg.SampleRate == 48000);
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(cfg.LdacEqmid == PNA2DP_LDAC_EQMID_HQ && cfg.BitrateBps == 990000 && cfg.MaxBitrateBps == 990000);
+    CHECK(cfg.SampleRate == 48000 && cfg.ChannelMode == PNA2DP_CHMODE_STEREO && cfg.IesLength == sizeof(ldac48) &&
+          !memcmp(cfg.Ies, ldac48, sizeof(ldac48)));                                 /* the receiver's configuration stands */
+    /* the same quality as the chooser picks from the receiver's capabilities (MR5: 44.1 / 48 / 96 kHz) */
+    const UCHAR ldacCaps[] = { 0x2d, 0x01, 0x00, 0x00, 0xaa, 0x00, 0x34, 0x07 };
+    A2DP_CODEC_CAPS caps;
+    CHECK(A2dpParseCaps(A2DP_CODEC_VENDOR, ldacCaps, sizeof(ldacCaps), &caps, NULL, NULL) &&
+          A2dpSelectConfig(&caps, &pref, 48000, 24, &chosen) && chosen.LdacEqmid == cfg.LdacEqmid);
+    pref.Ldac.Eqmid = PNA2DP_LDAC_EQMID_MQ;
+    CHECK(A2dpParseConfig(A2DP_CODEC_VENDOR, ldac48, sizeof(ldac48), &cfg));
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(cfg.LdacEqmid == PNA2DP_LDAC_EQMID_MQ && cfg.BitrateBps == 330000);
+    pref.Ldac.Eqmid = PNA2DP_LDAC_EQMID_ABR;                                         /* adaptive: starts at SQ, as the chooser */
+    CHECK(A2dpParseConfig(A2DP_CODEC_VENDOR, ldac48, sizeof(ldac48), &cfg));
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(cfg.LdacEqmid == PNA2DP_LDAC_EQMID_SQ && cfg.BitrateBps == 660000);
+    pref.Ldac.Eqmid = PNA2DP_LDAC_EQMID_HQ;                                          /* a basic-rate radio: MQ, as the chooser */
+    CHECK(A2dpParseConfig(A2DP_CODEC_VENDOR, ldac48, sizeof(ldac48), &cfg));
+    A2dpApplySourcePreferences(&cfg, &pref, TRUE);
+    CHECK(cfg.LdacEqmid == PNA2DP_LDAC_EQMID_MQ && cfg.BitrateBps == 330000 && cfg.MaxBitrateBps == 330000);
+    CHECK(cfg.IesLength == sizeof(ldac48) && !memcmp(cfg.Ies, ldac48, sizeof(ldac48)));
+
+    /* AAC: MPEG-2 LC, 48 kHz stereo, VBR allowed, 320 kbps (byte 3: VBR | bitrate bits 22..16) */
+    PnConfigDefaults(&pref);
+    const UCHAR aac320[] = { 0x80, 0x00, 0x84, 0x84, 0xE2, 0x00 };
+    CHECK(A2dpParseConfig(A2DP_CODEC_MPEG24_AAC, aac320, sizeof(aac320), &cfg) && cfg.Codec == PNA2DP_CODEC_AAC &&
+          cfg.SampleRate == 48000 && cfg.AacVbr && cfg.BitrateBps == 320000);
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(!cfg.AacVbr && cfg.BitrateBps == 320000 && cfg.MaxBitrateBps == 320000);   /* CBR, as preferred */
+    CHECK(!(cfg.Ies[3] & 0x80) && cfg.Ies[4] == 0xE2 && cfg.Ies[5] == 0x00 && cfg.Ies[0] == 0x80 && cfg.Ies[2] == 0x84);   /* the encoder reads the IEs */
+    pref.Aac.BitrateBps = 192000; pref.Aac.Vbr = 1;
+    CHECK(A2dpParseConfig(A2DP_CODEC_MPEG24_AAC, aac320, sizeof(aac320), &cfg));
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(cfg.AacVbr && cfg.BitrateBps == 192000);
+    CHECK((cfg.Ies[3] & 0x80) && (((ULONG)(cfg.Ies[3] & 0x7F) << 16) | ((ULONG)cfg.Ies[4] << 8) | cfg.Ies[5]) == 192000);
+    const UCHAR aac256cbr[] = { 0x80, 0x00, 0x84, 0x03, 0xE8, 0x00 };                /* the receiver's own 256 kbps, no VBR */
+    pref.Aac.BitrateBps = 320000;
+    CHECK(A2dpParseConfig(A2DP_CODEC_MPEG24_AAC, aac256cbr, sizeof(aac256cbr), &cfg) && !cfg.AacVbr && cfg.BitrateBps == 256000);
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(!cfg.AacVbr && cfg.BitrateBps == 256000);                                  /* never above the receiver's bitrate */
+    CHECK(cfg.IesLength == sizeof(aac256cbr) && !memcmp(cfg.Ies, aac256cbr, sizeof(aac256cbr)));
+
+    /* SBC: the receiver's bitpool range is binding. A preference narrows where the encoder starts
+     * (SbcBitpool, the ABR's top rung) and its floor; SbcMaxBitpool stays the negotiated maximum,
+     * which a live bitpool change may still reach in band (DeviceSetConfig, A2dpSbcPlanStream) */
+    PnConfigDefaults(&pref);
+    const UCHAR sbc48[] = { 0x11, 0x15, 0x02, 0x35 };                                /* 48 kHz joint, 16 blocks, 8 subbands, loudness, 2..53 */
+    CHECK(A2dpParseConfig(A2DP_CODEC_SBC, sbc48, sizeof(sbc48), &cfg) && cfg.SbcMaxBitpool == 53);
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(cfg.SbcBitpool == 53 && cfg.SbcMaxBitpool == 53 && cfg.SbcMinBitpool == 2 && cfg.BitrateBps == A2dpNominalBitrate(&cfg));
+    pref.Sbc.MaxBitpool = 35; pref.Sbc.MinBitpool = 10;
+    CHECK(A2dpParseConfig(A2DP_CODEC_SBC, sbc48, sizeof(sbc48), &cfg));
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(cfg.SbcBitpool == 35 && cfg.SbcMaxBitpool == 53 && cfg.SbcMinBitpool == 10 && cfg.BitrateBps == A2dpNominalBitrate(&cfg));
+    CHECK(cfg.IesLength == sizeof(sbc48) && !memcmp(cfg.Ies, sbc48, sizeof(sbc48)));
+    pref.Sbc.MaxBitpool = 64; pref.Sbc.AllowBitpoolOverride = 1;                     /* never above the receiver's maximum */
+    CHECK(A2dpParseConfig(A2DP_CODEC_SBC, sbc48, sizeof(sbc48), &cfg));
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(cfg.SbcBitpool == 53 && cfg.SbcMaxBitpool == 53);
+    const UCHAR sbc48narrow[] = { 0x11, 0x15, 0x14, 0x28 };                          /* the receiver allows only 20..40 */
+    pref.Sbc.MaxBitpool = 10; pref.Sbc.MinBitpool = 2; pref.Sbc.AllowBitpoolOverride = 0;
+    CHECK(A2dpParseConfig(A2DP_CODEC_SBC, sbc48narrow, sizeof(sbc48narrow), &cfg));
+    A2dpApplySourcePreferences(&cfg, &pref, FALSE);
+    CHECK(cfg.SbcBitpool == 20 && cfg.SbcMaxBitpool == 40 && cfg.SbcMinBitpool == 20);   /* never below the receiver's minimum */
+    PnConfigDefaults(&pref);                                                         /* a basic-rate radio: the 350 kbps budget */
+    CHECK(A2dpParseConfig(A2DP_CODEC_SBC, sbc48, sizeof(sbc48), &cfg));
+    A2dpApplySourcePreferences(&cfg, &pref, TRUE);
+    CHECK(cfg.SbcBitpool < 53 && cfg.SbcBitpool >= 2 && cfg.BitrateBps <= 350000 && cfg.SbcMaxBitpool == 53 &&
+          cfg.IesLength == sizeof(sbc48) && !memcmp(cfg.Ies, sbc48, sizeof(sbc48)));
+}
+
 static void TestLaneP3()
 {
     TestReview2P();
@@ -1962,6 +2064,7 @@ static void TestLaneP3()
     TestQualityReviewP();
     TestConfigPolicy();
     TestLatencyProfiles();
+    TestRemoteConfiguredQuality();
     TestAbrProfileGate();
     TestLatencyProfileLink();
     TestNativeConversionGolden();

@@ -1022,8 +1022,9 @@ STDMETHODIMP_(NTSTATUS) CPnMiniportWaveRTStream::GetOutputStreamPresentationPosi
 {
     if (m_Notifications == 0) return STATUS_NOT_SUPPORTED;
     /* Bluetooth path latency between the consumed position and what the sink presents
-     * (C2/C3: pipeline + the receiver's delay, the sources the status reports). Read
-     * without the stream lock (the pump has its own). */
+     * (C2/C3: pipeline + the applied sink delay - the set speaker delay, a plausible report
+     * or the per-codec default - the sources the status reports). Read without the stream
+     * lock (the pump has its own). A changed sink delay is followed at the 1 %/s slew. */
     ULONG latencyUs = 0, epoch = 0;
     if (m_Device) {
         epoch = PumpLatencyEpoch(&m_Device->Pump);   /* first: a restart in between snaps on the next call */

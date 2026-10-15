@@ -77,10 +77,40 @@ std::wstring   StreamFormatText(const PNA2DP_STATUS &status, bool withEngineRate
 std::wstring   EngineRateText(const PNA2DP_STATUS &status);
 std::wstring   NtStatusText(ULONG status);
 std::wstring   DescribeSep(const PNA2DP_REMOTE_SEP &sep);   /* multi-line decode of the codec IEs */
+std::wstring   SepRatesText(const PNA2DP_REMOTE_SEP &sep);  /* the receiver's sample rates for this codec: "44.1k, 48k, 96k", or "-" */
 std::wstring   HexBytes(const UCHAR *p, ULONG n);
 std::wstring   AdapterNameForDevice(const std::wstring &instanceId);
 const wchar_t *QualityHealthName(ULONG health);
 std::wstring   QualityReport(const PNA2DP_QUALITY &q);
+
+/* ---- speaker delay (driver 0.1.0.25) ----------------------------------------- */
+/* Where the speaker delay the driver applies comes from (PNA2DP_STATUS.SinkDelayUs with the
+ * SINK_DELAY_SET / SINK_DELAY_IGNORED flags; transport_policy.h PnSinkDelayDecide). Legacy: a
+ * driver before 0.1.0.25 (SinkDelayUs 0 with a stream or a report), described as before. */
+enum class SinkDelaySource { NoStream, Set, Reported, Default, Legacy };
+SinkDelaySource SinkDelaySourceOf(const PNA2DP_STATUS &s);
+bool           DriverAppliesSinkDelay(const PNA2DP_VERSION &v);   /* 0.1.0.25 or later: SinkDelayUs, SinkDelayMs */
+std::wstring   DelayMsText(ULONG us);                    /* "364 ms", "25.4 ms" (tenths as reported) */
+/* One sentence for the Headset page and pna2dpctl status: "Using 364 ms reported by the
+ * speaker", "Using 280 ms, the fixed speaker delay; the speaker reports 364 ms", "Using 200 ms,
+ * the LDAC default; the speaker's report of 25 ms is ignored as impossible", "No stream" */
+std::wstring   SinkDelayText(const PNA2DP_STATUS &s);
+/* The same for the Status page's value column: "364 ms reported by the speaker", "280 ms fixed;
+ * the speaker reports 364 ms", "200 ms default; the 25 ms report is ignored", "no stream" */
+std::wstring   SinkDelayShortText(const PNA2DP_STATUS &s);
+/* The setting (PNA2DP_CONFIG.SinkDelayMs / SinkDelayCodec): "automatic", "280 ms (LDAC)",
+ * "280 ms (any codec)" */
+std::wstring   SinkDelaySettingText(const PNA2DP_CONFIG &c);
+/* The pna2dpctl keys (also in the settings text): sinkdelay=auto|0|1..1000 (auto resets the
+ * codec too) and sinkdelay.codec=any|sbc|aac|aptx|aptxhd|aptxll|ldac|... (case-insensitive).
+ * Returns 1 when applied, 0 for a refused value (c unchanged), -1 for another key. */
+int            SinkDelayKey(PNA2DP_CONFIG &c, const wchar_t *key, const wchar_t *value);
+/* The speaker delay the driver is expected to apply while a measurement plays (its lag range,
+ * pnlatency.h FitLatencyLagRange), in ms rounded up: the larger of the applied SinkDelayUs and
+ * a fixed SinkDelayMs (c: the driver's configuration) for the stream's codec or any codec; with
+ * no stream (the measurement may start a fresh one, its codec not known yet) any fixed delay
+ * counts. 0 when nothing is known yet (automatic, no stream). */
+ULONG          ExpectedSinkDelayMs(const PNA2DP_STATUS &s, const PNA2DP_CONFIG &c);
 
 /* ---- configuration helpers -------------------------------------------------- */
 void  ConfigDefaults(PNA2DP_CONFIG &c);        /* the driver's RegCfgDefaults (config_policy.h PnConfigDefaults) */

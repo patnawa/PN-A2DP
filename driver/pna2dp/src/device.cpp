@@ -155,6 +155,8 @@ VOID DeviceFlushWaitersForFile(_Inout_ PPNA2DP_DEVICE D, _In_ PFILE_OBJECT File)
 /* Status helpers                                                               */
 /* ------------------------------------------------------------------------- */
 
+static PN_SINK_DELAY DeviceSinkDelay(_In_ PPNA2DP_DEVICE D);
+
 /* PipelineUs / CeilingBps: read from the pump before StatusLock is taken (its own spin
  * locks). C2/C3: the same sources as the presentation position of the wave stream. */
 static VOID UpdateStatusLocked(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG PipelineUs, _In_ ULONG CeilingBps)
@@ -179,11 +181,13 @@ static VOID UpdateStatusLocked(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG PipelineUs, 
         s->SampleRate = s->Channels = s->BitsPerSample = s->BitrateBps = s->MaxBitrateBps = 0;
     }
     s->MediaMtu = AvdtpMediaMtu(&D->Avdtp);
-    /* SinkReportedDelayUs keeps its ABI meaning (the receiver's AVDTP delay report, 0 if none);
-     * the end-to-end estimate also includes the per-codec default for non-reporting sinks. */
-    ULONG sinkUs = DeviceSinkDelayUs(D);
-    s->SinkReportedDelayUs = D->Avdtp.SinkDelayTenthsMs ? sinkUs : 0;
-    s->EstimatedLatencyUs = PipelineUs + sinkUs;
+    /* SinkReportedDelayUs keeps its ABI meaning (the receiver's AVDTP delay report, 0 if none),
+     * used or not; SinkDelayUs and the end-to-end estimate carry the delay the driver applies:
+     * the configured speaker delay, a plausible report or the per-codec default (0.1.0.25). */
+    PN_SINK_DELAY sink = DeviceSinkDelay(D);
+    s->SinkReportedDelayUs = sink.ReportedUs;
+    s->SinkDelayUs = sink.Us;
+    s->EstimatedLatencyUs = PipelineUs + sink.Us;
     s->AvdtpVersion = D->Avdtp.RemoteVersion;
     s->EncoderOwner = (ULONG)D->Pump.Owner;
     s->Flags = 0;
@@ -196,6 +200,8 @@ static VOID UpdateStatusLocked(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG PipelineUs, 
     if (D->RemoteVolumeActive) s->Flags |= PNA2DP_STATUS_FLAG_REMOTE_VOLUME;
     if (D->RemoteSuspended) s->Flags |= PNA2DP_STATUS_FLAG_REMOTE_SUSPENDED;
     if (D->ReceiverUnreachable) s->Flags |= PNA2DP_STATUS_FLAG_UNREACHABLE;
+    if (sink.Source == PnSinkDelaySet) s->Flags |= PNA2DP_STATUS_FLAG_SINK_DELAY_SET;
+    if (sink.ReportIgnored) s->Flags |= PNA2DP_STATUS_FLAG_SINK_DELAY_IGNORED;
     if (PumpIsStreaming(&D->Pump) && D->Pump.Rate.EngineRate != D->Pump.Rate.CodecRate) {
         s->Flags |= PNA2DP_STATUS_FLAG_RATE_CONVERTED;
         if (D->Pump.Rate.Decimate == 2 && !D->Pump.Rate.Rs) s->Flags |= PNA2DP_STATUS_FLAG_HALF_RATE;
@@ -204,15 +210,37 @@ static VOID UpdateStatusLocked(_Inout_ PPNA2DP_DEVICE D, _In_ ULONG PipelineUs, 
     if (D->Pump.Owner == PnEncoderKernelSbc && D->Config.CodecPriority[0] != PNA2DP_CODEC_SBC && !CodecHostCodecMask(&D->Host)) s->Flags |= PNA2DP_STATUS_FLAG_HOST_MISSING;
 }
 
-/* C2: sink delay of the current stream (transport_policy.h): the receiver's DELAYREPORT
- * whenever one was received, even without delay-reporting negotiation (the MR5 sends
- * them unasked), else the documented per-codec default; 0 without a stream.
- * Lock-free, <= DISPATCH. */
+/* C2 / 0.1.0.25: sink delay of the current stream (transport_policy.h PnSinkDelayDecide): the
+ * configured speaker delay when it applies to this codec, else the receiver's DELAYREPORT
+ * when one was received and is plausible (even without delay-reporting negotiation: the MR5
+ * sends them unasked; its 25 ms is not), else the documented per-codec default; 0 without a
+ * stream. A changed setting applies at once (SET_CONFIG renegotiates nothing for it); the
+ * WaveRT presentation position follows at its 1 %/s slew, never backwards (wave_math.h).
+ * Lock-free, <= DISPATCH: each input is read once. */
+static PN_SINK_DELAY DeviceSinkDelay(_In_ PPNA2DP_DEVICE D)
+{
+    LONG setting = InterlockedCompareExchange(&D->SinkDelaySetting, 0, 0);
+    PN_SINK_DELAY_INPUT in;
+    in.StreamActive = AvdtpGetState(&D->Avdtp) != AvdtpStateIdle;
+    in.ReportedTenthsMs = D->Avdtp.SinkDelayTenthsMs;
+    in.ReportReceived = in.ReportedTenthsMs != 0;
+    in.Codec = D->ActiveValid ? D->Active.Codec : PNA2DP_CODEC_NONE;
+    in.SetMs = PnSinkDelaySettingMs(setting);
+    in.SetCodec = PnSinkDelaySettingCodec(setting);
+    return PnSinkDelayDecide(&in);
+}
+
 ULONG DeviceSinkDelayUs(_In_ PPNA2DP_DEVICE D)
 {
-    ULONG tenths = D->Avdtp.SinkDelayTenthsMs;
-    return PnSinkDelayUs(AvdtpGetState(&D->Avdtp) != AvdtpStateIdle, D->Avdtp.DelayReportingNegotiated, tenths != 0, tenths,
-                         D->ActiveValid ? D->Active.Codec : PNA2DP_CODEC_NONE);
+    return DeviceSinkDelay(D).Us;
+}
+
+/* The lock-free copy of the speaker-delay words, after every write of the whole Config
+ * (DeviceStart; DeviceSetConfig with StatusLock held). */
+C_ASSERT(PN_CONFIG_MAX_SINK_DELAY_MS <= 0xFFFF);   /* a validated value fits the packed setting */
+static VOID PublishSinkDelaySetting(_Inout_ PPNA2DP_DEVICE D)
+{
+    InterlockedExchange(&D->SinkDelaySetting, PnSinkDelaySettingPack(D->Config.SinkDelayMs, D->Config.SinkDelayCodec));
 }
 
 NTSTATUS DeviceGetStatus(_In_ PPNA2DP_DEVICE D, _Out_ PPNA2DP_STATUS Status)
@@ -1223,6 +1251,19 @@ VOID DevicePowerChanged(_Inout_ PPNA2DP_DEVICE D, _In_ DEVICE_POWER_STATE State,
 /* AVDTP callbacks (Avdtp.Mutex held, PASSIVE)                                  */
 /* ------------------------------------------------------------------------- */
 
+/* A receiver-chosen configuration carries no LDAC quality, AAC encoder bitrate or aptX LL level:
+ * take them from the saved preferences, as ChooseConfig does for a stream we configure
+ * (A2dpApplySourcePreferences). Config is copied under StatusLock, as DeviceSetConfig writes it. */
+static VOID ApplySourcePreferences(_Inout_ PPNA2DP_DEVICE D, _Inout_ PA2DP_CODEC_CONFIG Cfg)
+{
+    PNA2DP_CONFIG pref;
+    KIRQL irql;
+    KeAcquireSpinLock(&D->StatusLock, &irql);
+    pref = D->Config;
+    KeReleaseSpinLock(&D->StatusLock, irql);
+    A2dpApplySourcePreferences(Cfg, &pref, ConservativeRadio(D));
+}
+
 static UCHAR OnRemoteSetConfiguration(_In_ PVOID Ctx, _In_ PAVDTP_LOCAL_SEP Local, _In_ UCHAR IntSeid, _In_reads_bytes_(Len) const UCHAR *Ies, _In_ ULONG Len,
                                       _In_ ULONG ServiceCaps, _Out_ PUCHAR FailedCategory)
 {
@@ -1243,6 +1284,7 @@ static UCHAR OnRemoteSetConfiguration(_In_ PVOID Ctx, _In_ PAVDTP_LOCAL_SEP Loca
     }
     /* only one sample rate / channel mode allowed in a configuration: ParseConfig picked one */
     KIRQL irql;
+    ApplySourcePreferences(D, &cfg);
     KeAcquireSpinLock(&D->StatusLock, &irql);
     D->Active = cfg;
     D->ActiveValid = TRUE;
@@ -1251,7 +1293,7 @@ static UCHAR OnRemoteSetConfiguration(_In_ PVOID Ctx, _In_ PAVDTP_LOCAL_SEP Loca
     /* T3/T9/T10: the receiver drives this stream's setup; the worker gives its OPEN time */
     D->RemoteConfiguredHns = PnNowHns();
     D->RemoteConfigured = TRUE;
-    PN_INFO("remote configured %s @ %u Hz (encoder %u)", A2dpCodecName(cfg.Codec), cfg.SampleRate, owner);
+    PN_INFO("remote configured %s @ %u Hz, %u bps (encoder %u)", A2dpCodecName(cfg.Codec), cfg.SampleRate, cfg.BitrateBps, owner);
     return 0;
 }
 
@@ -1262,6 +1304,7 @@ static UCHAR OnRemoteReconfigure(_In_ PVOID Ctx, _In_reads_bytes_(Len) const UCH
     if (!D->ActiveValid) return AVDTP_ERR_BAD_STATE;
     A2DP_CODEC_CONFIG cfg;
     if (!A2dpParseConfig(D->Active.MediaCodecType, Ies, Len, &cfg) || cfg.Codec != D->Active.Codec) return AVDTP_ERR_UNSUPPORTED_CONFIGURATION;
+    ApplySourcePreferences(D, &cfg);
     KIRQL irql;
     KeAcquireSpinLock(&D->StatusLock, &irql);
     D->Active = cfg;
@@ -1311,7 +1354,13 @@ static VOID OnRemoteStreamControl(_In_ PVOID Ctx, _In_ BOOLEAN Started)
 static VOID OnDelayReport(_In_ PVOID Ctx, _In_ ULONG DelayTenthsMs)
 {
     PPNA2DP_DEVICE D = (PPNA2DP_DEVICE)Ctx;
-    PN_INFO("sink delay report %u.%u ms", DelayTenthsMs / 10, DelayTenthsMs % 10);
+    ULONG codec = D->ActiveValid ? D->Active.Codec : PNA2DP_CODEC_NONE;
+    ULONG floorUs = PnMinPlausibleSinkDelayUs(codec);
+    if (DelayTenthsMs * 100 < floorUs)   /* DeviceSinkDelayUs does not use it (0.1.0.25) */
+        PN_INFO("sink delay report %u.%u ms ignored: below the %u ms floor of %s", DelayTenthsMs / 10, DelayTenthsMs % 10,
+                floorUs / 1000, A2dpCodecName(codec));
+    else
+        PN_INFO("sink delay report %u.%u ms", DelayTenthsMs / 10, DelayTenthsMs % 10);
     DeviceNotifyEvent(D, PNA2DP_EVENT_DELAY_REPORT);
 }
 
@@ -1496,6 +1545,7 @@ NTSTATUS DeviceSetConfig(_Inout_ PPNA2DP_DEVICE D, _In_ const PNA2DP_CONFIG *Cfg
     KIRQL irql;
     KeAcquireSpinLock(&D->StatusLock, &irql);
     D->Config = c;
+    PublishSinkDelaySetting(D);   /* the speaker delay applies at once; codecChanged leaves it out */
     KeReleaseSpinLock(&D->StatusLock, irql);
     D->Adapter->SetVolume(ULONG(-1), c.VolumeDb16);
 
@@ -1512,6 +1562,10 @@ NTSTATUS DeviceSetConfig(_Inout_ PPNA2DP_DEVICE D, _In_ const PNA2DP_CONFIG *Cfg
                                                      PNA2DP_CFG_SBC_XQ));
     /* C6: the endpoint offers formats of the enabled codecs (and all their rates on request) */
     BOOLEAN formatsChanged = old.EnabledCodecMask != c.EnabledCodecMask || ((old.Flags ^ c.Flags) & PNA2DP_CFG_EXPOSE_ALL_RATES);
+    if (old.SinkDelayMs != c.SinkDelayMs || old.SinkDelayCodec != c.SinkDelayCodec) {
+        if (c.SinkDelayMs) PN_INFO("speaker delay set: %u ms for %s", c.SinkDelayMs, c.SinkDelayCodec ? A2dpCodecName(c.SinkDelayCodec) : "any codec");
+        else PN_INFO("speaker delay: automatic");
+    }
     PumpSetAbr(&D->Pump, (c.Flags & PNA2DP_CFG_ABR_ENABLE) != 0 &&
         (D->Pump.Cfg.Codec != PNA2DP_CODEC_LDAC || c.Ldac.AbrEnable != 0));
     D->Pump.TargetLatencyMs = c.TargetLatencyMs;
@@ -1522,6 +1576,8 @@ NTSTATUS DeviceSetConfig(_Inout_ PPNA2DP_DEVICE D, _In_ const PNA2DP_CONFIG *Cfg
         /* Live path: if only the SBC bitpool changed, apply in band; otherwise renegotiate. */
         PNA2DP_CONFIG bitpoolOnly = old;
         bitpoolOnly.Sbc.MaxBitpool = c.Sbc.MaxBitpool;
+        bitpoolOnly.SinkDelayMs = c.SinkDelayMs;          /* live too: no reason to renegotiate */
+        bitpoolOnly.SinkDelayCodec = c.SinkDelayCodec;
         BOOLEAN onlyBitpool = D->Active.Codec == PNA2DP_CODEC_SBC && old.Sbc.MaxBitpool != c.Sbc.MaxBitpool &&
                               c.Sbc.MaxBitpool >= D->Active.SbcMinBitpool && c.Sbc.MaxBitpool <= D->Active.SbcMaxBitpool &&
                               RtlCompareMemory(&bitpoolOnly, &c, sizeof(c)) == sizeof(c);
@@ -1688,6 +1744,7 @@ NTSTATUS DeviceStart(_Inout_ PPNA2DP_DEVICE D)
         if (PnConfigShouldSaveDefaults(loaded)) RegCfgSaveDevice(D->DriverObject, D->Link.RemoteAddress, &D->Config, D->Link.RemoteName);
         else PN_WARN("saved configuration not loaded (0x%08x): defaults in memory, the stored value is kept", loaded);
     }
+    PublishSinkDelaySetting(D);
     D->VolumeDb16 = D->Config.VolumeDb16;
     D->WorkConfig = D->Config;   /* each worker pass takes a fresh copy (ApplyIntents) */
 

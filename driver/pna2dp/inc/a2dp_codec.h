@@ -149,6 +149,12 @@ ULONG   A2dpBuildLocalCaps(_In_ ULONG Codec, _Out_writes_bytes_(Cap) PUCHAR Out,
 BOOLEAN A2dpSelectConfig(_In_ const A2DP_CODEC_CAPS *Caps, _In_ const PNA2DP_CONFIG *Pref,
                          _In_ ULONG PreferredRate, _In_ ULONG PreferredBits, _Out_ PA2DP_CODEC_CONFIG Cfg);
 
+/* A configuration the receiver chose (its SET_CONFIGURATION / RECONFIGURE): apply the source's
+ * own choices it does not carry, from the user's preferences, as A2dpSelectConfig does (LDAC
+ * quality, AAC encoder bitrate and VBR, SBC bitpool within the receiver's range, aptX LL level),
+ * then the basic-rate budget when Conservative. The receiver's rate, mode and IEs stand. */
+VOID    A2dpApplySourcePreferences(_Inout_ PA2DP_CODEC_CONFIG Cfg, _In_ const PNA2DP_CONFIG *Pref, _In_ BOOLEAN Conservative);
+
 /* Re-serialise Cfg into Cfg->Ies (after an ABR / live parameter change). */
 VOID    A2dpSerializeConfig(_Inout_ PA2DP_CODEC_CONFIG Cfg);
 BOOLEAN A2dpConstrainBasicRadio(_Inout_ PA2DP_CODEC_CONFIG Cfg);
